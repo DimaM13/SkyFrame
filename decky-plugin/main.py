@@ -91,8 +91,12 @@ class Plugin:
                         "implementation_version": "1",
                         "description": "SkyFrame Native AI Frame Generation Layer (64-bit)",
                         "functions": {
+                            "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion",
                             "vkGetInstanceProcAddr": "skyframe_GetInstanceProcAddr",
                             "vkGetDeviceProcAddr": "skyframe_GetDeviceProcAddr"
+                        },
+                        "enable_environment": {
+                            "ENABLE_SKYFRAME": "1"
                         },
                         "disable_environment": {
                             "DISABLE_SKYFRAME": "1"
@@ -115,8 +119,12 @@ class Plugin:
                             "implementation_version": "1",
                             "description": "SkyFrame Native AI Frame Generation Layer (32-bit)",
                             "functions": {
+                                "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion",
                                 "vkGetInstanceProcAddr": "skyframe_GetInstanceProcAddr",
                                 "vkGetDeviceProcAddr": "skyframe_GetDeviceProcAddr"
+                            },
+                            "enable_environment": {
+                                "ENABLE_SKYFRAME": "1"
                             },
                             "disable_environment": {
                                 "DISABLE_SKYFRAME": "1"

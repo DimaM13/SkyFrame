@@ -3,11 +3,12 @@
   "layer": {
     "name": "VK_LAYER_SKYFRAME_framegen",
     "type": "GLOBAL",
-    "library_path": "/home/deck/homebrew/plugins/SkyFrame/bin/libVkLayer_skyframe.so",
+    "library_path": "/home/deck/.local/lib/libVkLayer_skyframe.so",
     "api_version": "1.3.0",
     "implementation_version": "1",
-    "description": "SkyFrame Native AI Frame Generation Layer for SteamOS (Vulkan FastWarp + RIFE)",
+    "description": "SkyFrame Native AI Frame Generation Layer",
     "functions": {
+      "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion",
       "vkGetInstanceProcAddr": "skyframe_GetInstanceProcAddr",
       "vkGetDeviceProcAddr": "skyframe_GetDeviceProcAddr"
     },

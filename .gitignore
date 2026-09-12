@@ -17,3 +17,4 @@ __pycache__/
 .vscode/
 .idea/
 skyframe_game.log
+skyframe_game*.log

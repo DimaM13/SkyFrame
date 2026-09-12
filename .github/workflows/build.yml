@@ -72,17 +72,17 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: github.ref == 'refs/heads/main'
         with:
-          tag_name: v1.0.2
-          name: "SkyFrame v1.0.2 for Steam Deck"
+          tag_name: v1.0.3
+          name: "SkyFrame v1.0.3 for Steam Deck"
           body: |
-            ## 🚀 SkyFrame v1.0.2 — Нативный генератор кадров для Steam Deck
+            ## 🚀 SkyFrame v1.0.3 — Нативный генератор кадров для Steam Deck
 
-            ### Что нового в v1.0.2:
-            - **Поддержка 32-битных (x86) и 64-битных (x86_64) игр:** скомпилированы обе версии слоя (`libVkLayer_skyframe.so` и `libVkLayer_skyframe_32.so`). Теперь работают как современные AAA-игры, так и классика (Supreme Commander 2 и т.д.).
-            - **Обход изоляции контейнера Proton (pressure-vessel):** библиотеки и манифесты автоматически устанавливаются в `~/.local/lib/`, благодаря чему любые игры Steam мгновенно получают доступ к генератору.
-            - **Кнопки в меню Decky:** добавлены кнопки для мгновенного копирования параметров запуска (обычного и с логированием) прямо в буфер обмена деки.
-            - **Полноценная цепочка Vulkan Dispatch Table (`vkCreateInstance` / `vkCreateDevice`):** правильная интеграция в цепочку слоёв поверх Gamescope WSI.
-            - **Логирование:** автоматическая запись логов в `~/.local/share/skyframe/skyframe.log`.
+            ### Что нового в v1.0.3:
+            - **Экспорт `vkNegotiateLoaderLayerInterfaceVersion`:** добавлен канонический переговорный интерфейс Vulkan Loader, благодаря чему слой теперь корректно опознаётся современным загрузчиком Vulkan в SteamOS и Proton.
+            - **Полноценная поддержка 32-битных (x86) и 64-битных (x86_64) игр:** скомпилированы обе версии слоя (`libVkLayer_skyframe.so` и `libVkLayer_skyframe_32.so`). Работает как Supreme Commander 2, так и Cyberpunk.
+            - **Обход песочницы Proton:** авто-установка в системный каталог `~/.local/lib/`.
+            - **Кнопки в меню Decky:** мгновенное копирование параметров запуска в один клик.
+            - **Логирование:** прямо в `~/.local/share/skyframe/skyframe.log`.
 
             ### 📦 Установка на Steam Deck:
             1. Скачайте прикреплённый архив **`SkyFrame.zip`** на Steam Deck.

@@ -320,6 +320,25 @@ __attribute__((constructor)) void skyframe_init() {
 
 extern "C" {
 
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface *pVersionStruct) {
+    skyframe::Log("vkNegotiateLoaderLayerInterfaceVersion called! Loader interface version: %d",
+                  pVersionStruct ? pVersionStruct->loaderLayerInterfaceVersion : -1);
+    if (!pVersionStruct) return VK_ERROR_INITIALIZATION_FAILED;
+
+    if (pVersionStruct->loaderLayerInterfaceVersion < 2) {
+        skyframe::Log("Loader interface version < 2 not supported!");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    pVersionStruct->loaderLayerInterfaceVersion = 2;
+    pVersionStruct->pfnGetInstanceProcAddr = skyframe_GetInstanceProcAddr;
+    pVersionStruct->pfnGetDeviceProcAddr = skyframe_GetDeviceProcAddr;
+    pVersionStruct->pfnGetPhysicalDeviceProcAddr = nullptr;
+
+    skyframe::Log("vkNegotiateLoaderLayerInterfaceVersion negotiated successfully!");
+    return VK_SUCCESS;
+}
+
 VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL skyframe_GetInstanceProcAddr(VkInstance instance, const char* pName) {
     if (strcmp(pName, "vkGetInstanceProcAddr") == 0) return (PFN_vkVoidFunction)skyframe_GetInstanceProcAddr;
     if (strcmp(pName, "vkCreateInstance") == 0) return (PFN_vkVoidFunction)skyframe::Hook_vkCreateInstance;
