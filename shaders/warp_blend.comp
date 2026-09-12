@@ -14,7 +14,8 @@ layout(push_constant) uniform PushConstants {
     int   mode;
 } pc;
 
-shared float s_sad[64];
+shared float s_candSAD[64];
+shared ivec2 s_bestVec;
 
 float getLuma(vec3 c) {
     return dot(c, vec3(0.299, 0.587, 0.114));
@@ -44,163 +45,136 @@ vec4 sampleBilinearFrame1(vec2 pos, ivec2 size) {
     return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
 }
 
-float evaluateVector(ivec2 d, ivec2 pixelCoord, bool inBounds, float l1, vec3 rgb1) {
-    ivec2 sampleCoord = clamp(pixelCoord - d, ivec2(0), ivec2(pc.width - 1, pc.height - 1));
-    vec4 samp0 = imageLoad(u_Frame0, sampleCoord);
-    float l0_samp = getLuma(samp0.rgb);
-    
-    // Luminance diff + small color diff for robust matching
-    float diff = inBounds ? (abs(l1 - l0_samp) + 0.2 * dot(abs(rgb1 - samp0.rgb), vec3(1.0))) : 0.0;
-    
-    // Preference bias for zero motion (prevents noise in flat/uniform areas)
-    if (d.x == 0 && d.y == 0) {
-        diff *= 0.90;
-    }
-    
-    s_sad[gl_LocalInvocationIndex] = diff;
-    barrier();
-    
-    if (gl_LocalInvocationIndex < 32) s_sad[gl_LocalInvocationIndex] += s_sad[gl_LocalInvocationIndex + 32];
-    barrier();
-    if (gl_LocalInvocationIndex < 16) s_sad[gl_LocalInvocationIndex] += s_sad[gl_LocalInvocationIndex + 16];
-    barrier();
-    if (gl_LocalInvocationIndex < 8) s_sad[gl_LocalInvocationIndex] += s_sad[gl_LocalInvocationIndex + 8];
-    barrier();
-    if (gl_LocalInvocationIndex < 4) s_sad[gl_LocalInvocationIndex] += s_sad[gl_LocalInvocationIndex + 4];
-    barrier();
-    if (gl_LocalInvocationIndex < 2) s_sad[gl_LocalInvocationIndex] += s_sad[gl_LocalInvocationIndex + 2];
-    barrier();
-    if (gl_LocalInvocationIndex == 0) s_sad[0] += s_sad[1];
-    barrier();
-    
-    return s_sad[0];
-}
+// 49 motion candidates covering radii 0, 2, 4, 8, 14, 22, 30 px
+const ivec2 kCandidates[49] = ivec2[49](
+    ivec2(0, 0),
+    // Radius 4
+    ivec2(-4, 0), ivec2(4, 0), ivec2(0, -4), ivec2(0, 4),
+    ivec2(-4, -4), ivec2(4, -4), ivec2(-4, 4), ivec2(4, 4),
+    // Radius 8
+    ivec2(-8, 0), ivec2(8, 0), ivec2(0, -8), ivec2(0, 8),
+    ivec2(-8, -8), ivec2(8, -8), ivec2(-8, 8), ivec2(8, 8),
+    // Radius 14
+    ivec2(-14, 0), ivec2(14, 0), ivec2(0, -14), ivec2(0, 14),
+    ivec2(-14, -8), ivec2(14, -8), ivec2(-14, 8), ivec2(14, 8),
+    ivec2(-8, -14), ivec2(8, -14), ivec2(-8, 14), ivec2(8, 14),
+    // Radius 22
+    ivec2(-22, 0), ivec2(22, 0), ivec2(0, -22), ivec2(0, 22),
+    ivec2(-22, -12), ivec2(22, -12), ivec2(-22, 12), ivec2(22, 12),
+    // Radius 30
+    ivec2(-30, 0), ivec2(30, 0), ivec2(0, -30), ivec2(0, 30),
+    ivec2(-30, -16), ivec2(30, -16), ivec2(-30, 16), ivec2(30, 16),
+    // Radius 2
+    ivec2(-2, 0), ivec2(2, 0), ivec2(0, -2), ivec2(0, 2)
+);
+
+// 9 sample points inside 8x8 block
+const ivec2 kBlockSamples[9] = ivec2[9](
+    ivec2(1, 1), ivec2(4, 1), ivec2(7, 1),
+    ivec2(1, 4), ivec2(4, 4), ivec2(7, 4),
+    ivec2(1, 7), ivec2(4, 7), ivec2(7, 7)
+);
 
 void main() {
     ivec2 baseCoord = ivec2(gl_WorkGroupID.xy) * 8;
     ivec2 pixelCoord = baseCoord + ivec2(gl_LocalInvocationID.xy);
     bool inBounds = (pixelCoord.x < pc.width && pixelCoord.y < pc.height);
-    ivec2 clampedCoord = clamp(pixelCoord, ivec2(0), ivec2(pc.width - 1, pc.height - 1));
+    ivec2 maxCoord = ivec2(pc.width - 1, pc.height - 1);
 
-    vec4 c1 = imageLoad(u_Frame1, clampedCoord);
-    float l1 = getLuma(c1.rgb);
+    uint tid = gl_LocalInvocationIndex; // 0..63
 
-    vec4 c0 = imageLoad(u_Frame0, clampedCoord);
-    float l0 = getLuma(c0.rgb);
+    // 1. Parallel evaluation of all 49 motion candidates simultaneously across workgroup threads
+    if (tid < 49) {
+        ivec2 cand = kCandidates[tid];
+        float diff = 0.0;
+        for (int i = 0; i < 9; ++i) {
+            ivec2 p1 = clamp(baseCoord + kBlockSamples[i], ivec2(0), maxCoord);
+            ivec2 p0 = clamp(p1 - cand, ivec2(0), maxCoord);
+            vec3 c1 = imageLoad(u_Frame1, p1).rgb;
+            vec3 c0 = imageLoad(u_Frame0, p0).rgb;
+            diff += abs(getLuma(c1) - getLuma(c0)) + 0.2 * dot(abs(c1 - c0), vec3(1.0));
+        }
 
-    // 1. Hierarchical Diamond Motion Vector Estimation across 8x8 block
-    ivec2 bestVec = ivec2(0, 0);
-    float minSAD = 1e9;
+        // Slight zero-bias to stabilize uniform / low-contrast regions
+        if (cand.x == 0 && cand.y == 0) {
+            diff *= 0.88;
+        }
 
-    // Step 1: Coarse search
-    const ivec2 coarse[9] = ivec2[9](
-        ivec2(0, 0),
-        ivec2(-12, 0), ivec2(12, 0),
-        ivec2(0, -12), ivec2(0, 12),
-        ivec2(-8, -8), ivec2(8, -8),
-        ivec2(-8, 8),  ivec2(8, 8)
-    );
+        s_candSAD[tid] = diff;
+    } else {
+        s_candSAD[tid] = 1e9;
+    }
 
-    for (int i = 0; i < 9; ++i) {
-        float sad = evaluateVector(coarse[i], pixelCoord, inBounds, l1, c1.rgb);
-        if (sad < minSAD) {
-            minSAD = sad;
-            bestVec = coarse[i];
+    barrier(); // Barrier 1: All 49 candidates evaluated
+
+    // 2. Thread 0 finds the best motion vector
+    if (tid == 0) {
+        float minVal = s_candSAD[0];
+        int bestIdx = 0;
+        for (int i = 1; i < 49; ++i) {
+            if (s_candSAD[i] < minVal) {
+                minVal = s_candSAD[i];
+                bestIdx = i;
+            }
+        }
+
+        // Scene cut detection: if best SAD is very high (> 0.55 avg per sample), reset to 0
+        if (minVal > 0.55 * 9.0) {
+            s_bestVec = ivec2(0, 0);
+        } else {
+            s_bestVec = kCandidates[bestIdx];
         }
     }
 
-    // Step 2: Medium search (step size 4)
-    const ivec2 step4[8] = ivec2[8](
-        ivec2(-4, 0), ivec2(4, 0),
-        ivec2(0, -4), ivec2(0, 4),
-        ivec2(-4, -4), ivec2(4, -4),
-        ivec2(-4, 4), ivec2(4, 4)
-    );
-
-    ivec2 center = bestVec;
-    for (int i = 0; i < 8; ++i) {
-        float sad = evaluateVector(center + step4[i], pixelCoord, inBounds, l1, c1.rgb);
-        if (sad < minSAD) {
-            minSAD = sad;
-            bestVec = center + step4[i];
-        }
-    }
-
-    // Step 3: Fine search (step size 2)
-    const ivec2 step2[8] = ivec2[8](
-        ivec2(-2, 0), ivec2(2, 0),
-        ivec2(0, -2), ivec2(0, 2),
-        ivec2(-2, -2), ivec2(2, -2),
-        ivec2(-2, 2), ivec2(2, 2)
-    );
-
-    center = bestVec;
-    for (int i = 0; i < 8; ++i) {
-        float sad = evaluateVector(center + step2[i], pixelCoord, inBounds, l1, c1.rgb);
-        if (sad < minSAD) {
-            minSAD = sad;
-            bestVec = center + step2[i];
-        }
-    }
-
-    // Step 4: Pixel refinement (step size 1)
-    const ivec2 step1[4] = ivec2[4](
-        ivec2(-1, 0), ivec2(1, 0),
-        ivec2(0, -1), ivec2(0, 1)
-    );
-
-    center = bestVec;
-    for (int i = 0; i < 4; ++i) {
-        float sad = evaluateVector(center + step1[i], pixelCoord, inBounds, l1, c1.rgb);
-        if (sad < minSAD) {
-            minSAD = sad;
-            bestVec = center + step1[i];
-        }
-    }
+    barrier(); // Barrier 2: Best vector shared with all 64 threads
 
     if (!inBounds) {
         return;
     }
 
-    // 2. Scene Cut Detection
-    // If average pixel difference across 64 pixels is large (> 0.45), scene changed completely
-    if (minSAD > 0.45 * 64.0) {
-        bestVec = ivec2(0, 0);
-    }
+    ivec2 clampedCoord = clamp(pixelCoord, ivec2(0), maxCoord);
+    vec2 flow = vec2(s_bestVec);
 
-    vec2 flow = vec2(bestVec);
+    // 3. Static UI / HUD Protection:
+    // A genuine HUD element has a sharp spatial edge (text/icons/crosshair)
+    // AND its color did not change between Frame 0 and Frame 1.
+    // Flat textures (sky, road, walls) are NOT HUD and will not be zeroed out.
+    if (pc.hud_protection == 1 && length(flow) > 1.5) {
+        vec3 c1_here = imageLoad(u_Frame1, clampedCoord).rgb;
+        vec3 c0_here = imageLoad(u_Frame0, clampedCoord).rgb;
+        float temporalDiff = dot(abs(c1_here - c0_here), vec3(0.299, 0.587, 0.114));
 
-    // 3. Static HUD / UI Protection
-    // If block is moving, but this pixel did not change color, it is static HUD (crosshair, healthbar, minimap)
-    if (pc.hud_protection == 1) {
-        float localDiff = dot(abs(c1.rgb - c0.rgb), vec3(0.299, 0.587, 0.114));
-        if (localDiff < 0.05 && length(flow) > 1.5) {
+        vec3 c_right = imageLoad(u_Frame1, min(clampedCoord + ivec2(1, 0), maxCoord)).rgb;
+        vec3 c_down  = imageLoad(u_Frame1, min(clampedCoord + ivec2(0, 1), maxCoord)).rgb;
+        float spatialEdge = max(
+            dot(abs(c_right - c1_here), vec3(0.299, 0.587, 0.114)),
+            dot(abs(c_down - c1_here), vec3(0.299, 0.587, 0.114))
+        );
+
+        if (temporalDiff < 0.05 && spatialEdge > 0.08) {
             flow = vec2(0.0);
         }
     }
 
-    // 4. Spatial Motion Warping with Subpixel Bilinear Filtering
+    // 4. True Chronological Symmetric Interpolation at phase 0.5:
+    // Motion vector 'flow' points from Frame 0 to Frame 1.
+    // At intermediate time t = 0.5:
+    // Object at screen position pixelCoord was at:
+    // Frame 0: pixelCoord - 0.5 * flow
+    // Frame 1: pixelCoord + 0.5 * flow
     ivec2 size = ivec2(pc.width, pc.height);
+    vec2 pos0 = vec2(pixelCoord) - flow * 0.5;
+    vec2 pos1 = vec2(pixelCoord) + flow * 0.5;
 
-    // Forward motion extrapolation (+0.5 along vector):
-    // Object moves along vector 'flow' from Frame 0 to Frame 1.
-    // At intermediate time t + 0.5, object is at coord + 0.5 * flow.
-    // Thus, at screen position 'pixelCoord', we sample the pixel from Frame 1 that was at:
-    // pixelCoord - 0.5 * flow
-    vec2 samplePos1 = vec2(pixelCoord) - flow * 0.5;
-    vec4 warped1 = sampleBilinearFrame1(samplePos1, size);
+    vec4 sample0 = sampleBilinearFrame0(pos0, size);
+    vec4 sample1 = sampleBilinearFrame1(pos1, size);
 
-    vec2 samplePos0 = vec2(pixelCoord) - flow * 1.5;
-    vec4 warped0 = sampleBilinearFrame0(samplePos0, size);
+    vec4 finalColor = mix(sample0, sample1, 0.5);
 
-    // Temporal blend: mostly Frame 1 (closest in time) with Frame 0 for occlusion filling
-    vec4 finalColor = mix(warped0, warped1, 0.82);
-
-    // 5. Visual HUD marker (neon green square in corner to verify generated frame)
+    // 5. Visual HUD marker (neon green square in corner to verify generated frame delivery)
     if (pc.show_hud == 1 && pixelCoord.x >= 6 && pixelCoord.x <= 18 && pixelCoord.y >= 6 && pixelCoord.y <= 18) {
         finalColor = vec4(0.0, 1.0, 0.4, 1.0);
     }
 
     imageStore(u_OutImage, pixelCoord, finalColor);
 }
-
