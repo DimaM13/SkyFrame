@@ -573,50 +573,67 @@ static std::mutex g_flowInitMutex;
 static std::atomic<bool> g_rifeReady{false};
 static std::atomic<bool> g_rifeWarmingUp{false};
 
+static void EnsureRifeInitializedAsync(int flowW = 288, int flowH = 192) {
+    if (g_rifeReady.load()) return;
+    if (g_rifeWarmingUp.exchange(true)) return;
+
+    std::thread([flowW, flowH]() {
+        Log("RIFE FlowNet background initialization & warmup thread started (%dx%d)...", flowW, flowH);
+        std::shared_ptr<FlowEstimator> est;
+        {
+            std::lock_guard<std::mutex> lock(g_flowInitMutex);
+            if (!g_globalFlowEstimator) {
+                auto newEst = std::make_shared<FlowEstimator>();
+                const char* home = getenv("HOME");
+                std::vector<std::string> modelDirs;
+                if (home && strlen(home) > 0) {
+                    modelDirs.push_back(std::string(home) + "/.local/share/skyframe/models");
+                    modelDirs.push_back(std::string(home) + "/homebrew/plugins/SkyFrame/bin/models");
+                }
+                modelDirs.push_back("/home/deck/.local/share/skyframe/models");
+                modelDirs.push_back("/home/deck/homebrew/plugins/SkyFrame/bin/models");
+                modelDirs.push_back("./models");
+
+                for (const auto& dir : modelDirs) {
+                    std::string param = dir + "/flownet.param";
+                    if (access(param.c_str(), R_OK) == 0) {
+                        g_isInternalNcnnCall.store(true);
+                        bool ok = newEst->LoadModel(dir);
+                        g_isInternalNcnnCall.store(false);
+                        if (ok) {
+                            Log("FlowEstimator loaded RIFE model from %s", dir.c_str());
+                            g_globalFlowEstimator = newEst;
+                            break;
+                        }
+                    }
+                }
+                if (!g_globalFlowEstimator) {
+                    Log("RIFE model not found or failed to load, falling back to compute blend.");
+                }
+            }
+            est = g_globalFlowEstimator;
+        }
+
+        if (est && est->IsLoaded()) {
+            Log("RIFE FlowNet background warmup compiling 295 compute pipelines (%dx%d)...", flowW, flowH);
+            bool warmupOk = est->Warmup(flowW, flowH);
+            if (warmupOk) {
+                Log("RIFE FlowNet background warmup complete! FastWarp neural frame generation active.");
+                g_rifeReady.store(true);
+            } else {
+                Log("RIFE FlowNet warmup failed, continuing on high-speed compute blend.");
+            }
+        }
+        g_rifeWarmingUp.store(false);
+    }).detach();
+}
+
 static bool InitRifePipeline(SwapchainContext* ctx) {
     if (!ctx) return false;
 
     {
         std::lock_guard<std::mutex> lock(g_flowInitMutex);
-        if (!g_globalFlowEstimator) {
-            auto est = std::make_shared<FlowEstimator>();
-
-            const char* home = getenv("HOME");
-            std::vector<std::string> modelDirs;
-            if (home && strlen(home) > 0) {
-                modelDirs.push_back(std::string(home) + "/.local/share/skyframe/models");
-                modelDirs.push_back(std::string(home) + "/homebrew/plugins/SkyFrame/bin/models");
-            }
-            modelDirs.push_back("/home/deck/.local/share/skyframe/models");
-            modelDirs.push_back("/home/deck/homebrew/plugins/SkyFrame/bin/models");
-            modelDirs.push_back("./models");
-
-            bool modelLoaded = false;
-            for (const auto& dir : modelDirs) {
-                std::string param = dir + "/flownet.param";
-                if (access(param.c_str(), R_OK) == 0) {
-                    g_isInternalNcnnCall.store(true);
-                    bool ok = est->LoadModel(dir);
-                    g_isInternalNcnnCall.store(false);
-                    if (ok) {
-                        Log("FlowEstimator loaded RIFE model from %s", dir.c_str());
-                        modelLoaded = true;
-                        break;
-                    }
-                }
-            }
-            if (modelLoaded) {
-                g_globalFlowEstimator = est;
-            } else {
-                Log("RIFE model not found or failed to load, falling back to compute blend.");
-            }
-        }
-    }
-
-    ctx->flowEstimator = g_globalFlowEstimator;
-    if (!ctx->flowEstimator || !ctx->flowEstimator->IsLoaded()) {
-        ctx->rifeEnabled = false;
-        return false;
+        ctx->flowEstimator = g_globalFlowEstimator;
     }
 
     if (ctx->memProperties.memoryTypeCount == 0) {
@@ -655,8 +672,14 @@ static bool InitRifePipeline(SwapchainContext* ctx) {
 #endif
 
     auto& cfg = GetConfig();
-    ctx->flowWidth = ctx->flowEstimator->GetOptimalFlowWidth(cfg.mode, ctx->extent.width);
-    ctx->flowHeight = ctx->flowEstimator->GetOptimalFlowHeight(cfg.mode, ctx->extent.height);
+    int w = 288;
+    int h = 192;
+    if (ctx->flowEstimator && ctx->flowEstimator->IsLoaded()) {
+        w = ctx->flowEstimator->GetOptimalFlowWidth(cfg.mode, ctx->extent.width);
+        h = ctx->flowEstimator->GetOptimalFlowHeight(cfg.mode, ctx->extent.height);
+    }
+    ctx->flowWidth = w;
+    ctx->flowHeight = h;
 
     if (!ctx->warper->CreateFlowAndMaskTextures(ctx->flowWidth, ctx->flowHeight) ||
         !ctx->warper->CreateDownsampleStaging(ctx->flowWidth, ctx->flowHeight, ctx->format)) {
@@ -675,22 +698,8 @@ static bool InitRifePipeline(SwapchainContext* ctx) {
     ctx->hasPrevDownsample = false;
     ctx->rifeEnabled = true;
 
-    // Trigger asynchronous background warmup so gamescope/game never freeze at startup
-    if (!g_rifeReady.load() && !g_rifeWarmingUp.exchange(true)) {
-        int w = ctx->flowWidth;
-        int h = ctx->flowHeight;
-        std::thread([w, h]() {
-            Log("RIFE FlowNet background warmup started (%dx%d)...", w, h);
-            bool warmupOk = g_globalFlowEstimator->Warmup(w, h);
-            if (warmupOk) {
-                Log("RIFE FlowNet background warmup complete! FastWarp neural frame generation active.");
-                g_rifeReady.store(true);
-            } else {
-                Log("RIFE FlowNet warmup failed, continuing on high-speed compute blend.");
-            }
-            g_rifeWarmingUp.store(false);
-        }).detach();
-    }
+    // Trigger asynchronous background warmup if not yet ready
+    EnsureRifeInitializedAsync(ctx->flowWidth, ctx->flowHeight);
 
     Log("RIFE FastWarp initialized: %dx%d dense optical flow for %ux%u native output (neural pipelines: %s)!",
         ctx->flowWidth, ctx->flowHeight, ctx->extent.width, ctx->extent.height,
@@ -928,6 +937,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateDevice(
     if (!g_pfnCmdDispatch) g_pfnCmdDispatch = &vkCmdDispatch;
 
     Log("Vulkan Device created successfully. Dispatch table initialized.");
+    EnsureRifeInitializedAsync();
     return VK_SUCCESS;
 }
 
@@ -1238,6 +1248,10 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
         const WarperDeviceDispatch* pDisp = ctx->warper ? &ctx->warper->GetDispatch() : nullptr;
 
         // PATH A: RIFE FlowNet (NCNN Vulkan) + Native FastWarp (1280x800)
+        if (!ctx->flowEstimator && g_globalFlowEstimator) {
+            ctx->flowEstimator = g_globalFlowEstimator;
+        }
+
         if (ctx->rifeEnabled && g_rifeReady.load() && ctx->warper && ctx->flowEstimator && ctx->flowEstimator->IsLoaded() &&
             ctx->prevGameIdx != UINT32_MAX &&
             ctx->prevGameIdx < ctx->images.size() && ctx->prevGameIdx != intermediateIdx &&
@@ -1396,6 +1410,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                 }
             }
         }
+    }
 
         if (usedRife) {
             // Readback already waited on game's pWaitSemaphores, so we only wait on slot.acqSemaphore
