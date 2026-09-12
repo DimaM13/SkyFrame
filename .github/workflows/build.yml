@@ -36,7 +36,7 @@ jobs:
 
       - name: Build NCNN Vulkan Static Library (64-bit)
         run: |
-          git clone --depth 1 https://github.com/Tencent/ncnn.git
+          git clone --recursive --depth 1 https://github.com/Tencent/ncnn.git
           cd ncnn
           mkdir -p build && cd build
           cmake .. \
