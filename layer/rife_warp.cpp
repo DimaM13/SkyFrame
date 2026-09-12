@@ -276,7 +276,7 @@ int RifeWarp::create_pipeline(const ncnn::Option& opt) {
     }
 
     // 3. Pack8
-    if (opt.use_shader_pack8) {
+    if (opt.use_packing_layout) {
         static std::vector<uint32_t> spirv;
         static ncnn::Mutex lock;
         {
@@ -390,11 +390,11 @@ int RifeWarp::forward(const std::vector<ncnn::VkMat>& bottom_blobs, std::vector<
     constants[2].i = top_blob.c;
     constants[3].i = top_blob.cstep;
 
-    if (elempack == 8) {
+    if (elempack == 8 && pipeline_warp_pack8) {
         cmd.record_pipeline(pipeline_warp_pack8, bindings, constants, top_blob);
-    } else if (elempack == 4) {
+    } else if (elempack == 4 && pipeline_warp_pack4) {
         cmd.record_pipeline(pipeline_warp_pack4, bindings, constants, top_blob);
-    } else {
+    } else if (pipeline_warp) {
         cmd.record_pipeline(pipeline_warp, bindings, constants, top_blob);
     }
 
