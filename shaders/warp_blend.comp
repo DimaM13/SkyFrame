@@ -1,14 +1,15 @@
 #version 450
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(binding = 0) uniform sampler2D u_Frame0;
-layout(binding = 1) uniform sampler2D u_Frame1;
+layout(binding = 0, rgba8) uniform readonly image2D u_Frame0;
+layout(binding = 1, rgba8) uniform readonly image2D u_Frame1;
 layout(binding = 2, rgba8) uniform writeonly image2D u_OutImage;
 
 layout(push_constant) uniform PushConstants {
     float alpha;
     int   width;
     int   height;
+    int   show_hud;
 } pc;
 
 void main() {
@@ -17,10 +18,16 @@ void main() {
         return;
     }
 
-    vec2 uv = (vec2(coord) + 0.5) / vec2(pc.width, pc.height);
-    vec4 c0 = texture(u_Frame0, uv);
-    vec4 c1 = texture(u_Frame1, uv);
+    // Optional debug indicator on generated frame to prove visual delivery
+    if (pc.show_hud == 1 && coord.x >= 6 && coord.x <= 14 && coord.y >= 6 && coord.y <= 14) {
+        imageStore(u_OutImage, coord, vec4(0.0, 1.0, 0.4, 1.0));
+        return;
+    }
+
+    vec4 c0 = imageLoad(u_Frame0, coord);
+    vec4 c1 = imageLoad(u_Frame1, coord);
 
     vec4 blended = mix(c0, c1, pc.alpha);
     imageStore(u_OutImage, coord, blended);
 }
+

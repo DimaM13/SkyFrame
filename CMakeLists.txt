@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(SkyFrame VERSION 1.0.7 LANGUAGES CXX C)
+project(SkyFrame VERSION 1.0.8 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,20 +20,22 @@ if (NOT GLSL_VALIDATOR)
     find_program(GLSL_VALIDATOR glslc HINTS /usr/bin /usr/local/bin)
 endif()
 
-set(SPIRV_OUTPUTS "")
+set(SPIRV_HEADERS "")
 foreach(SHADER ${SHADER_SOURCES})
     get_filename_component(SHADER_NAME ${SHADER} NAME)
     set(SPV_OUT "${CMAKE_CURRENT_BINARY_DIR}/${SHADER_NAME}.spv")
+    set(HEADER_OUT "${CMAKE_CURRENT_BINARY_DIR}/${SHADER_NAME}_spv.h")
     add_custom_command(
-        OUTPUT ${SPV_OUT}
+        OUTPUT ${HEADER_OUT}
         COMMAND ${GLSL_VALIDATOR} -V ${SHADER} -o ${SPV_OUT}
-        DEPENDS ${SHADER}
-        COMMENT "Compiling compute shader: ${SHADER_NAME}"
+        COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/scripts/spv_to_header.py" "${SPV_OUT}" "${HEADER_OUT}" "${SHADER_NAME}"
+        DEPENDS ${SHADER} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/spv_to_header.py"
+        COMMENT "Compiling compute shader to C++ header: ${SHADER_NAME}"
     )
-    list(APPEND SPIRV_OUTPUTS ${SPV_OUT})
+    list(APPEND SPIRV_HEADERS ${HEADER_OUT})
 endforeach()
 
-add_custom_target(SkyFrameShaders DEPENDS ${SPIRV_OUTPUTS})
+add_custom_target(SkyFrameShaders DEPENDS ${SPIRV_HEADERS})
 
 # Vulkan Layer Library
 add_library(VkLayer_skyframe SHARED
@@ -48,6 +50,7 @@ add_dependencies(VkLayer_skyframe SkyFrameShaders)
 target_include_directories(VkLayer_skyframe PRIVATE
     ${Vulkan_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/layer
+    ${CMAKE_CURRENT_BINARY_DIR}
 )
 
 target_link_libraries(VkLayer_skyframe PRIVATE
