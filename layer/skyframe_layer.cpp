@@ -640,7 +640,7 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL skyframe_GetInstancePro
     if (strcmp(pName, "vkCreateSwapchainKHR") == 0) return (PFN_vkVoidFunction)skyframe::Hook_vkCreateSwapchainKHR;
     if (strcmp(pName, "vkDestroySwapchainKHR") == 0) return (PFN_vkVoidFunction)skyframe::Hook_vkDestroySwapchainKHR;
     if (strcmp(pName, "vkGetSwapchainImagesKHR") == 0) return (PFN_vkVoidFunction)skyframe::Hook_vkGetSwapchainImagesKHR;
-    if (strcmp(pName, "vkQueuePresentKHR") == 0) return (PFN_vkQueuePresentKHR)skyframe::Hook_vkQueuePresentKHR;
+    if (strcmp(pName, "vkQueuePresentKHR") == 0) return (PFN_vkVoidFunction)skyframe::Hook_vkQueuePresentKHR;
 
     if (skyframe::g_nextGetInstanceProcAddr && instance) {
         return skyframe::g_nextGetInstanceProcAddr(instance, pName);
@@ -654,7 +654,7 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL skyframe_GetDeviceProcA
     if (strcmp(pName, "vkCreateSwapchainKHR") == 0) return (PFN_vkVoidFunction)skyframe::Hook_vkCreateSwapchainKHR;
     if (strcmp(pName, "vkDestroySwapchainKHR") == 0) return (PFN_vkVoidFunction)skyframe::Hook_vkDestroySwapchainKHR;
     if (strcmp(pName, "vkGetSwapchainImagesKHR") == 0) return (PFN_vkVoidFunction)skyframe::Hook_vkGetSwapchainImagesKHR;
-    if (strcmp(pName, "vkQueuePresentKHR") == 0) return (PFN_vkQueuePresentKHR)skyframe::Hook_vkQueuePresentKHR;
+    if (strcmp(pName, "vkQueuePresentKHR") == 0) return (PFN_vkVoidFunction)skyframe::Hook_vkQueuePresentKHR;
 
     if (skyframe::g_nextGetDeviceProcAddr && device) {
         return skyframe::g_nextGetDeviceProcAddr(device, pName);
