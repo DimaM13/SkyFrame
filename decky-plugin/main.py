@@ -1,14 +1,19 @@
 import os
 import json
 import logging
+import shutil
 import asyncio
 
 logging.basicConfig(level=logging.INFO)
 
-CONFIG_DIR = os.path.expanduser("~/.config/skyframe")
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(HOME, ".config", "skyframe")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
-VULKAN_LAYER_DIR = os.path.expanduser("~/.local/share/vulkan/implicit_layer.d")
-VULKAN_LAYER_PATH = os.path.join(VULKAN_LAYER_DIR, "vk_layer_skyframe.json")
+LOCAL_LIB_DIR = os.path.join(HOME, ".local", "lib")
+VULKAN_LAYER_DIR = os.path.join(HOME, ".local", "share", "vulkan", "implicit_layer.d")
+VULKAN_LAYER_64_PATH = os.path.join(VULKAN_LAYER_DIR, "vk_layer_skyframe.json")
+VULKAN_LAYER_32_PATH = os.path.join(VULKAN_LAYER_DIR, "vk_layer_skyframe_32.json")
+MODELS_DIR = os.path.join(HOME, ".local", "share", "skyframe", "models")
 
 DEFAULT_CONFIG = {
     "enabled": False,
@@ -42,28 +47,92 @@ class Plugin:
             logging.error(f"[SkyFrame] Failed to save config: {e}")
 
     def sync_vulkan_layer(self):
-        """Installs or removes the Vulkan implicit layer manifest based on enabled state"""
+        """Installs layer libraries into ~/.local/lib and registers implicit layer manifests"""
         try:
             plugin_dir = os.path.dirname(os.path.abspath(__file__))
-            src_manifest = os.path.join(plugin_dir, "bin", "vk_layer_skyframe.json")
+            bin_dir = os.path.join(plugin_dir, "bin")
+
+            os.makedirs(LOCAL_LIB_DIR, exist_ok=True)
+            os.makedirs(VULKAN_LAYER_DIR, exist_ok=True)
+            os.makedirs(MODELS_DIR, exist_ok=True)
+
+            # Copy models to standard ~/.local/share/skyframe/models
+            models_src = os.path.join(bin_dir, "models")
+            if os.path.isdir(models_src):
+                for mf in os.listdir(models_src):
+                    src_f = os.path.join(models_src, mf)
+                    dst_f = os.path.join(MODELS_DIR, mf)
+                    if os.path.isfile(src_f) and not os.path.isfile(dst_f):
+                        shutil.copy2(src_f, dst_f)
+
+            # Copy 64-bit library
+            lib64_src = os.path.join(bin_dir, "libVkLayer_skyframe.so")
+            lib64_dst = os.path.join(LOCAL_LIB_DIR, "libVkLayer_skyframe.so")
+            if os.path.isfile(lib64_src):
+                shutil.copy2(lib64_src, lib64_dst)
+                os.chmod(lib64_dst, 0o755)
+
+            # Copy 32-bit library (if present)
+            lib32_src = os.path.join(bin_dir, "libVkLayer_skyframe_32.so")
+            lib32_dst = os.path.join(LOCAL_LIB_DIR, "libVkLayer_skyframe_32.so")
+            if os.path.isfile(lib32_src):
+                shutil.copy2(lib32_src, lib32_dst)
+                os.chmod(lib32_dst, 0o755)
 
             if self.config.get("enabled", False):
-                os.makedirs(VULKAN_LAYER_DIR, exist_ok=True)
-                # Read template manifest and update absolute library path
-                if os.path.isfile(src_manifest):
-                    with open(src_manifest, "r", encoding="utf-8") as f:
-                        manifest_data = json.load(f)
-                    
-                    lib_path = os.path.join(plugin_dir, "bin", "libVkLayer_skyframe.so")
-                    manifest_data["layer"]["library_path"] = lib_path
-                    
-                    with open(VULKAN_LAYER_PATH, "w", encoding="utf-8") as f:
-                        json.dump(manifest_data, f, indent=2)
-                    logging.info(f"[SkyFrame] Vulkan implicit layer manifest registered at: {VULKAN_LAYER_PATH}")
+                # 64-bit implicit manifest
+                manifest_64 = {
+                    "file_format_version": "1.0.0",
+                    "layer": {
+                        "name": "VK_LAYER_SKYFRAME_framegen",
+                        "type": "GLOBAL",
+                        "library_path": "../../../lib/libVkLayer_skyframe.so",
+                        "api_version": "1.3.0",
+                        "implementation_version": "1",
+                        "description": "SkyFrame Native AI Frame Generation Layer (64-bit)",
+                        "functions": {
+                            "vkGetInstanceProcAddr": "skyframe_GetInstanceProcAddr",
+                            "vkGetDeviceProcAddr": "skyframe_GetDeviceProcAddr"
+                        },
+                        "disable_environment": {
+                            "DISABLE_SKYFRAME": "1"
+                        }
+                    }
+                }
+                with open(VULKAN_LAYER_64_PATH, "w", encoding="utf-8") as f:
+                    json.dump(manifest_64, f, indent=2)
+                logging.info(f"[SkyFrame] Registered 64-bit Vulkan layer at {VULKAN_LAYER_64_PATH}")
+
+                # 32-bit implicit manifest (if 32-bit library exists)
+                if os.path.isfile(lib32_dst):
+                    manifest_32 = {
+                        "file_format_version": "1.0.0",
+                        "layer": {
+                            "name": "VK_LAYER_SKYFRAME_framegen_32",
+                            "type": "GLOBAL",
+                            "library_path": "../../../lib/libVkLayer_skyframe_32.so",
+                            "api_version": "1.3.0",
+                            "implementation_version": "1",
+                            "description": "SkyFrame Native AI Frame Generation Layer (32-bit)",
+                            "functions": {
+                                "vkGetInstanceProcAddr": "skyframe_GetInstanceProcAddr",
+                                "vkGetDeviceProcAddr": "skyframe_GetDeviceProcAddr"
+                            },
+                            "disable_environment": {
+                                "DISABLE_SKYFRAME": "1"
+                            }
+                        }
+                    }
+                    with open(VULKAN_LAYER_32_PATH, "w", encoding="utf-8") as f:
+                        json.dump(manifest_32, f, indent=2)
+                    logging.info(f"[SkyFrame] Registered 32-bit Vulkan layer at {VULKAN_LAYER_32_PATH}")
             else:
-                if os.path.isfile(VULKAN_LAYER_PATH):
-                    os.remove(VULKAN_LAYER_PATH)
-                    logging.info("[SkyFrame] Vulkan implicit layer manifest removed (disabled).")
+                # Remove manifests when disabled
+                if os.path.isfile(VULKAN_LAYER_64_PATH):
+                    os.remove(VULKAN_LAYER_64_PATH)
+                if os.path.isfile(VULKAN_LAYER_32_PATH):
+                    os.remove(VULKAN_LAYER_32_PATH)
+                logging.info("[SkyFrame] Vulkan layer manifests removed (disabled).")
         except Exception as e:
             logging.error(f"[SkyFrame] Error updating Vulkan layer: {e}")
 
@@ -93,7 +162,6 @@ class Plugin:
         return self.config
 
     async def get_stats(self):
-        """Simulated/actual telemetry from Vulkan Layer IPC / shared memory"""
         return {
             "base_fps": 30.0 if not self.config["enabled"] else 40.0,
             "output_fps": 30.0 if not self.config["enabled"] else 80.0

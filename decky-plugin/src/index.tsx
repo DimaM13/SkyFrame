@@ -1,4 +1,5 @@
 import {
+  ButtonItem,
   PanelSection,
   PanelSectionRow,
   ToggleField,
@@ -7,10 +8,11 @@ import {
 } from "@decky/ui";
 import {
   callable,
-  definePlugin
+  definePlugin,
+  toaster
 } from "@decky/api";
 import { useState, useEffect } from "react";
-import { FaBolt } from "react-icons/fa";
+import { FaBolt, FaCopy, FaFileAlt } from "react-icons/fa";
 
 interface SkyFrameConfig {
   enabled: boolean;
@@ -68,6 +70,27 @@ function Content() {
     setHudProtectionCall(val).catch(console.error);
   };
 
+  const copyToClipboard = (cmd: string, desc: string) => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(cmd);
+      } else {
+        const textArea = document.createElement("textarea");
+        textArea.value = cmd;
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand("copy");
+        document.body.removeChild(textArea);
+      }
+      toaster.toast({
+        title: "SkyFrame",
+        body: `Скопировано: ${desc}`
+      });
+    } catch (err) {
+      console.error("[SkyFrame] Failed to copy:", err);
+    }
+  };
+
   const modeOptions = [
     { data: 0, label: "🚀 Лёгкий (180p) — для AAA-игр" },
     { data: 1, label: "⚖️ Баланс (240p) — рекомендуемый" },
@@ -75,63 +98,85 @@ function Content() {
   ];
 
   return (
-    <PanelSection title="SkyFrame: Нативная генерация">
-      <PanelSectionRow>
-        <ToggleField
-          label="Генерация кадров (2x)"
-          description="Аппаратный сдвиг пикселей Vulkan FastWarp"
-          checked={enabled}
-          onChange={handleToggle}
-        />
-      </PanelSectionRow>
-
-      <PanelSectionRow>
-        <DropdownItem
-          label="Профиль вычислений"
-          rgOptions={modeOptions}
-          selectedOption={mode}
-          onChange={(opt) => handleModeChange(Number(opt.data))}
-        />
-      </PanelSectionRow>
-
-      <PanelSectionRow>
-        <ToggleField
-          label="Защита интерфейса (HUD)"
-          description="Предотвращает двоение прицелов и текста миникарты"
-          checked={hudProtection}
-          onChange={handleHudChange}
-        />
-      </PanelSectionRow>
-
-      {enabled && (
+    <>
+      <PanelSection title="SkyFrame: Нативная генерация">
         <PanelSectionRow>
-          <div style={{
-            background: "rgba(255, 255, 255, 0.05)",
-            borderRadius: "8px",
-            padding: "10px",
-            fontSize: "12px",
-            display: "flex",
-            flexDirection: "column",
-            gap: "6px"
-          }}>
-            <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <span style={{ color: "#aaa" }}>Статус:</span>
-              <span style={{ color: "#4ade80", fontWeight: "bold" }}>● Активно (Vulkan FastWarp)</span>
-            </div>
-            <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <span style={{ color: "#aaa" }}>Частота кадров:</span>
-              <span style={{ color: "#f59e0b", fontWeight: "bold" }}>
-                {baseFps} FPS → {outputFps} FPS
-              </span>
-            </div>
-            <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <span style={{ color: "#aaa" }}>Движок интерполяции:</span>
-              <span style={{ color: "#fff" }}>RIFE 4.6 + RDNA2 FP16</span>
-            </div>
-          </div>
+          <ToggleField
+            label="Генерация кадров (2x)"
+            description="Аппаратный сдвиг пикселей Vulkan FastWarp"
+            checked={enabled}
+            onChange={handleToggle}
+          />
         </PanelSectionRow>
-      )}
-    </PanelSection>
+
+        <PanelSectionRow>
+          <DropdownItem
+            label="Профиль вычислений"
+            rgOptions={modeOptions}
+            selectedOption={mode}
+            onChange={(opt) => handleModeChange(Number(opt.data))}
+          />
+        </PanelSectionRow>
+
+        <PanelSectionRow>
+          <ToggleField
+            label="Защита интерфейса (HUD)"
+            description="Предотвращает двоение прицелов и текста миникарты"
+            checked={hudProtection}
+            onChange={handleHudChange}
+          />
+        </PanelSectionRow>
+
+        {enabled && (
+          <PanelSectionRow>
+            <div style={{
+              background: "rgba(255, 255, 255, 0.05)",
+              borderRadius: "8px",
+              padding: "10px",
+              fontSize: "12px",
+              display: "flex",
+              flexDirection: "column",
+              gap: "6px"
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: "#aaa" }}>Статус:</span>
+                <span style={{ color: "#4ade80", fontWeight: "bold" }}>● Активно (Vulkan FastWarp)</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: "#aaa" }}>Частота кадров:</span>
+                <span style={{ color: "#f59e0b", fontWeight: "bold" }}>
+                  {baseFps} FPS → {outputFps} FPS
+                </span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: "#aaa" }}>Движок интерполяции:</span>
+                <span style={{ color: "#fff" }}>RIFE 4.6 + RDNA2 FP16</span>
+              </div>
+            </div>
+          </PanelSectionRow>
+        )}
+      </PanelSection>
+
+      <PanelSection title="Параметры запуска Steam">
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            onClick={() => copyToClipboard("ENABLE_SKYFRAME=1 %command%", "Команда запуска")}
+          >
+            📋 Скопировать ENABLE_SKYFRAME=1
+          </ButtonItem>
+        </PanelSectionRow>
+
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            onClick={() => copyToClipboard("ENABLE_SKYFRAME=1 %command% > ~/skyframe_game.log 2>&1", "Запуск с логами")}
+          >
+            📝 Скопировать запуск с подробным логом
+          </ButtonItem>
+        </PanelSectionRow>
+      </PanelSection>
+    </>
   );
 }
 

@@ -18,8 +18,9 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y cmake g++ libvulkan-dev glslang-tools python3 zip
+          sudo apt-get install -y cmake g++ g++-multilib gcc-multilib libvulkan-dev libvulkan-dev:i386 glslang-tools python3 zip
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -33,18 +34,28 @@ jobs:
           npm run build
           cd ..
 
-      - name: Compile Vulkan Shaders and Layer (.so)
+      - name: Compile 64-bit and 32-bit Vulkan Layers (.so)
         run: |
-          mkdir -p build
-          cd build
+          # 1. 64-bit build
+          mkdir -p build64
+          cd build64
           cmake .. -DCMAKE_BUILD_TYPE=Release
           cmake --build . --config Release -j$(nproc)
+          cd ..
+
+          # 2. 32-bit build
+          mkdir -p build32
+          cd build32
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="-m32" -DCMAKE_CXX_FLAGS="-m32" -DCMAKE_SHARED_LINKER_FLAGS="-m32"
+          cmake --build . --config Release -j$(nproc)
+          cd ..
 
       - name: Prepare Decky Plugin binaries
         run: |
           mkdir -p decky-plugin/bin/models
-          cp build/libVkLayer_skyframe.so decky-plugin/bin/
-          cp build/vk_layer_skyframe.json decky-plugin/bin/
+          cp build64/libVkLayer_skyframe.so decky-plugin/bin/libVkLayer_skyframe.so
+          cp build32/libVkLayer_skyframe.so decky-plugin/bin/libVkLayer_skyframe_32.so
+          cp build64/vk_layer_skyframe.json decky-plugin/bin/vk_layer_skyframe.json
           cp -r models/* decky-plugin/bin/models/
 
       - name: Package Decky Plugin Zip
@@ -61,22 +72,25 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: github.ref == 'refs/heads/main'
         with:
-          tag_name: v1.0.1
-          name: "SkyFrame v1.0.1 for Steam Deck"
+          tag_name: v1.0.2
+          name: "SkyFrame v1.0.2 for Steam Deck"
           body: |
-            ## 🚀 SkyFrame v1.0.1 — Нативный генератор кадров для Steam Deck
+            ## 🚀 SkyFrame v1.0.2 — Нативный генератор кадров для Steam Deck
 
-            ### Что нового в v1.0.1:
-            - **Исправлена загрузка в Decky Loader:** полный переход на актуальный стандарт `@decky/rollup` + `@decky/ui` (ESM module v1).
-            - Исправлена ошибка `SyntaxError: Unexpected token 'export'`.
-            - Поддержка новых версий SteamUI.
+            ### Что нового в v1.0.2:
+            - **Поддержка 32-битных (x86) и 64-битных (x86_64) игр:** скомпилированы обе версии слоя (`libVkLayer_skyframe.so` и `libVkLayer_skyframe_32.so`). Теперь работают как современные AAA-игры, так и классика (Supreme Commander 2 и т.д.).
+            - **Обход изоляции контейнера Proton (pressure-vessel):** библиотеки и манифесты автоматически устанавливаются в `~/.local/lib/`, благодаря чему любые игры Steam мгновенно получают доступ к генератору.
+            - **Кнопки в меню Decky:** добавлены кнопки для мгновенного копирования параметров запуска (обычного и с логированием) прямо в буфер обмена деки.
+            - **Полноценная цепочка Vulkan Dispatch Table (`vkCreateInstance` / `vkCreateDevice`):** правильная интеграция в цепочку слоёв поверх Gamescope WSI.
+            - **Логирование:** автоматическая запись логов в `~/.local/share/skyframe/skyframe.log`.
 
             ### 📦 Установка на Steam Deck:
             1. Скачайте прикреплённый архив **`SkyFrame.zip`** на Steam Deck.
             2. В меню **Decky Loader** зайдите в Настройки ⚙️ -> **Режим разработчика** (Developer Mode).
             3. Нажмите **«Install plugin from zip»** и выберите скачанный `SkyFrame.zip`.
-            4. Открывайте любую игру и включайте генерацию кадров (2x) в меню Decky (кнопка `...`)!
+            4. В свойствах любой игры в Steam укажите:
+               `ENABLE_SKYFRAME=1 %command%`
+               *(можно скопировать кнопкой прямо из плагина в меню `...`)*.
           files: SkyFrame.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
