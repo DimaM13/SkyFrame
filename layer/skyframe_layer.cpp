@@ -226,6 +226,8 @@ struct BlendPushConstants {
     int   width;
     int   height;
     int   show_hud;
+    int   hud_protection;
+    int   mode;
 };
 
 struct SwapchainContext {
@@ -943,11 +945,18 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             g_pfnCmdBindPipeline(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->blendPipeline);
             g_pfnCmdBindDescriptorSets(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->blendPipelineLayout, 0, 1, &slot.blendDescSet, 0, nullptr);
 
-            BlendPushConstants pc{ 0.5f, static_cast<int>(ctx->extent.width), static_cast<int>(ctx->extent.height), cfg.show_hud ? 1 : 0 };
+            BlendPushConstants pc{
+                0.5f,
+                static_cast<int>(ctx->extent.width),
+                static_cast<int>(ctx->extent.height),
+                cfg.show_hud ? 1 : 0,
+                cfg.hud_protection ? 1 : 0,
+                cfg.mode
+            };
             g_pfnCmdPushConstants(slot.cmdBuffer, ctx->blendPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
-            uint32_t groupX = (ctx->extent.width + 15) / 16;
-            uint32_t groupY = (ctx->extent.height + 15) / 16;
+            uint32_t groupX = (ctx->extent.width + 7) / 8;
+            uint32_t groupY = (ctx->extent.height + 7) / 8;
             g_pfnCmdDispatch(slot.cmdBuffer, groupX, groupY, 1);
 
             barriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
