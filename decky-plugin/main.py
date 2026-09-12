@@ -33,8 +33,31 @@ DEFAULT_CONFIG = {
     "multiplier": 2,           # 2x frame generation
     "hud_protection": True,
     "hud_threshold": 0.08,
+    "target_hz": 60,           # Target display refresh rate (auto-synced with Steam Deck QAM)
     "show_hud": False
 }
+
+def detect_system_refresh_rate() -> int:
+    """Attempts to detect the active display refresh rate via xrandr or gamescope"""
+    try:
+        import subprocess
+        for disp in [":0", ":1"]:
+            env = os.environ.copy()
+            env["DISPLAY"] = disp
+            res = subprocess.run(["xrandr"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=1, env=env)
+            if res.returncode == 0 and res.stdout:
+                for line in res.stdout.splitlines():
+                    if "*" in line:
+                        parts = line.split()
+                        for p in parts:
+                            if "*" in p:
+                                hz_str = p.replace("*", "").replace("+", "")
+                                hz = float(hz_str)
+                                if 30 <= hz <= 240:
+                                    return int(round(hz))
+    except Exception:
+        pass
+    return 60
 
 def get_target_uid_gid():
     try:
@@ -249,6 +272,12 @@ class Plugin:
         self.save_config()
         return self.config
 
+    async def set_target_hz(self, hz: int):
+        if hz >= 30 and hz <= 240:
+            self.config["target_hz"] = int(hz)
+            self.save_config()
+        return self.config
+
     async def get_stats(self):
         try:
             if os.path.isfile("/tmp/skyframe_stats.json"):
@@ -257,13 +286,15 @@ class Plugin:
                     if isinstance(data, dict):
                         return {
                             "base_fps": float(data.get("base_fps", 0.0)),
-                            "output_fps": float(data.get("output_fps", 0.0))
+                            "output_fps": float(data.get("output_fps", 0.0)),
+                            "target_hz": int(data.get("target_hz", self.config.get("target_hz", 60)))
                         }
         except Exception:
             pass
         return {
             "base_fps": 0.0 if not self.config.get("enabled", False) else 30.0,
-            "output_fps": 0.0 if not self.config.get("enabled", False) else 60.0
+            "output_fps": 0.0 if not self.config.get("enabled", False) else 60.0,
+            "target_hz": int(self.config.get("target_hz", 60))
         }
 
     async def get_status_info(self):

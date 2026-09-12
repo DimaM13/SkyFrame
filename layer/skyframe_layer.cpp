@@ -20,6 +20,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#endif
+
 #if __has_include("warp_blend_comp_spv.h")
 #include "warp_blend_comp_spv.h"
 #define HAVE_WARP_BLEND 1
@@ -68,6 +72,7 @@ LayerConfig& GetConfig() {
 }
 
 static time_t g_lastConfigMtime = 0;
+static long g_lastConfigNsec = 0;
 
 void ReloadConfig() {
     std::lock_guard<std::mutex> lock(g_configMutex);
@@ -89,6 +94,9 @@ void ReloadConfig() {
         struct stat st;
         if (stat(configPath.c_str(), &st) == 0) {
             g_lastConfigMtime = st.st_mtime;
+#if defined(__linux__)
+            g_lastConfigNsec = st.st_mtim.tv_nsec;
+#endif
         }
 
         std::string line;
@@ -103,6 +111,12 @@ void ReloadConfig() {
                 g_config.hud_protection = (line.find("true") != std::string::npos);
             } else if (line.find("\"show_hud\"") != std::string::npos) {
                 g_config.show_hud = (line.find("true") != std::string::npos);
+            } else if (line.find("\"target_hz\"") != std::string::npos) {
+                size_t colon = line.find(':');
+                if (colon != std::string::npos) {
+                    int hz = std::atoi(line.c_str() + colon + 1);
+                    if (hz >= 30 && hz <= 240) g_config.target_hz = hz;
+                }
             }
         }
     }
@@ -129,7 +143,7 @@ void ReloadConfig() {
 static void CheckHotReload() {
     static auto lastCheck = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
-    if (now - lastCheck < std::chrono::milliseconds(250)) {
+    if (now - lastCheck < std::chrono::milliseconds(100)) {
         return;
     }
     lastCheck = now;
@@ -149,11 +163,18 @@ static void CheckHotReload() {
         }
     }
 
-    if (st.st_mtime != g_lastConfigMtime) {
+    bool changed = (st.st_mtime != g_lastConfigMtime);
+#if defined(__linux__)
+    if (st.st_mtim.tv_nsec != g_lastConfigNsec) {
+        changed = true;
+    }
+#endif
+
+    if (changed) {
         ReloadConfig();
         auto& cfg = GetConfig();
-        Log("Hot-reload applied: enabled=%d, mode=%d, show_hud=%d, hud_protection=%d",
-            cfg.enabled, cfg.mode, cfg.show_hud, cfg.hud_protection);
+        Log("Hot-reload applied: enabled=%d, mode=%d, show_hud=%d, hud_protection=%d, target_hz=%d",
+            cfg.enabled, cfg.mode, cfg.show_hud, cfg.hud_protection, cfg.target_hz);
     }
 }
 
@@ -283,6 +304,16 @@ static void PresentWorkerLoop(std::shared_ptr<SwapchainContext> ctx) {
                     return !ctx->workerRunning.load() || ctx->pendingPresents.empty();
                 });
                 if (!ctx->workerRunning.load() || ctx->pendingPresents.empty()) continue;
+            }
+
+            while (std::chrono::steady_clock::now() < job.targetTime) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(_MSC_VER)
+                _mm_pause();
+#else
+                __builtin_ia32_pause();
+#endif
+#endif
             }
 
             job = ctx->pendingPresents.front();
@@ -848,9 +879,10 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
         return g_pfnQueuePresentKHR(queue, pPresentInfo);
     }
 
-    // 1. Update frame pacer and timing
+    // 1. Update frame pacer and timing (Auto VSync Cadence locked to display refresh rate)
+    ctx->pacer.SetTargetHz(cfg.target_hz);
+    ctx->pacer.PaceBasePresent();
     auto now = std::chrono::steady_clock::now();
-    ctx->pacer.OnGamePresent();
     static uint64_t s_presentCount = 0;
     s_presentCount++;
 
@@ -1096,18 +1128,19 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
         ctx->prevGameIdx = currentGameIdx;
 
         if (s_presentCount % 120 == 1) {
-            Log("FrameGen ACTIVE: 2x presents paced! Base: %.1f FPS -> Output: %.1f FPS (%s, interval: %.1f ms / pacing: %.1f ms)",
+            Log("FrameGen ACTIVE: 2x presents paced! Base: %.1f FPS -> Output: %.1f FPS (Display: %d Hz | %s, step: %.1f ms / avg: %.1f ms)",
                 ctx->pacer.GetBaseFps(), ctx->pacer.GetOutputFps(),
+                ctx->pacer.GetTargetHz(),
                 usedBlend ? "Compute Motion Blend" : "Fallback Copy",
-                static_cast<float>(ctx->pacer.GetAverageFrameTimeNs()) / 1e6f,
-                static_cast<float>(halfIntervalNs) / 1e6f);
+                static_cast<float>(halfIntervalNs) / 1e6f,
+                static_cast<float>(ctx->pacer.GetAverageFrameTimeNs()) / 1e6f);
         }
 
         if (s_presentCount % 60 == 1) {
             FILE* fStats = fopen("/tmp/skyframe_stats.json", "w");
             if (fStats) {
-                fprintf(fStats, "{\"base_fps\": %.1f, \"output_fps\": %.1f, \"enabled\": true}\n",
-                        ctx->pacer.GetBaseFps(), ctx->pacer.GetOutputFps());
+                fprintf(fStats, "{\"base_fps\": %.1f, \"output_fps\": %.1f, \"target_hz\": %d, \"enabled\": true}\n",
+                        ctx->pacer.GetBaseFps(), ctx->pacer.GetOutputFps(), ctx->pacer.GetTargetHz());
                 fclose(fStats);
             }
         }

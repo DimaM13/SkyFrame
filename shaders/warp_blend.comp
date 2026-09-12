@@ -68,11 +68,12 @@ const ivec2 kCandidates[49] = ivec2[49](
     ivec2(-2, 0), ivec2(2, 0), ivec2(0, -2), ivec2(0, 2)
 );
 
-// 9 sample points inside 8x8 block
-const ivec2 kBlockSamples[9] = ivec2[9](
-    ivec2(1, 1), ivec2(4, 1), ivec2(7, 1),
-    ivec2(1, 4), ivec2(4, 4), ivec2(7, 4),
-    ivec2(1, 7), ivec2(4, 7), ivec2(7, 7)
+// 16 sample points uniformly covering the 8x8 block (4x4 grid)
+const ivec2 kBlockSamples[16] = ivec2[16](
+    ivec2(0, 0), ivec2(2, 0), ivec2(5, 0), ivec2(7, 0),
+    ivec2(0, 2), ivec2(2, 2), ivec2(5, 2), ivec2(7, 2),
+    ivec2(0, 5), ivec2(2, 5), ivec2(5, 5), ivec2(7, 5),
+    ivec2(0, 7), ivec2(2, 7), ivec2(5, 7), ivec2(7, 7)
 );
 
 void main() {
@@ -87,7 +88,7 @@ void main() {
     if (tid < 49) {
         ivec2 cand = kCandidates[tid];
         float diff = 0.0;
-        for (int i = 0; i < 9; ++i) {
+        for (int i = 0; i < 16; ++i) {
             ivec2 p1 = clamp(baseCoord + kBlockSamples[i], ivec2(0), maxCoord);
             ivec2 p0 = clamp(p1 - cand, ivec2(0), maxCoord);
             vec3 c1 = imageLoad(u_Frame1, p1).rgb;
@@ -95,9 +96,9 @@ void main() {
             diff += abs(getLuma(c1) - getLuma(c0)) + 0.2 * dot(abs(c1 - c0), vec3(1.0));
         }
 
-        // Slight zero-bias to stabilize uniform / low-contrast regions
+        // Slight zero-bias only on pure zero candidate to prevent subpixel drift in flat regions
         if (cand.x == 0 && cand.y == 0) {
-            diff *= 0.88;
+            diff *= 0.94;
         }
 
         s_candSAD[tid] = diff;
@@ -107,7 +108,7 @@ void main() {
 
     barrier(); // Barrier 1: All 49 candidates evaluated
 
-    // 2. Thread 0 finds the best motion vector
+    // 2. Thread 0 finds the best motion vector for the block
     if (tid == 0) {
         float minVal = s_candSAD[0];
         int bestIdx = 0;
@@ -117,13 +118,7 @@ void main() {
                 bestIdx = i;
             }
         }
-
-        // Scene cut detection: if best SAD is very high (> 0.55 avg per sample), reset to 0
-        if (minVal > 0.55 * 9.0) {
-            s_bestVec = ivec2(0, 0);
-        } else {
-            s_bestVec = kCandidates[bestIdx];
-        }
+        s_bestVec = kCandidates[bestIdx];
     }
 
     barrier(); // Barrier 2: Best vector shared with all 64 threads
@@ -169,7 +164,15 @@ void main() {
     vec4 sample0 = sampleBilinearFrame0(pos0, size);
     vec4 sample1 = sampleBilinearFrame1(pos1, size);
 
-    vec4 finalColor = mix(sample0, sample1, 0.5);
+    // Color consistency check between the two projected samples
+    float colorDiff = dot(abs(sample0.rgb - sample1.rgb), vec3(0.299, 0.587, 0.114));
+
+    // Smooth soft-fade: if samples agree (colorDiff < 0.12), blend 50/50 for smooth motion.
+    // If samples disagree (occlusion/boundary error), smoothly fade to Frame 1 (sharp native frame),
+    // completely dissolving all block boundaries and preventing flickering squares!
+    float blendWeight = clamp(1.0 - (colorDiff - 0.12) * 4.0, 0.0, 1.0);
+    vec4 motionBlended = mix(sample0, sample1, 0.5);
+    vec4 finalColor = mix(sample1, motionBlended, blendWeight);
 
     // 5. Visual HUD marker (neon green square in corner to verify generated frame delivery)
     if (pc.show_hud == 1 && pixelCoord.x >= 6 && pixelCoord.x <= 18 && pixelCoord.y >= 6 && pixelCoord.y <= 18) {

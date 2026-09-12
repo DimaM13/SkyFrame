@@ -23,6 +23,7 @@ struct LayerConfig {
     bool hud_protection = true; // Protect static HUD
     float hud_threshold = 0.08f;
     int target_fps = 0;         // 0 = unconstrained / match refresh rate
+    int target_hz = 60;         // Target display refresh rate (e.g. 60, 90, 40, 45, 50, 72, 80, 120)
     bool show_hud = false;      // Visual debug indicator on generated frames
 };
 

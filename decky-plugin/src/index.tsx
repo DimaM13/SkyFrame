@@ -20,6 +20,7 @@ interface SkyFrameConfig {
   mode: number;
   hud_protection: boolean;
   multiplier: number;
+  target_hz?: number;
   show_hud?: boolean;
 }
 
@@ -39,7 +40,8 @@ const setGlobalInjectionCall = callable<[global_injection: boolean], SkyFrameCon
 const setModeCall = callable<[mode: number], SkyFrameConfig>("set_mode");
 const setHudProtectionCall = callable<[hud_protection: boolean], SkyFrameConfig>("set_hud_protection");
 const setShowHudCall = callable<[show_hud: boolean], SkyFrameConfig>("set_show_hud");
-const getStatsCall = callable<[], { base_fps: number; output_fps: number }>("get_stats");
+const setTargetHzCall = callable<[target_hz: number], SkyFrameConfig>("set_target_hz");
+const getStatsCall = callable<[], { base_fps: number; output_fps: number; target_hz?: number }>("get_stats");
 const getStatusInfoCall = callable<[], StatusInfo>("get_status_info");
 
 function Content() {
@@ -48,6 +50,7 @@ function Content() {
   const [mode, setMode] = useState<number>(1);
   const [hudProtection, setHudProtection] = useState<boolean>(true);
   const [showHud, setShowHud] = useState<boolean>(false);
+  const [targetHz, setTargetHz] = useState<number>(60);
   const [baseFps, setBaseFps] = useState<number>(30);
   const [outputFps, setOutputFps] = useState<number>(60);
   const [status, setStatus] = useState<StatusInfo | null>(null);
@@ -60,8 +63,35 @@ function Content() {
         setMode(Number(res.mode ?? 1));
         setHudProtection(Boolean(res.hud_protection ?? true));
         setShowHud(Boolean(res.show_hud ?? false));
+        if (res.target_hz) setTargetHz(Number(res.target_hz));
       }
     }).catch((e) => console.error("[SkyFrame] Error loading config:", e));
+
+    const checkRefreshRate = () => {
+      try {
+        const steamClient = (window as any).SteamClient;
+        if (steamClient?.Settings?.gamescope_display_refresh_rate) {
+          const hz = steamClient.Settings.gamescope_display_refresh_rate();
+          if (hz && hz >= 30 && hz <= 240) {
+            setTargetHz(Math.round(hz));
+            setTargetHzCall(Math.round(hz)).catch(() => {});
+            return;
+          }
+        }
+        if (steamClient?.System?.Perf?.GetSettings) {
+          steamClient.System.Perf.GetSettings().then((perf: any) => {
+            const hz = perf?.display_external_refresh_manual_hz || perf?.display_refresh_manual_hz;
+            if (hz && hz >= 30 && hz <= 240) {
+              setTargetHz(Math.round(hz));
+              setTargetHzCall(Math.round(hz)).catch(() => {});
+            }
+          }).catch(() => {});
+        }
+      } catch (e) {
+        console.warn("[SkyFrame] Could not query Steam refresh rate:", e);
+      }
+    };
+    checkRefreshRate();
 
     const loadStatus = () => {
       getStatusInfoCall().then(setStatus).catch(() => {});
@@ -73,9 +103,11 @@ function Content() {
         if (stats) {
           setBaseFps(Math.round(stats.base_fps));
           setOutputFps(Math.round(stats.output_fps));
+          if (stats.target_hz) setTargetHz(Math.round(stats.target_hz));
         }
       }).catch(() => {});
       loadStatus();
+      checkRefreshRate();
     }, 2000);
 
     return () => clearInterval(interval);
@@ -201,7 +233,7 @@ function Content() {
               <div style={{ display: "flex", justifyContent: "space-between" }}>
                 <span style={{ color: "#aaa" }}>Частота кадров:</span>
                 <span style={{ color: "#f59e0b", fontWeight: "bold" }}>
-                  {baseFps} FPS → {outputFps} FPS
+                  {baseFps} FPS → {outputFps} FPS ({targetHz} Hz Auto)
                 </span>
               </div>
               <div style={{ display: "flex", justifyContent: "space-between" }}>
