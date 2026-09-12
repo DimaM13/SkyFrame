@@ -154,88 +154,11 @@ void main()
 }
 )";
 
-static const char warp_pack8_comp_data[] = R"(
-#version 450
-
-#if NCNN_fp16_storage
-#extension GL_EXT_shader_16bit_storage: require
-struct sfpvec8 { f16vec4 abcd; f16vec4 efgh; };
-#endif
-#if NCNN_fp16_arithmetic
-#extension GL_EXT_shader_explicit_arithmetic_types_float16: require
-#endif
-
-layout (binding = 0) readonly buffer image_blob { sfpvec8 image_blob_data[]; };
-layout (binding = 1) readonly buffer flow_blob { sfp flow_blob_data[]; };
-layout (binding = 2) writeonly buffer top_blob { sfpvec8 top_blob_data[]; };
-
-layout (push_constant) uniform parameter
-{
-    int w;
-    int h;
-    int c;
-    int cstep;
-} p;
-
-void main()
-{
-    int gx = int(gl_GlobalInvocationID.x);
-    int gy = int(gl_GlobalInvocationID.y);
-    int gz = int(gl_GlobalInvocationID.z);
-
-    if (gx >= p.w || gy >= p.h || gz >= p.c)
-        return;
-
-    afp flow_x = buffer_ld1(flow_blob_data, gy * p.w + gx);
-    afp flow_y = buffer_ld1(flow_blob_data, p.cstep + gy * p.w + gx);
-
-    afp sample_x = afp(gx) + flow_x;
-    afp sample_y = afp(gy) + flow_y;
-
-    // bilinear interpolate
-    afpvec8 v;
-    {
-        int x0 = int(floor(sample_x));
-        int y0 = int(floor(sample_y));
-        int x1 = x0 + 1;
-        int y1 = y0 + 1;
-
-        x0 = clamp(x0, 0, p.w - 1);
-        y0 = clamp(y0, 0, p.h - 1);
-        x1 = clamp(x1, 0, p.w - 1);
-        y1 = clamp(y1, 0, p.h - 1);
-
-        afp alpha = sample_x - afp(x0);
-        afp beta = sample_y - afp(y0);
-
-        afpvec8 v0 = buffer_ld8(image_blob_data, gz * p.cstep + y0 * p.w + x0);
-        afpvec8 v1 = buffer_ld8(image_blob_data, gz * p.cstep + y0 * p.w + x1);
-        afpvec8 v2 = buffer_ld8(image_blob_data, gz * p.cstep + y1 * p.w + x0);
-        afpvec8 v3 = buffer_ld8(image_blob_data, gz * p.cstep + y1 * p.w + x1);
-
-        afpvec8 v4;
-        afpvec8 v5;
-
-        v4[0] = v0[0] * (afp(1.f) - alpha) + v1[0] * alpha;
-        v4[1] = v0[1] * (afp(1.f) - alpha) + v1[1] * alpha;
-        v5[0] = v2[0] * (afp(1.f) - alpha) + v3[0] * alpha;
-        v5[1] = v2[1] * (afp(1.f) - alpha) + v3[1] * alpha;
-
-        v[0] = v4[0] * (afp(1.f) - beta) + v5[0] * beta;
-        v[1] = v4[1] * (afp(1.f) - beta) + v5[1] * beta;
-    }
-
-    const int gi = gz * p.cstep + gy * p.w + gx;
-
-    buffer_st8(top_blob_data, gi, v);
-}
-)";
-
 RifeWarp::RifeWarp() {
     support_vulkan = true;
+    support_packing = false;
     pipeline_warp = nullptr;
     pipeline_warp_pack4 = nullptr;
-    pipeline_warp_pack8 = nullptr;
 }
 
 int RifeWarp::create_pipeline(const ncnn::Option& opt) {
@@ -254,9 +177,11 @@ int RifeWarp::create_pipeline(const ncnn::Option& opt) {
             }
         }
 
-        pipeline_warp = new ncnn::Pipeline(vkdev);
-        pipeline_warp->set_optimal_local_size_xyz();
-        pipeline_warp->create(spirv.data(), spirv.size() * 4, specializations);
+        if (!spirv.empty()) {
+            pipeline_warp = new ncnn::Pipeline(vkdev);
+            pipeline_warp->set_optimal_local_size_xyz();
+            pipeline_warp->create(spirv.data(), spirv.size() * 4, specializations);
+        }
     }
 
     // 2. Pack4
@@ -270,25 +195,11 @@ int RifeWarp::create_pipeline(const ncnn::Option& opt) {
             }
         }
 
-        pipeline_warp_pack4 = new ncnn::Pipeline(vkdev);
-        pipeline_warp_pack4->set_optimal_local_size_xyz();
-        pipeline_warp_pack4->create(spirv.data(), spirv.size() * 4, specializations);
-    }
-
-    // 3. Pack8
-    if (opt.use_packing_layout) {
-        static std::vector<uint32_t> spirv;
-        static ncnn::Mutex lock;
-        {
-            ncnn::MutexLockGuard guard(lock);
-            if (spirv.empty()) {
-                ncnn::compile_spirv_module(warp_pack8_comp_data, opt, spirv);
-            }
+        if (!spirv.empty()) {
+            pipeline_warp_pack4 = new ncnn::Pipeline(vkdev);
+            pipeline_warp_pack4->set_optimal_local_size_xyz();
+            pipeline_warp_pack4->create(spirv.data(), spirv.size() * 4, specializations);
         }
-
-        pipeline_warp_pack8 = new ncnn::Pipeline(vkdev);
-        pipeline_warp_pack8->set_optimal_local_size_xyz();
-        pipeline_warp_pack8->create(spirv.data(), spirv.size() * 4, specializations);
     }
 
     return 0;
@@ -300,9 +211,6 @@ int RifeWarp::destroy_pipeline(const ncnn::Option& /*opt*/) {
 
     delete pipeline_warp_pack4;
     pipeline_warp_pack4 = nullptr;
-
-    delete pipeline_warp_pack8;
-    pipeline_warp_pack8 = nullptr;
 
     return 0;
 }
@@ -390,9 +298,7 @@ int RifeWarp::forward(const std::vector<ncnn::VkMat>& bottom_blobs, std::vector<
     constants[2].i = top_blob.c;
     constants[3].i = top_blob.cstep;
 
-    if (elempack == 8 && pipeline_warp_pack8) {
-        cmd.record_pipeline(pipeline_warp_pack8, bindings, constants, top_blob);
-    } else if (elempack == 4 && pipeline_warp_pack4) {
+    if (elempack == 4 && pipeline_warp_pack4) {
         cmd.record_pipeline(pipeline_warp_pack4, bindings, constants, top_blob);
     } else if (pipeline_warp) {
         cmd.record_pipeline(pipeline_warp, bindings, constants, top_blob);

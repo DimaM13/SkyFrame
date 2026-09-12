@@ -26,7 +26,6 @@ public:
 private:
     ncnn::Pipeline* pipeline_warp = nullptr;
     ncnn::Pipeline* pipeline_warp_pack4 = nullptr;
-    ncnn::Pipeline* pipeline_warp_pack8 = nullptr;
 };
 
 ncnn::Layer* RifeWarp_layer_creator(void* userdata);
