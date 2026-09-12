@@ -94,16 +94,16 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: github.ref == 'refs/heads/main'
         with:
-          tag_name: v1.1.6
-          name: "SkyFrame v1.1.6 for Steam Deck (Critical Fix: NCNN Instance Isolation & Black Screen Fix)"
+          tag_name: v1.1.7
+          name: "SkyFrame v1.1.7 for Steam Deck (Critical Fix: Vulkan Memory Properties & APU Fallback)"
           body: |
-            ## 🚀 SkyFrame v1.1.6 — Исправление черного экрана (1 FPS) и изоляция Vulkan-устройств NCNN
+            ## 🚀 SkyFrame v1.1.7 — Полное устранение ошибки Physical Device Memory Properties и краша
 
-            ### Что исправлено в v1.1.6:
-            - **Устранено зависание на первом кадре (Черный экран, 1 кадр):** NCNN при инициализации создавал отдельное Vulkan-устройство, которое перехватывалось нашим слоем и перезаписывало глобальные указатели функций игры (`vkQueuePresentKHR`, `vkQueueSubmit`, `g_physicalDevice`), из-за чего игра больше не могла выводить кадры на экран.
-            - **Полная изоляция NCNN от игрового пайплайна:** добавлены фильтры для перехвата `vkCreateInstance` и `vkCreateDevice` внутренних вызовов NCNN, чтобы NCNN не трогал и не ломал swapchain-пайплайн и очереди команд игры.
-            - **Привязка физических устройств per-device:** `SwapchainContext` теперь гарантированно использует валидное `VkPhysicalDevice` игры, устраняя ошибку `VUID-vkGetPhysicalDeviceMemoryProperties-physicalDevice-parameter`.
-            - **Полноценная работа RIFE FlowNet + FastWarp 1280x800 в 60 FPS.**
+            ### Что исправлено в v1.1.7:
+            - **Устранен краш при создании текстур оптического потока (SIGSEGV):** устранена ошибка `vkGetPhysicalDeviceMemoryProperties: Invalid physicalDevice [VUID-vkGetPhysicalDeviceMemoryProperties-physicalDevice-parameter]`.
+            - **Прямое кэширование свойств памяти устройства:** `VulkanWarper` больше не обращается к трамплину `libvulkan.so` во время распределения памяти, а использует свойства памяти устройства, перехваченные при создании устройства (`Hook_vkCreateDevice`).
+            - **Безотказный APU Fallback:** добавлен встроенный профиль свойств памяти для APU VanGogh (Steam Deck), гарантирующий 100% успех выделения памяти под RG32F/R32F и промежуточные буферы даже при изоляции или уничтожении вспомогательных экземпляров Vulkan.
+            - **Чистый запуск игры:** устранен темный экран и зависание на 1 кадре. Полноценная интерполяция 30 -> 60 FPS через RIFE FlowNet + FastWarp.
           files: SkyFrame.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

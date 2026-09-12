@@ -44,12 +44,32 @@ namespace skyframe {
 static LayerConfig g_config;
 static std::mutex g_configMutex;
 static uint32_t g_graphicsQueueFamily = 0;
+static VkInstance g_instance = VK_NULL_HANDLE;
 static VkPhysicalDevice g_physicalDevice = VK_NULL_HANDLE;
 
 static std::atomic<bool> g_isInternalNcnnCall{false};
 static std::mutex g_deviceMapMutex;
 static std::unordered_map<VkDevice, VkPhysicalDevice> g_deviceToPhysicalDevice;
 static std::unordered_map<VkDevice, PFN_vkGetDeviceProcAddr> g_deviceToGetDeviceProcAddr;
+static std::unordered_map<VkDevice, VkPhysicalDeviceMemoryProperties> g_deviceToMemProperties;
+static VkPhysicalDeviceMemoryProperties g_fallbackMemProperties{};
+
+static void InitFallbackMemProperties(VkPhysicalDeviceMemoryProperties& memProps) {
+    memProps = {};
+    memProps.memoryTypeCount = 3;
+    // Type 0: Device Local (VRAM)
+    memProps.memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    memProps.memoryTypes[0].heapIndex = 0;
+    // Type 1: Host Visible | Host Coherent | Host Cached (System RAM)
+    memProps.memoryTypes[1].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    memProps.memoryTypes[1].heapIndex = 0;
+    // Type 2: Device Local | Host Visible | Host Coherent (BAR/ReBAR VRAM)
+    memProps.memoryTypes[2].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    memProps.memoryTypes[2].heapIndex = 0;
+    memProps.memoryHeapCount = 1;
+    memProps.memoryHeaps[0].size = 16ULL * 1024 * 1024 * 1024;
+    memProps.memoryHeaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
+}
 
 void Log(const char* fmt, ...) {
     va_list args;
@@ -279,6 +299,7 @@ struct SwapchainContext {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+    VkPhysicalDeviceMemoryProperties memProperties{};
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkExtent2D extent{0, 0};
     std::vector<VkImage> images;
@@ -584,15 +605,11 @@ static bool InitRifePipeline(SwapchainContext* ctx) {
         return false;
     }
 
-    if (ctx->physicalDevice == VK_NULL_HANDLE) {
-        ctx->physicalDevice = g_physicalDevice;
-    }
-    if (ctx->physicalDevice == VK_NULL_HANDLE) {
-        Log("ctx->physicalDevice is null, cannot init VulkanWarper for RIFE");
-        return false;
+    if (ctx->memProperties.memoryTypeCount == 0) {
+        InitFallbackMemProperties(ctx->memProperties);
     }
 
-    ctx->warper = std::make_unique<VulkanWarper>(ctx->device, ctx->physicalDevice, (VkQueue)VK_NULL_HANDLE, g_graphicsQueueFamily);
+    ctx->warper = std::make_unique<VulkanWarper>(ctx->device, ctx->memProperties, (VkQueue)VK_NULL_HANDLE, g_graphicsQueueFamily);
 
 #if HAVE_WARP_RGBA
     size_t downSize = 0;
@@ -690,6 +707,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateInstance(
         return VK_SUCCESS;
     }
 
+    g_instance = *pInstance;
     g_nextGetInstanceProcAddr = nextGetInstanceProcAddr;
     g_nextCreateInstance = nextCreateInstance;
     g_nextDestroyInstance = (PFN_vkDestroyInstance)g_nextGetInstanceProcAddr(*pInstance, "vkDestroyInstance");
@@ -704,6 +722,9 @@ VKAPI_ATTR void VKAPI_CALL Hook_vkDestroyInstance(
     const VkAllocationCallbacks* pAllocator
 ) {
     Log("Hook_vkDestroyInstance called");
+    if (instance == g_instance) {
+        g_instance = VK_NULL_HANDLE;
+    }
     if (g_nextDestroyInstance) {
         g_nextDestroyInstance(instance, pAllocator);
     }
@@ -745,6 +766,27 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateDevice(
         return VK_SUCCESS;
     }
 
+    PFN_vkGetPhysicalDeviceMemoryProperties nextGetPhysMemProps = nullptr;
+    if (nextGetInstanceProcAddr) {
+        nextGetPhysMemProps = (PFN_vkGetPhysicalDeviceMemoryProperties)nextGetInstanceProcAddr(VK_NULL_HANDLE, "vkGetPhysicalDeviceMemoryProperties");
+    }
+    if (!nextGetPhysMemProps && g_nextGetInstanceProcAddr && g_instance) {
+        nextGetPhysMemProps = (PFN_vkGetPhysicalDeviceMemoryProperties)g_nextGetInstanceProcAddr(g_instance, "vkGetPhysicalDeviceMemoryProperties");
+    }
+
+    VkPhysicalDeviceMemoryProperties memProps{};
+    if (nextGetPhysMemProps) {
+        nextGetPhysMemProps(physicalDevice, &memProps);
+    }
+
+    if (memProps.memoryTypeCount == 0) {
+        InitFallbackMemProperties(memProps);
+        Log("Hook_vkCreateDevice: Initialized robust APU fallback memory properties (%u types).", memProps.memoryTypeCount);
+    } else {
+        Log("Hook_vkCreateDevice: Captured downstream memory properties (%u types, %u heaps).",
+            memProps.memoryTypeCount, memProps.memoryHeapCount);
+    }
+
     g_nextGetDeviceProcAddr = nextGetDeviceProcAddr;
     g_nextGetInstanceProcAddr = nextGetInstanceProcAddr;
     g_physicalDevice = physicalDevice;
@@ -753,6 +795,8 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateDevice(
         std::lock_guard<std::mutex> lock(g_deviceMapMutex);
         g_deviceToPhysicalDevice[*pDevice] = physicalDevice;
         g_deviceToGetDeviceProcAddr[*pDevice] = nextGetDeviceProcAddr;
+        g_deviceToMemProperties[*pDevice] = memProps;
+        g_fallbackMemProperties = memProps;
     }
 
     if (pCreateInfo && pCreateInfo->queueCreateInfoCount > 0) {
@@ -856,6 +900,7 @@ VKAPI_ATTR void VKAPI_CALL Hook_vkDestroyDevice(
         }
         g_deviceToPhysicalDevice.erase(device);
         g_deviceToGetDeviceProcAddr.erase(device);
+        g_deviceToMemProperties.erase(device);
     }
     if (!nextDestroyDevice) nextDestroyDevice = g_nextDestroyDevice;
     if (nextDestroyDevice) {
@@ -904,6 +949,12 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateSwapchainKHR(
             ctx->physicalDevice = it->second;
         } else {
             ctx->physicalDevice = g_physicalDevice;
+        }
+        auto itMem = g_deviceToMemProperties.find(device);
+        if (itMem != g_deviceToMemProperties.end()) {
+            ctx->memProperties = itMem->second;
+        } else {
+            ctx->memProperties = g_fallbackMemProperties;
         }
     }
     ctx->format = modifiedCi.imageFormat;

@@ -16,8 +16,8 @@ static VkShaderModule CreateShaderModule(VkDevice device, const uint32_t* pCode,
     return mod;
 }
 
-VulkanWarper::VulkanWarper(VkDevice device, VkPhysicalDevice physicalDevice, VkQueue queue, uint32_t queueFamilyIndex)
-    : m_device(device), m_physDevice(physicalDevice), m_queue(queue), m_queueFamily(queueFamilyIndex) {
+VulkanWarper::VulkanWarper(VkDevice device, const VkPhysicalDeviceMemoryProperties& memProperties, VkQueue queue, uint32_t queueFamilyIndex)
+    : m_device(device), m_memProperties(memProperties), m_queue(queue), m_queueFamily(queueFamilyIndex) {
     
     // Linear clamp-to-edge sampler for hardware bilinear interpolation
     VkSamplerCreateInfo sci{};
@@ -60,10 +60,27 @@ VulkanWarper::~VulkanWarper() {
 }
 
 uint32_t VulkanWarper::FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
-    VkPhysicalDeviceMemoryProperties memProperties;
-    vkGetPhysicalDeviceMemoryProperties(m_physDevice, &memProperties);
-    for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
-        if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+    if (m_memProperties.memoryTypeCount > 0) {
+        for (uint32_t i = 0; i < m_memProperties.memoryTypeCount; i++) {
+            if ((typeFilter & (1 << i)) && (m_memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+                return i;
+            }
+        }
+        for (uint32_t i = 0; i < m_memProperties.memoryTypeCount; i++) {
+            if (typeFilter & (1 << i)) {
+                if ((m_memProperties.memoryTypes[i].propertyFlags & properties) != 0) {
+                    return i;
+                }
+            }
+        }
+        for (uint32_t i = 0; i < m_memProperties.memoryTypeCount; i++) {
+            if (typeFilter & (1 << i)) {
+                return i;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < 32; i++) {
+        if (typeFilter & (1 << i)) {
             return i;
         }
     }

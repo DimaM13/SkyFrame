@@ -19,7 +19,7 @@ struct WarpPushConstants {
 
 class VulkanWarper {
 public:
-    VulkanWarper(VkDevice device, VkPhysicalDevice physicalDevice, VkQueue queue, uint32_t queueFamilyIndex);
+    VulkanWarper(VkDevice device, const VkPhysicalDeviceMemoryProperties& memProperties, VkQueue queue, uint32_t queueFamilyIndex);
     ~VulkanWarper();
 
     bool InitPipelines(const uint32_t* warpSpv, size_t warpSize, const uint32_t* downSpv, size_t downSize);
@@ -87,7 +87,7 @@ private:
     uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
 
     VkDevice m_device = VK_NULL_HANDLE;
-    VkPhysicalDevice m_physDevice = VK_NULL_HANDLE;
+    VkPhysicalDeviceMemoryProperties m_memProperties{};
     VkQueue m_queue = VK_NULL_HANDLE;
     uint32_t m_queueFamily = 0;
 
