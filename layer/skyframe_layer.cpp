@@ -580,7 +580,7 @@ static bool InitRifePipeline(SwapchainContext* ctx) {
         return false;
     }
 
-    ctx->warper = std::make_unique<VulkanWarper>(ctx->device, g_physicalDevice, VK_NULL_HANDLE, g_graphicsQueueFamily);
+    ctx->warper = std::make_unique<VulkanWarper>(ctx->device, g_physicalDevice, (VkQueue)VK_NULL_HANDLE, g_graphicsQueueFamily);
 
 #if HAVE_WARP_RGBA
     size_t downSize = 0;
