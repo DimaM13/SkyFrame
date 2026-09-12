@@ -67,6 +67,13 @@ if (ENABLE_NCNN AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     if (ncnn_FOUND)
         message(STATUS "Found NCNN: ${ncnn_DIR}")
         target_compile_definitions(VkLayer_skyframe PRIVATE HAVE_NCNN=1)
+        target_include_directories(VkLayer_skyframe PRIVATE
+            ${ncnn_INCLUDE_DIRS}
+            "${NCNN_DIR}/include"
+            "${NCNN_DIR}/include/ncnn"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ncnn_install/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ncnn_install/include/ncnn"
+        )
         target_link_libraries(VkLayer_skyframe PRIVATE ncnn)
     else()
         message(WARNING "NCNN not found, building with blend compute fallback")

@@ -2,8 +2,13 @@
 
 #if HAVE_NCNN
 
+#if __has_include(<ncnn/command.h>)
 #include <ncnn/command.h>
 #include <ncnn/gpu.h>
+#else
+#include <command.h>
+#include <gpu.h>
+#endif
 #include <cmath>
 #include <algorithm>
 

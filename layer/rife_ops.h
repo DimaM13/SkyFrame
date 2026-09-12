@@ -3,9 +3,15 @@
 #if HAVE_NCNN
 
 #include <vector>
+#if __has_include(<ncnn/layer.h>)
 #include <ncnn/layer.h>
 #include <ncnn/pipeline.h>
 #include <ncnn/mat.h>
+#else
+#include <layer.h>
+#include <pipeline.h>
+#include <mat.h>
+#endif
 
 namespace skyframe {
 

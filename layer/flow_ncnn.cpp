@@ -5,8 +5,13 @@
 #include <algorithm>
 
 #if HAVE_NCNN
+#if __has_include(<ncnn/net.h>)
 #include <ncnn/net.h>
 #include <ncnn/gpu.h>
+#else
+#include <net.h>
+#include <gpu.h>
+#endif
 #include "rife_ops.h"
 #endif
 
