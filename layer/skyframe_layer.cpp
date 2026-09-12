@@ -20,6 +20,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if __has_include("warp_blend_comp_spv.h")
+#include "warp_blend_comp_spv.h"
+#define HAVE_WARP_BLEND 1
+#endif
+
 namespace skyframe {
 
 static LayerConfig g_config;
@@ -151,11 +156,6 @@ PFN_vkCmdBindPipeline           g_pfnCmdBindPipeline = nullptr;
 PFN_vkCmdBindDescriptorSets     g_pfnCmdBindDescriptorSets = nullptr;
 PFN_vkCmdPushConstants          g_pfnCmdPushConstants = nullptr;
 PFN_vkCmdDispatch               g_pfnCmdDispatch = nullptr;
-
-#if __has_include("warp_blend_comp_spv.h")
-#include "warp_blend_comp_spv.h"
-#define HAVE_WARP_BLEND 1
-#endif
 
 constexpr size_t RING_SIZE = 4;
 
