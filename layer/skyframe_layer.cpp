@@ -46,6 +46,11 @@ static std::mutex g_configMutex;
 static uint32_t g_graphicsQueueFamily = 0;
 static VkPhysicalDevice g_physicalDevice = VK_NULL_HANDLE;
 
+static std::atomic<bool> g_isInternalNcnnCall{false};
+static std::mutex g_deviceMapMutex;
+static std::unordered_map<VkDevice, VkPhysicalDevice> g_deviceToPhysicalDevice;
+static std::unordered_map<VkDevice, PFN_vkGetDeviceProcAddr> g_deviceToGetDeviceProcAddr;
+
 void Log(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -273,6 +278,7 @@ struct BlendPushConstants {
 struct SwapchainContext {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
+    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkExtent2D extent{0, 0};
     std::vector<VkImage> images;
@@ -562,7 +568,10 @@ static bool InitRifePipeline(SwapchainContext* ctx) {
     for (const auto& dir : modelDirs) {
         std::string param = dir + "/flownet.param";
         if (access(param.c_str(), R_OK) == 0) {
-            if (ctx->flowEstimator->LoadModel(dir)) {
+            g_isInternalNcnnCall.store(true);
+            bool ok = ctx->flowEstimator->LoadModel(dir);
+            g_isInternalNcnnCall.store(false);
+            if (ok) {
                 Log("FlowEstimator loaded RIFE model from %s", dir.c_str());
                 modelLoaded = true;
                 break;
@@ -575,12 +584,15 @@ static bool InitRifePipeline(SwapchainContext* ctx) {
         return false;
     }
 
-    if (g_physicalDevice == VK_NULL_HANDLE) {
-        Log("g_physicalDevice is null, cannot init VulkanWarper for RIFE");
+    if (ctx->physicalDevice == VK_NULL_HANDLE) {
+        ctx->physicalDevice = g_physicalDevice;
+    }
+    if (ctx->physicalDevice == VK_NULL_HANDLE) {
+        Log("ctx->physicalDevice is null, cannot init VulkanWarper for RIFE");
         return false;
     }
 
-    ctx->warper = std::make_unique<VulkanWarper>(ctx->device, g_physicalDevice, (VkQueue)VK_NULL_HANDLE, g_graphicsQueueFamily);
+    ctx->warper = std::make_unique<VulkanWarper>(ctx->device, ctx->physicalDevice, (VkQueue)VK_NULL_HANDLE, g_graphicsQueueFamily);
 
 #if HAVE_WARP_RGBA
     size_t downSize = 0;
@@ -650,21 +662,36 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateInstance(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    g_nextGetInstanceProcAddr = chain_info->u.pLayerInfo->pfnNextGetInstanceProcAddr;
+    PFN_vkGetInstanceProcAddr nextGetInstanceProcAddr = chain_info->u.pLayerInfo->pfnNextGetInstanceProcAddr;
     chain_info->u.pLayerInfo = chain_info->u.pLayerInfo->pNext;
 
-    g_nextCreateInstance = (PFN_vkCreateInstance)g_nextGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance");
-    if (!g_nextCreateInstance) {
+    PFN_vkCreateInstance nextCreateInstance = (PFN_vkCreateInstance)nextGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance");
+    if (!nextCreateInstance) {
         Log("ERROR: Failed to find next vkCreateInstance!");
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    VkResult res = g_nextCreateInstance(pCreateInfo, pAllocator, pInstance);
+    VkResult res = nextCreateInstance(pCreateInfo, pAllocator, pInstance);
     if (res != VK_SUCCESS) {
         Log("vkCreateInstance downstream returned error: %d", res);
         return res;
     }
 
+    bool isNcnn = g_isInternalNcnnCall.load();
+    if (pCreateInfo && pCreateInfo->pApplicationInfo) {
+        if ((pCreateInfo->pApplicationInfo->pApplicationName && strcmp(pCreateInfo->pApplicationInfo->pApplicationName, "ncnn") == 0) ||
+            (pCreateInfo->pApplicationInfo->pEngineName && strcmp(pCreateInfo->pApplicationInfo->pEngineName, "ncnn") == 0)) {
+            isNcnn = true;
+        }
+    }
+
+    if (isNcnn) {
+        Log("Hook_vkCreateInstance: NCNN Vulkan Instance created, bypassing layer state capture.");
+        return VK_SUCCESS;
+    }
+
+    g_nextGetInstanceProcAddr = nextGetInstanceProcAddr;
+    g_nextCreateInstance = nextCreateInstance;
     g_nextDestroyInstance = (PFN_vkDestroyInstance)g_nextGetInstanceProcAddr(*pInstance, "vkDestroyInstance");
     g_nextCreateDevice = (PFN_vkCreateDevice)g_nextGetInstanceProcAddr(*pInstance, "vkCreateDevice");
 
@@ -688,7 +715,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateDevice(
     const VkAllocationCallbacks* pAllocator,
     VkDevice* pDevice
 ) {
-    Log("Hook_vkCreateDevice called");
+    Log("Hook_vkCreateDevice called (internalNcnn=%d)", (int)g_isInternalNcnnCall.load());
     VkLayerDeviceCreateInfo* chain_info = (VkLayerDeviceCreateInfo*)pCreateInfo->pNext;
     while (chain_info && (chain_info->sType != VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO ||
                           chain_info->function != VK_LAYER_LINK_INFO)) {
@@ -700,11 +727,11 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateDevice(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    g_nextGetDeviceProcAddr = chain_info->u.pLayerInfo->pfnNextGetDeviceProcAddr;
-    g_nextGetInstanceProcAddr = chain_info->u.pLayerInfo->pfnNextGetInstanceProcAddr;
+    PFN_vkGetDeviceProcAddr nextGetDeviceProcAddr = chain_info->u.pLayerInfo->pfnNextGetDeviceProcAddr;
+    PFN_vkGetInstanceProcAddr nextGetInstanceProcAddr = chain_info->u.pLayerInfo->pfnNextGetInstanceProcAddr;
     chain_info->u.pLayerInfo = chain_info->u.pLayerInfo->pNext;
 
-    PFN_vkCreateDevice nextCreateDevice = (PFN_vkCreateDevice)g_nextGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateDevice");
+    PFN_vkCreateDevice nextCreateDevice = (PFN_vkCreateDevice)nextGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateDevice");
     if (!nextCreateDevice) nextCreateDevice = g_nextCreateDevice;
 
     VkResult res = nextCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
@@ -713,7 +740,20 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateDevice(
         return res;
     }
 
+    if (g_isInternalNcnnCall.load()) {
+        Log("Hook_vkCreateDevice: NCNN Vulkan Device created, bypassing layer state capture.");
+        return VK_SUCCESS;
+    }
+
+    g_nextGetDeviceProcAddr = nextGetDeviceProcAddr;
+    g_nextGetInstanceProcAddr = nextGetInstanceProcAddr;
     g_physicalDevice = physicalDevice;
+
+    {
+        std::lock_guard<std::mutex> lock(g_deviceMapMutex);
+        g_deviceToPhysicalDevice[*pDevice] = physicalDevice;
+        g_deviceToGetDeviceProcAddr[*pDevice] = nextGetDeviceProcAddr;
+    }
 
     if (pCreateInfo && pCreateInfo->queueCreateInfoCount > 0) {
         g_graphicsQueueFamily = pCreateInfo->pQueueCreateInfos[0].queueFamilyIndex;
@@ -807,8 +847,19 @@ VKAPI_ATTR void VKAPI_CALL Hook_vkDestroyDevice(
     const VkAllocationCallbacks* pAllocator
 ) {
     Log("Hook_vkDestroyDevice called");
-    if (g_nextDestroyDevice) {
-        g_nextDestroyDevice(device, pAllocator);
+    PFN_vkDestroyDevice nextDestroyDevice = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_deviceMapMutex);
+        auto it = g_deviceToGetDeviceProcAddr.find(device);
+        if (it != g_deviceToGetDeviceProcAddr.end() && it->second) {
+            nextDestroyDevice = (PFN_vkDestroyDevice)it->second(device, "vkDestroyDevice");
+        }
+        g_deviceToPhysicalDevice.erase(device);
+        g_deviceToGetDeviceProcAddr.erase(device);
+    }
+    if (!nextDestroyDevice) nextDestroyDevice = g_nextDestroyDevice;
+    if (nextDestroyDevice) {
+        nextDestroyDevice(device, pAllocator);
     }
 }
 
@@ -846,6 +897,15 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateSwapchainKHR(
     auto ctx = std::make_shared<SwapchainContext>();
     ctx->swapchain = *pSwapchain;
     ctx->device = device;
+    {
+        std::lock_guard<std::mutex> lock(g_deviceMapMutex);
+        auto it = g_deviceToPhysicalDevice.find(device);
+        if (it != g_deviceToPhysicalDevice.end()) {
+            ctx->physicalDevice = it->second;
+        } else {
+            ctx->physicalDevice = g_physicalDevice;
+        }
+    }
     ctx->format = modifiedCi.imageFormat;
     ctx->extent = modifiedCi.imageExtent;
 
@@ -1587,8 +1647,18 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL skyframe_GetDeviceProcA
     if (strcmp(pName, "vkGetSwapchainImagesKHR") == 0) return (PFN_vkVoidFunction)skyframe::Hook_vkGetSwapchainImagesKHR;
     if (strcmp(pName, "vkQueuePresentKHR") == 0) return (PFN_vkVoidFunction)skyframe::Hook_vkQueuePresentKHR;
 
-    if (skyframe::g_nextGetDeviceProcAddr && device) {
-        return skyframe::g_nextGetDeviceProcAddr(device, pName);
+    PFN_vkGetDeviceProcAddr nextPfn = nullptr;
+    if (device) {
+        std::lock_guard<std::mutex> lock(skyframe::g_deviceMapMutex);
+        auto it = skyframe::g_deviceToGetDeviceProcAddr.find(device);
+        if (it != skyframe::g_deviceToGetDeviceProcAddr.end()) {
+            nextPfn = it->second;
+        }
+    }
+    if (!nextPfn) nextPfn = skyframe::g_nextGetDeviceProcAddr;
+
+    if (nextPfn && device) {
+        return nextPfn(device, pName);
     }
     return nullptr;
 }

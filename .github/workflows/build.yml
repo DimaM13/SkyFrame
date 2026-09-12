@@ -94,15 +94,16 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: github.ref == 'refs/heads/main'
         with:
-          tag_name: v1.1.5
-          name: "SkyFrame v1.1.5 for Steam Deck (Critical Fix: Shader Crash Resolved)"
+          tag_name: v1.1.6
+          name: "SkyFrame v1.1.6 for Steam Deck (Critical Fix: NCNN Instance Isolation & Black Screen Fix)"
           body: |
-            ## 🚀 SkyFrame v1.1.5 — Исправление вылета игр при запуске и стабилизация NCNN
+            ## 🚀 SkyFrame v1.1.6 — Исправление черного экрана (1 FPS) и изоляция Vulkan-устройств NCNN
 
-            ### Что исправлено в v1.1.5:
-            - **Устранен критический вылет при старте игр (Fix `afpvec8` crash):** удален несовместимый GLSL pack8 шейдер `afpvec8`, вызывавший ошибку компиляции SPIR-V в NCNN на драйверах RADV VanGogh и аварийное завершение процесса игры.
-            - **100% стабильная загрузка RIFE FlowNet (NCNN Vulkan):** переведен RifeWarp на проверенный Pack1/Pack4 пайплайн с защитой от нулевых SPIR-V модулей.
-            - **Нативный FastWarp 1280x800:** расчет непрерывных субпиксельных векторов без блочных артефактов и квадратов в 60 FPS.
+            ### Что исправлено в v1.1.6:
+            - **Устранено зависание на первом кадре (Черный экран, 1 кадр):** NCNN при инициализации создавал отдельное Vulkan-устройство, которое перехватывалось нашим слоем и перезаписывало глобальные указатели функций игры (`vkQueuePresentKHR`, `vkQueueSubmit`, `g_physicalDevice`), из-за чего игра больше не могла выводить кадры на экран.
+            - **Полная изоляция NCNN от игрового пайплайна:** добавлены фильтры для перехвата `vkCreateInstance` и `vkCreateDevice` внутренних вызовов NCNN, чтобы NCNN не трогал и не ломал swapchain-пайплайн и очереди команд игры.
+            - **Привязка физических устройств per-device:** `SwapchainContext` теперь гарантированно использует валидное `VkPhysicalDevice` игры, устраняя ошибку `VUID-vkGetPhysicalDeviceMemoryProperties-physicalDevice-parameter`.
+            - **Полноценная работа RIFE FlowNet + FastWarp 1280x800 в 60 FPS.**
           files: SkyFrame.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
