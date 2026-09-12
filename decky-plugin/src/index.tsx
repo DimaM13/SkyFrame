@@ -1,47 +1,53 @@
 import {
-  definePlugin,
   PanelSection,
   PanelSectionRow,
   ToggleField,
   DropdownItem,
-  ServerAPI,
   staticClasses
-} from "decky-frontend-lib";
-import { VFC, useState, useEffect } from "react";
-import { FaBolt, FaRocket, FaShieldAlt } from "react-icons/fa";
+} from "@decky/ui";
+import {
+  callable,
+  definePlugin
+} from "@decky/api";
+import { useState, useEffect } from "react";
+import { FaBolt } from "react-icons/fa";
 
 interface SkyFrameConfig {
   enabled: boolean;
-  mode: number; // 0 = Lite (180p), 1 = Balanced (240p), 2 = Quality (360p)
+  mode: number;
   hud_protection: boolean;
   multiplier: number;
 }
 
-const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
+const getConfig = callable<[], SkyFrameConfig>("get_config");
+const setEnabledCall = callable<[enabled: boolean], SkyFrameConfig>("set_enabled");
+const setModeCall = callable<[mode: number], SkyFrameConfig>("set_mode");
+const setHudProtectionCall = callable<[hud_protection: boolean], SkyFrameConfig>("set_hud_protection");
+const getStatsCall = callable<[], { base_fps: number; output_fps: number }>("get_stats");
+
+function Content() {
   const [enabled, setEnabled] = useState<boolean>(false);
   const [mode, setMode] = useState<number>(1);
   const [hudProtection, setHudProtection] = useState<boolean>(true);
   const [baseFps, setBaseFps] = useState<number>(30);
   const [outputFps, setOutputFps] = useState<number>(60);
 
-  // Load config on mount
   useEffect(() => {
-    serverAPI.callPluginMethod<{}, SkyFrameConfig>("get_config", {}).then((res) => {
-      if (res.success) {
-        setEnabled(res.result.enabled);
-        setMode(res.result.mode);
-        setHudProtection(res.result.hud_protection);
+    getConfig().then((res) => {
+      if (res) {
+        setEnabled(Boolean(res.enabled));
+        setMode(Number(res.mode ?? 1));
+        setHudProtection(Boolean(res.hud_protection ?? true));
       }
-    });
+    }).catch((e) => console.error("[SkyFrame] Error loading config:", e));
 
-    // Poll live telemetry every 1.5s
     const interval = setInterval(() => {
-      serverAPI.callPluginMethod<{}, { base_fps: number; output_fps: number }>("get_stats", {}).then((res) => {
-        if (res.success) {
-          setBaseFps(Math.round(res.result.base_fps));
-          setOutputFps(Math.round(res.result.output_fps));
+      getStatsCall().then((stats) => {
+        if (stats) {
+          setBaseFps(Math.round(stats.base_fps));
+          setOutputFps(Math.round(stats.output_fps));
         }
-      });
+      }).catch(() => {});
     }, 1500);
 
     return () => clearInterval(interval);
@@ -49,17 +55,17 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
 
   const handleToggle = (val: boolean) => {
     setEnabled(val);
-    serverAPI.callPluginMethod("set_enabled", { enabled: val });
+    setEnabledCall(val).catch(console.error);
   };
 
   const handleModeChange = (val: number) => {
     setMode(val);
-    serverAPI.callPluginMethod("set_mode", { mode: val });
+    setModeCall(val).catch(console.error);
   };
 
   const handleHudChange = (val: boolean) => {
     setHudProtection(val);
-    serverAPI.callPluginMethod("set_hud_protection", { hud_protection: val });
+    setHudProtectionCall(val).catch(console.error);
   };
 
   const modeOptions = [
@@ -69,8 +75,7 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
   ];
 
   return (
-    <PanelSection title="SkyFrame: Нативная генерация кадров">
-      {/* Master Toggle */}
+    <PanelSection title="SkyFrame: Нативная генерация">
       <PanelSectionRow>
         <ToggleField
           label="Генерация кадров (2x)"
@@ -80,17 +85,15 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
         />
       </PanelSectionRow>
 
-      {/* Preset Mode Selection */}
       <PanelSectionRow>
         <DropdownItem
           label="Профиль вычислений"
           rgOptions={modeOptions}
           selectedOption={mode}
-          onChange={(opt) => handleModeChange(opt.data)}
+          onChange={(opt) => handleModeChange(Number(opt.data))}
         />
       </PanelSectionRow>
 
-      {/* HUD & Crosshair Protection */}
       <PanelSectionRow>
         <ToggleField
           label="Защита интерфейса (HUD)"
@@ -100,7 +103,6 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
         />
       </PanelSectionRow>
 
-      {/* Real-time Telemetry Card */}
       {enabled && (
         <PanelSectionRow>
           <div style={{
@@ -131,12 +133,13 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
       )}
     </PanelSection>
   );
-};
+}
 
-export default definePlugin((serverAPI: ServerAPI) => {
+export default definePlugin(() => {
   return {
-    title: <div className={staticClasses.Title}>SkyFrame</div>,
-    content: <Content serverAPI={serverAPI} />,
+    name: "SkyFrame",
+    titleView: <div className={staticClasses.Title}>SkyFrame</div>,
+    content: <Content />,
     icon: <FaBolt />,
     onDismount() {}
   };

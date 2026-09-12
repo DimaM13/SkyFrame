@@ -8,26 +8,11 @@ def package_decky():
     plugin_dir = os.path.join(project_dir, "decky-plugin")
     output_zip = os.path.join(project_dir, "SkyFrame.zip")
 
-    # 1. Ensure dist/ directory exists with index.js
+    # 1. Verify dist/ directory exists with compiled index.js
     dist_dir = os.path.join(plugin_dir, "dist")
-    os.makedirs(dist_dir, exist_ok=True)
     index_js = os.path.join(dist_dir, "index.js")
     if not os.path.isfile(index_js):
-        # Create minimal transpiled bundle for Decky loader if not yet built via rollup
-        with open(index_js, "w", encoding="utf-8") as f:
-            f.write("""// SkyFrame Decky Loader Plugin bundle
-const { definePlugin, PanelSection, PanelSectionRow, ToggleField, DropdownItem, staticClasses } = window.DeckyFrontendLib || {};
-const React = window.React || {};
-
-export default definePlugin((serverAPI) => {
-  return {
-    title: React.createElement("div", { className: staticClasses ? staticClasses.Title : "" }, "SkyFrame"),
-    content: React.createElement("div", { style: { padding: "10px" } }, "SkyFrame Native AI Frame Generation"),
-    icon: null,
-    onDismount() {}
-  };
-});
-""")
+        raise RuntimeError("dist/index.js is missing! Run 'npm run build' inside decky-plugin first.")
 
     # 2. Ensure bin/ directory has layer manifest and models
     bin_dir = os.path.join(plugin_dir, "bin")

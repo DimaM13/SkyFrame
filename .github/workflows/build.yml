@@ -21,6 +21,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake g++ libvulkan-dev glslang-tools python3 zip
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build Decky Frontend
+        run: |
+          cd decky-plugin
+          npm install
+          npm run build
+          cd ..
+
       - name: Compile Vulkan Shaders and Layer (.so)
         run: |
           mkdir -p build
@@ -49,10 +61,15 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: github.ref == 'refs/heads/main'
         with:
-          tag_name: v1.0.0
-          name: "SkyFrame v1.0.0 for Steam Deck"
+          tag_name: v1.0.1
+          name: "SkyFrame v1.0.1 for Steam Deck"
           body: |
-            ## 🚀 SkyFrame v1.0.0 — Нативный генератор кадров для Steam Deck
+            ## 🚀 SkyFrame v1.0.1 — Нативный генератор кадров для Steam Deck
+
+            ### Что нового в v1.0.1:
+            - **Исправлена загрузка в Decky Loader:** полный переход на актуальный стандарт `@decky/rollup` + `@decky/ui` (ESM module v1).
+            - Исправлена ошибка `SyntaxError: Unexpected token 'export'`.
+            - Поддержка новых версий SteamUI.
 
             ### 📦 Установка на Steam Deck:
             1. Скачайте прикреплённый архив **`SkyFrame.zip`** на Steam Deck.
@@ -62,3 +79,4 @@ jobs:
           files: SkyFrame.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
