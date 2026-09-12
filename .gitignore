@@ -1,0 +1,18 @@
+# Build directories
+build/
+bin/
+dist/
+*.spv
+
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+
+# Local packages
+*.zip
+# local zip
+
+# IDEs
+.vscode/
+.idea/

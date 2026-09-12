@@ -1,0 +1,8 @@
+{
+  "name": "SkyFrame",
+  "author": "SkyCine Team",
+  "flags": [],
+  "version": "1.0.0",
+  "description": "Native AI Frame Generation for Steam Deck (Vulkan FastWarp + RIFE)",
+  "icon": "icon.svg"
+}

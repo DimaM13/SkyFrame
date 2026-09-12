@@ -1,0 +1,64 @@
+name: Build SkyFrame for Steam Deck
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libvulkan-dev glslang-tools python3 zip
+
+      - name: Compile Vulkan Shaders and Layer (.so)
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          cmake --build . --config Release -j$(nproc)
+
+      - name: Prepare Decky Plugin binaries
+        run: |
+          mkdir -p decky-plugin/bin/models
+          cp build/libVkLayer_skyframe.so decky-plugin/bin/
+          cp build/vk_layer_skyframe.json decky-plugin/bin/
+          cp -r models/* decky-plugin/bin/models/
+
+      - name: Package Decky Plugin Zip
+        run: |
+          python3 scripts/package_decky_zip.py
+
+      - name: Upload SkyFrame.zip Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SkyFrame-SteamDeck
+          path: SkyFrame.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          tag_name: v1.0.0
+          name: "SkyFrame v1.0.0 for Steam Deck"
+          body: |
+            ## 🚀 SkyFrame v1.0.0 — Нативный генератор кадров для Steam Deck
+
+            ### 📦 Установка на Steam Deck:
+            1. Скачайте прикреплённый архив **`SkyFrame.zip`** на Steam Deck.
+            2. В меню **Decky Loader** зайдите в Настройки ⚙️ -> **Режим разработчика** (Developer Mode).
+            3. Нажмите **«Install plugin from zip»** и выберите скачанный `SkyFrame.zip`.
+            4. Открывайте любую игру и включайте генерацию кадров (2x) в меню Decky (кнопка `...`)!
+          files: SkyFrame.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
