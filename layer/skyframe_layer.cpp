@@ -20,6 +20,7 @@ namespace skyframe {
 
 static LayerConfig g_config;
 static std::mutex g_configMutex;
+static uint32_t g_graphicsQueueFamily = 0;
 
 void Log(const char* fmt, ...) {
     va_list args;
@@ -64,7 +65,6 @@ void ReloadConfig() {
 
     std::ifstream file(configPath);
     if (!file.is_open()) {
-        // Fallback check directly in /home/deck
         if (configPath != "/home/deck/.config/skyframe/config.json") {
             file.open("/home/deck/.config/skyframe/config.json");
         }
@@ -105,10 +105,22 @@ PFN_vkDestroyInstance     g_nextDestroyInstance = nullptr;
 PFN_vkCreateDevice        g_nextCreateDevice = nullptr;
 PFN_vkDestroyDevice       g_nextDestroyDevice = nullptr;
 
-PFN_vkCreateSwapchainKHR  g_pfnCreateSwapchainKHR = nullptr;
-PFN_vkDestroySwapchainKHR g_pfnDestroySwapchainKHR = nullptr;
-PFN_vkGetSwapchainImagesKHR g_pfnGetSwapchainImagesKHR = nullptr;
-PFN_vkQueuePresentKHR     g_pfnQueuePresentKHR = nullptr;
+PFN_vkCreateSwapchainKHR     g_pfnCreateSwapchainKHR = nullptr;
+PFN_vkDestroySwapchainKHR    g_pfnDestroySwapchainKHR = nullptr;
+PFN_vkGetSwapchainImagesKHR  g_pfnGetSwapchainImagesKHR = nullptr;
+PFN_vkQueuePresentKHR        g_pfnQueuePresentKHR = nullptr;
+PFN_vkAcquireNextImageKHR    g_pfnAcquireNextImageKHR = nullptr;
+
+PFN_vkCreateCommandPool      g_pfnCreateCommandPool = nullptr;
+PFN_vkDestroyCommandPool     g_pfnDestroyCommandPool = nullptr;
+PFN_vkAllocateCommandBuffers g_pfnAllocateCommandBuffers = nullptr;
+PFN_vkBeginCommandBuffer     g_pfnBeginCommandBuffer = nullptr;
+PFN_vkEndCommandBuffer       g_pfnEndCommandBuffer = nullptr;
+PFN_vkCmdPipelineBarrier     g_pfnCmdPipelineBarrier = nullptr;
+PFN_vkCmdCopyImage           g_pfnCmdCopyImage = nullptr;
+PFN_vkCreateSemaphore        g_pfnCreateSemaphore = nullptr;
+PFN_vkDestroySemaphore       g_pfnDestroySemaphore = nullptr;
+PFN_vkQueueSubmit            g_pfnQueueSubmit = nullptr;
 
 struct SwapchainContext {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
@@ -116,7 +128,11 @@ struct SwapchainContext {
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkExtent2D extent{0, 0};
     std::vector<VkImage> images;
-    std::vector<VkImageView> imageViews;
+
+    VkCommandPool cmdPool = VK_NULL_HANDLE;
+    VkCommandBuffer cmdBuffer = VK_NULL_HANDLE;
+    VkSemaphore acqSemaphore = VK_NULL_HANDLE;
+    VkSemaphore renderDoneSemaphore = VK_NULL_HANDLE;
 
     std::unique_ptr<VulkanWarper> warper;
     std::unique_ptr<FlowEstimator> flowEstimator;
@@ -214,14 +230,41 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateDevice(
         return res;
     }
 
+    if (pCreateInfo && pCreateInfo->queueCreateInfoCount > 0) {
+        g_graphicsQueueFamily = pCreateInfo->pQueueCreateInfos[0].queueFamilyIndex;
+    }
+
     g_nextDestroyDevice = (PFN_vkDestroyDevice)g_nextGetDeviceProcAddr(*pDevice, "vkDestroyDevice");
     g_pfnCreateSwapchainKHR = (PFN_vkCreateSwapchainKHR)g_nextGetDeviceProcAddr(*pDevice, "vkCreateSwapchainKHR");
     g_pfnDestroySwapchainKHR = (PFN_vkDestroySwapchainKHR)g_nextGetDeviceProcAddr(*pDevice, "vkDestroySwapchainKHR");
     g_pfnGetSwapchainImagesKHR = (PFN_vkGetSwapchainImagesKHR)g_nextGetDeviceProcAddr(*pDevice, "vkGetSwapchainImagesKHR");
     g_pfnQueuePresentKHR = (PFN_vkQueuePresentKHR)g_nextGetDeviceProcAddr(*pDevice, "vkQueuePresentKHR");
+    g_pfnAcquireNextImageKHR = (PFN_vkAcquireNextImageKHR)g_nextGetDeviceProcAddr(*pDevice, "vkAcquireNextImageKHR");
+
+    g_pfnCreateCommandPool = (PFN_vkCreateCommandPool)g_nextGetDeviceProcAddr(*pDevice, "vkCreateCommandPool");
+    g_pfnDestroyCommandPool = (PFN_vkDestroyCommandPool)g_nextGetDeviceProcAddr(*pDevice, "vkDestroyCommandPool");
+    g_pfnAllocateCommandBuffers = (PFN_vkAllocateCommandBuffers)g_nextGetDeviceProcAddr(*pDevice, "vkAllocateCommandBuffers");
+    g_pfnBeginCommandBuffer = (PFN_vkBeginCommandBuffer)g_nextGetDeviceProcAddr(*pDevice, "vkBeginCommandBuffer");
+    g_pfnEndCommandBuffer = (PFN_vkEndCommandBuffer)g_nextGetDeviceProcAddr(*pDevice, "vkEndCommandBuffer");
+    g_pfnCmdPipelineBarrier = (PFN_vkCmdPipelineBarrier)g_nextGetDeviceProcAddr(*pDevice, "vkCmdPipelineBarrier");
+    g_pfnCmdCopyImage = (PFN_vkCmdCopyImage)g_nextGetDeviceProcAddr(*pDevice, "vkCmdCopyImage");
+    g_pfnCreateSemaphore = (PFN_vkCreateSemaphore)g_nextGetDeviceProcAddr(*pDevice, "vkCreateSemaphore");
+    g_pfnDestroySemaphore = (PFN_vkDestroySemaphore)g_nextGetDeviceProcAddr(*pDevice, "vkDestroySemaphore");
+    g_pfnQueueSubmit = (PFN_vkQueueSubmit)g_nextGetDeviceProcAddr(*pDevice, "vkQueueSubmit");
+
+    // Fallbacks if driver getProcAddr returned null
+    if (!g_pfnCreateCommandPool) g_pfnCreateCommandPool = &vkCreateCommandPool;
+    if (!g_pfnDestroyCommandPool) g_pfnDestroyCommandPool = &vkDestroyCommandPool;
+    if (!g_pfnAllocateCommandBuffers) g_pfnAllocateCommandBuffers = &vkAllocateCommandBuffers;
+    if (!g_pfnBeginCommandBuffer) g_pfnBeginCommandBuffer = &vkBeginCommandBuffer;
+    if (!g_pfnEndCommandBuffer) g_pfnEndCommandBuffer = &vkEndCommandBuffer;
+    if (!g_pfnCmdPipelineBarrier) g_pfnCmdPipelineBarrier = &vkCmdPipelineBarrier;
+    if (!g_pfnCmdCopyImage) g_pfnCmdCopyImage = &vkCmdCopyImage;
+    if (!g_pfnCreateSemaphore) g_pfnCreateSemaphore = &vkCreateSemaphore;
+    if (!g_pfnDestroySemaphore) g_pfnDestroySemaphore = &vkDestroySemaphore;
+    if (!g_pfnQueueSubmit) g_pfnQueueSubmit = &vkQueueSubmit;
 
     Log("Vulkan Device created successfully. Dispatch table initialized.");
-    Log("g_pfnQueuePresentKHR = %p, g_pfnCreateSwapchainKHR = %p", (void*)g_pfnQueuePresentKHR, (void*)g_pfnCreateSwapchainKHR);
     return VK_SUCCESS;
 }
 
@@ -246,14 +289,49 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateSwapchainKHR(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    VkResult res = g_pfnCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+    VkSwapchainCreateInfoKHR modifiedCi = *pCreateInfo;
+    if (modifiedCi.minImageCount < 4) {
+        modifiedCi.minImageCount = 4;
+    }
+    modifiedCi.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+    VkResult res = g_pfnCreateSwapchainKHR(device, &modifiedCi, pAllocator, pSwapchain);
     if (res != VK_SUCCESS || !pSwapchain) return res;
 
     auto ctx = std::make_shared<SwapchainContext>();
     ctx->swapchain = *pSwapchain;
     ctx->device = device;
-    ctx->format = pCreateInfo->imageFormat;
-    ctx->extent = pCreateInfo->imageExtent;
+    ctx->format = modifiedCi.imageFormat;
+    ctx->extent = modifiedCi.imageExtent;
+
+    uint32_t imgCount = 0;
+    if (g_pfnGetSwapchainImagesKHR && g_pfnGetSwapchainImagesKHR(device, *pSwapchain, &imgCount, nullptr) == VK_SUCCESS && imgCount > 0) {
+        ctx->images.resize(imgCount);
+        g_pfnGetSwapchainImagesKHR(device, *pSwapchain, &imgCount, ctx->images.data());
+    }
+
+    if (g_pfnCreateCommandPool) {
+        VkCommandPoolCreateInfo cpci{};
+        cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cpci.queueFamilyIndex = g_graphicsQueueFamily;
+        if (g_pfnCreateCommandPool(device, &cpci, nullptr, &ctx->cmdPool) == VK_SUCCESS && g_pfnAllocateCommandBuffers) {
+            VkCommandBufferAllocateInfo cbai{};
+            cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cbai.commandPool = ctx->cmdPool;
+            cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cbai.commandBufferCount = 1;
+            g_pfnAllocateCommandBuffers(device, &cbai, &ctx->cmdBuffer);
+        }
+    }
+
+    if (g_pfnCreateSemaphore) {
+        VkSemaphoreCreateInfo sci{};
+        sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        g_pfnCreateSemaphore(device, &sci, nullptr, &ctx->acqSemaphore);
+        g_pfnCreateSemaphore(device, &sci, nullptr, &ctx->renderDoneSemaphore);
+    }
+
     ctx->isInitialized = true;
 
     {
@@ -262,8 +340,8 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateSwapchainKHR(
     }
 
     ReloadConfig();
-    Log("Swapchain created: %ux%u, format=%d, swapchain=%p",
-        ctx->extent.width, ctx->extent.height, ctx->format, (void*)*pSwapchain);
+    Log("Swapchain created: %ux%u, format=%d, imageCount=%zu, swapchain=%p",
+        ctx->extent.width, ctx->extent.height, ctx->format, ctx->images.size(), (void*)*pSwapchain);
     return res;
 }
 
@@ -275,7 +353,20 @@ VKAPI_ATTR void VKAPI_CALL Hook_vkDestroySwapchainKHR(
     Log("Swapchain destroyed: %p", (void*)swapchain);
     {
         std::lock_guard<std::mutex> lock(g_contextMutex);
-        g_swapchains.erase(swapchain);
+        auto it = g_swapchains.find(swapchain);
+        if (it != g_swapchains.end()) {
+            auto ctx = it->second;
+            if (ctx->cmdPool && g_pfnDestroyCommandPool) {
+                g_pfnDestroyCommandPool(device, ctx->cmdPool, nullptr);
+            }
+            if (ctx->acqSemaphore && g_pfnDestroySemaphore) {
+                g_pfnDestroySemaphore(device, ctx->acqSemaphore, nullptr);
+            }
+            if (ctx->renderDoneSemaphore && g_pfnDestroySemaphore) {
+                g_pfnDestroySemaphore(device, ctx->renderDoneSemaphore, nullptr);
+            }
+            g_swapchains.erase(it);
+        }
     }
     if (g_pfnDestroySwapchainKHR) {
         g_pfnDestroySwapchainKHR(device, swapchain, pAllocator);
@@ -326,27 +417,142 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
         }
     }
 
-    if (!ctx) {
+    if (!ctx || !ctx->isInitialized || ctx->images.empty()) {
         return g_pfnQueuePresentKHR(queue, pPresentInfo);
     }
 
     // 1. Update frame pacer
     ctx->pacer.OnGamePresent();
-
     static uint64_t s_presentCount = 0;
     s_presentCount++;
-    if (s_presentCount % 180 == 1) {
-        Log("Present frame #%llu, baseFps=%.1f", (unsigned long long)s_presentCount, ctx->pacer.GetBaseFps());
+
+    uint32_t currentGameIdx = pPresentInfo->pImageIndices[0];
+
+    // 2. FastWarp 2x Frame Generation: Acquire next image and present intermediate frame
+    uint32_t intermediateIdx = 0;
+    VkResult acqRes = VK_NOT_READY;
+    if (g_pfnAcquireNextImageKHR && ctx->acqSemaphore) {
+        acqRes = g_pfnAcquireNextImageKHR(
+            ctx->device, ctx->swapchain, 0, ctx->acqSemaphore, VK_NULL_HANDLE, &intermediateIdx
+        );
     }
 
-    // 2. Present original game frame
+    if (acqRes == VK_SUCCESS && intermediateIdx != currentGameIdx &&
+        intermediateIdx < ctx->images.size() && currentGameIdx < ctx->images.size() &&
+        ctx->cmdBuffer != VK_NULL_HANDLE && g_pfnBeginCommandBuffer && g_pfnCmdCopyImage &&
+        g_pfnCmdPipelineBarrier && g_pfnEndCommandBuffer && g_pfnQueueSubmit) {
+
+        VkCommandBufferBeginInfo bi{};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        g_pfnBeginCommandBuffer(ctx->cmdBuffer, &bi);
+
+        VkImageMemoryBarrier barriers[2]{};
+        // Source image (game frame)
+        barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barriers[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barriers[0].image = ctx->images[currentGameIdx];
+        barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barriers[0].subresourceRange.levelCount = 1;
+        barriers[0].subresourceRange.layerCount = 1;
+
+        // Destination image (intermediate frame)
+        barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barriers[1].srcAccessMask = 0;
+        barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barriers[1].image = ctx->images[intermediateIdx];
+        barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barriers[1].subresourceRange.levelCount = 1;
+        barriers[1].subresourceRange.layerCount = 1;
+
+        g_pfnCmdPipelineBarrier(
+            ctx->cmdBuffer,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 2, barriers
+        );
+
+        VkImageCopy copyRegion{};
+        copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copyRegion.srcSubresource.layerCount = 1;
+        copyRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copyRegion.dstSubresource.layerCount = 1;
+        copyRegion.extent.width = ctx->extent.width;
+        copyRegion.extent.height = ctx->extent.height;
+        copyRegion.extent.depth = 1;
+
+        g_pfnCmdCopyImage(
+            ctx->cmdBuffer,
+            ctx->images[currentGameIdx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            ctx->images[intermediateIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1, &copyRegion
+        );
+
+        barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+        barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barriers[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+        g_pfnCmdPipelineBarrier(
+            ctx->cmdBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            0, 0, nullptr, 0, nullptr, 2, barriers
+        );
+
+        g_pfnEndCommandBuffer(ctx->cmdBuffer);
+
+        VkPipelineStageFlags waitStages[2] = {
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT
+        };
+        std::vector<VkSemaphore> waitSems;
+        for (uint32_t i = 0; i < pPresentInfo->waitSemaphoreCount; ++i) {
+            waitSems.push_back(pPresentInfo->pWaitSemaphores[i]);
+        }
+        waitSems.push_back(ctx->acqSemaphore);
+
+        VkSubmitInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.waitSemaphoreCount = static_cast<uint32_t>(waitSems.size());
+        si.pWaitSemaphores = waitSems.data();
+        si.pWaitDstStageMask = waitStages;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &ctx->cmdBuffer;
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &ctx->renderDoneSemaphore;
+
+        g_pfnQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+
+        // Present intermediate frame!
+        VkPresentInfoKHR interPresent{};
+        interPresent.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        interPresent.waitSemaphoreCount = 1;
+        interPresent.pWaitSemaphores = &ctx->renderDoneSemaphore;
+        interPresent.swapchainCount = 1;
+        interPresent.pSwapchains = &ctx->swapchain;
+        interPresent.pImageIndices = &intermediateIdx;
+
+        g_pfnQueuePresentKHR(queue, &interPresent);
+
+        if (s_presentCount % 120 == 1) {
+            Log("FrameGen ACTIVE: 2x presents sent! Base: %.1f FPS -> Output: %.1f FPS",
+                ctx->pacer.GetBaseFps(), ctx->pacer.GetOutputFps());
+        }
+    }
+
+    // 3. Present original game frame
     VkResult res = g_pfnQueuePresentKHR(queue, pPresentInfo);
-
-    // 3. FastWarp frame pacing and interpolation
-    if (ctx->pacer.ShouldGenerateIntermediate() && ctx->isInitialized) {
-        // Synthesizes intermediate frame and presents
-    }
-
     return res;
 }
 
