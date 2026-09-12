@@ -32,7 +32,8 @@ DEFAULT_CONFIG = {
     "mode": 1,                 # 0 = Lite (180p), 1 = Balanced (240p), 2 = Quality (360p)
     "multiplier": 2,           # 2x frame generation
     "hud_protection": True,
-    "hud_threshold": 0.08
+    "hud_threshold": 0.08,
+    "show_hud": False
 }
 
 def get_target_uid_gid():
@@ -247,6 +248,11 @@ class Plugin:
 
     async def set_hud_protection(self, hud_protection: bool):
         self.config["hud_protection"] = bool(hud_protection)
+        self.save_config()
+        return self.config
+
+    async def set_show_hud(self, show_hud: bool):
+        self.config["show_hud"] = bool(show_hud)
         self.save_config()
         return self.config
 

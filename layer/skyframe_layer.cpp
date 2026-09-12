@@ -85,6 +85,8 @@ void ReloadConfig() {
                 else g_config.mode = 1;
             } else if (line.find("\"hud_protection\"") != std::string::npos) {
                 g_config.hud_protection = (line.find("true") != std::string::npos);
+            } else if (line.find("\"show_hud\"") != std::string::npos || line.find("\"hud\"") != std::string::npos) {
+                g_config.show_hud = (line.find("true") != std::string::npos || line.find("1") != std::string::npos);
             }
         }
     }
@@ -97,6 +99,10 @@ void ReloadConfig() {
     const char* envDisable = getenv("DISABLE_SKYFRAME");
     if (envDisable && (strcmp(envDisable, "1") == 0 || strcmp(envDisable, "true") == 0)) {
         g_config.enabled = false;
+    }
+    const char* envHud = getenv("SKYFRAME_HUD");
+    if (envHud && (strcmp(envHud, "1") == 0 || strcmp(envHud, "true") == 0)) {
+        g_config.show_hud = true;
     }
 }
 
@@ -850,7 +856,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             g_pfnCmdBindPipeline(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->blendPipeline);
             g_pfnCmdBindDescriptorSets(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->blendPipelineLayout, 0, 1, &slot.blendDescSet, 0, nullptr);
 
-            BlendPushConstants pc{ 0.5f, static_cast<int>(ctx->extent.width), static_cast<int>(ctx->extent.height), cfg.hud ? 1 : 0 };
+            BlendPushConstants pc{ 0.5f, static_cast<int>(ctx->extent.width), static_cast<int>(ctx->extent.height), cfg.show_hud ? 1 : 0 };
             g_pfnCmdPushConstants(slot.cmdBuffer, ctx->blendPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
             uint32_t groupX = (ctx->extent.width + 15) / 16;

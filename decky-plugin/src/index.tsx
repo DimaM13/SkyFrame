@@ -20,6 +20,7 @@ interface SkyFrameConfig {
   mode: number;
   hud_protection: boolean;
   multiplier: number;
+  show_hud?: boolean;
 }
 
 interface StatusInfo {
@@ -37,6 +38,7 @@ const setEnabledCall = callable<[enabled: boolean], SkyFrameConfig>("set_enabled
 const setGlobalInjectionCall = callable<[global_injection: boolean], SkyFrameConfig>("set_global_injection");
 const setModeCall = callable<[mode: number], SkyFrameConfig>("set_mode");
 const setHudProtectionCall = callable<[hud_protection: boolean], SkyFrameConfig>("set_hud_protection");
+const setShowHudCall = callable<[show_hud: boolean], SkyFrameConfig>("set_show_hud");
 const getStatsCall = callable<[], { base_fps: number; output_fps: number }>("get_stats");
 const getStatusInfoCall = callable<[], StatusInfo>("get_status_info");
 
@@ -45,6 +47,7 @@ function Content() {
   const [globalMode, setGlobalMode] = useState<boolean>(false);
   const [mode, setMode] = useState<number>(1);
   const [hudProtection, setHudProtection] = useState<boolean>(true);
+  const [showHud, setShowHud] = useState<boolean>(false);
   const [baseFps, setBaseFps] = useState<number>(30);
   const [outputFps, setOutputFps] = useState<number>(60);
   const [status, setStatus] = useState<StatusInfo | null>(null);
@@ -56,6 +59,7 @@ function Content() {
         setGlobalMode(Boolean(res.global_injection ?? false));
         setMode(Number(res.mode ?? 1));
         setHudProtection(Boolean(res.hud_protection ?? true));
+        setShowHud(Boolean(res.show_hud ?? false));
       }
     }).catch((e) => console.error("[SkyFrame] Error loading config:", e));
 
@@ -97,6 +101,11 @@ function Content() {
   const handleHudChange = (val: boolean) => {
     setHudProtection(val);
     setHudProtectionCall(val).catch(console.error);
+  };
+
+  const handleShowHudChange = (val: boolean) => {
+    setShowHud(val);
+    setShowHudCall(val).catch(console.error);
   };
 
   const copyToClipboard = (cmd: string, desc: string) => {
@@ -162,6 +171,15 @@ function Content() {
             description="Предотвращает артефакты на прицелах и миникарте"
             checked={hudProtection}
             onChange={handleHudChange}
+          />
+        </PanelSectionRow>
+
+        <PanelSectionRow>
+          <ToggleField
+            label="Визуальный маркер кадров"
+            description="Зелёная точка в углу для проверки вывода промежуточных кадров"
+            checked={showHud}
+            onChange={handleShowHudChange}
           />
         </PanelSectionRow>
 

@@ -23,6 +23,7 @@ struct LayerConfig {
     bool hud_protection = true; // Protect static HUD
     float hud_threshold = 0.08f;
     int target_fps = 0;         // 0 = unconstrained / match refresh rate
+    bool show_hud = false;      // Visual debug indicator on generated frames
 };
 
 // Global config singleton loaded from /home/deck/.config/skyframe/config.json
