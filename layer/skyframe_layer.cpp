@@ -263,24 +263,41 @@ static bool InitBlendPipeline(SwapchainContext* ctx) {
         return false;
     }
 
-    // 1. Create Image Views for all swapchain images
-    ctx->imageViews.resize(ctx->images.size(), VK_NULL_HANDLE);
-    for (size_t i = 0; i < ctx->images.size(); ++i) {
-        VkImageViewCreateInfo ivci{};
-        ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        ivci.image = ctx->images[i];
-        ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        ivci.format = ctx->format;
-        ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        ivci.subresourceRange.baseMipLevel = 0;
-        ivci.subresourceRange.levelCount = 1;
-        ivci.subresourceRange.baseArrayLayer = 0;
-        ivci.subresourceRange.layerCount = 1;
+    if (ctx->images.empty()) {
+        return false;
+    }
 
-        if (g_pfnCreateImageView(ctx->device, &ivci, nullptr, &ctx->imageViews[i]) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to create image view for image %zu", i);
-            return false;
+    // 1. Create Image Views for all swapchain images if needed
+    if (ctx->imageViews.size() != ctx->images.size()) {
+        for (auto iv : ctx->imageViews) {
+            if (iv != VK_NULL_HANDLE && g_pfnDestroyImageView) {
+                g_pfnDestroyImageView(ctx->device, iv, nullptr);
+            }
         }
+        ctx->imageViews.clear();
+        ctx->imageViews.resize(ctx->images.size(), VK_NULL_HANDLE);
+
+        for (size_t i = 0; i < ctx->images.size(); ++i) {
+            VkImageViewCreateInfo ivci{};
+            ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            ivci.image = ctx->images[i];
+            ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            ivci.format = ctx->format;
+            ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            ivci.subresourceRange.baseMipLevel = 0;
+            ivci.subresourceRange.levelCount = 1;
+            ivci.subresourceRange.baseArrayLayer = 0;
+            ivci.subresourceRange.layerCount = 1;
+
+            if (g_pfnCreateImageView(ctx->device, &ivci, nullptr, &ctx->imageViews[i]) != VK_SUCCESS) {
+                Log("Blend pipeline: failed to create image view for image %zu", i);
+                return false;
+            }
+        }
+    }
+
+    if (ctx->blendPipeline != VK_NULL_HANDLE) {
+        return true;
     }
 
     // 2. Create Shader Module
@@ -703,6 +720,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkGetSwapchainImagesKHR(
     if (it != g_swapchains.end()) {
         it->second->images.assign(pSwapchainImages, pSwapchainImages + *pSwapchainImageCount);
         Log("Swapchain images received: count=%u", *pSwapchainImageCount);
+        InitBlendPipeline(it->second.get());
     }
     return res;
 }
@@ -797,6 +815,11 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
         bool usedBlend = false;
         if (ctx->blendPipeline != VK_NULL_HANDLE && ctx->prevGameIdx != UINT32_MAX &&
             ctx->prevGameIdx < ctx->images.size() && ctx->prevGameIdx != intermediateIdx &&
+            ctx->prevGameIdx < ctx->imageViews.size() && currentGameIdx < ctx->imageViews.size() &&
+            intermediateIdx < ctx->imageViews.size() &&
+            ctx->imageViews[ctx->prevGameIdx] != VK_NULL_HANDLE &&
+            ctx->imageViews[currentGameIdx] != VK_NULL_HANDLE &&
+            ctx->imageViews[intermediateIdx] != VK_NULL_HANDLE &&
             slot.blendDescSet != VK_NULL_HANDLE && g_pfnUpdateDescriptorSets &&
             g_pfnCmdBindPipeline && g_pfnCmdBindDescriptorSets && g_pfnCmdPushConstants && g_pfnCmdDispatch) {
 
@@ -939,7 +962,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
         waitSems.push_back(slot.acqSemaphore);
         std::vector<VkPipelineStageFlags> waitStages(waitSems.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
 
-        VkSemaphore signalSems[2] = { slot.interDoneSemaphore, slot.finalDoneSemaphore };
+        VkSemaphore signalSems[2] = { slot.finalDoneSemaphore, slot.interDoneSemaphore };
 
         VkSubmitInfo si{};
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -956,32 +979,31 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             g_pfnQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
         }
 
-        // A. Present intermediate frame (Frame N-0.5) IMMEDIATELY
-        VkPresentInfoKHR interPresent{};
-        interPresent.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-        interPresent.waitSemaphoreCount = 1;
-        interPresent.pWaitSemaphores = &slot.interDoneSemaphore;
-        interPresent.swapchainCount = 1;
-        interPresent.pSwapchains = &ctx->swapchain;
-        interPresent.pImageIndices = &intermediateIdx;
+        // A. Present original game frame IMMEDIATELY (zero added input lag, 100% WSI sync)
+        VkPresentInfoKHR finalPresent = *pPresentInfo;
+        finalPresent.waitSemaphoreCount = 1;
+        finalPresent.pWaitSemaphores = &slot.finalDoneSemaphore;
+        finalPresent.swapchainCount = 1;
+        finalPresent.pSwapchains = &ctx->swapchain;
+        finalPresent.pImageIndices = &currentGameIdx;
 
         VkResult res = VK_SUCCESS;
         {
             std::lock_guard<std::mutex> qlock(ctx->queueMutex);
-            res = g_pfnQueuePresentKHR(queue, &interPresent);
+            res = g_pfnQueuePresentKHR(queue, &finalPresent);
         }
 
-        // B. Queue real game frame (Frame N) for halfway presentation on worker thread
-        PendingPresent gameJob;
-        gameJob.queue = queue;
-        gameJob.swapchain = ctx->swapchain;
-        gameJob.imageIndex = currentGameIdx;
-        gameJob.waitSemaphore = slot.finalDoneSemaphore;
-        gameJob.targetTime = now + std::chrono::nanoseconds(halfIntervalNs);
+        // B. Queue intermediate frame for halfway presentation (now + halfInterval) on worker thread
+        PendingPresent interJob;
+        interJob.queue = queue;
+        interJob.swapchain = ctx->swapchain;
+        interJob.imageIndex = intermediateIdx;
+        interJob.waitSemaphore = slot.interDoneSemaphore;
+        interJob.targetTime = now + std::chrono::nanoseconds(halfIntervalNs);
 
         {
             std::lock_guard<std::mutex> lock(ctx->presentMutex);
-            ctx->pendingPresents.push_back(gameJob);
+            ctx->pendingPresents.push_back(interJob);
         }
         ctx->presentCv.notify_one();
 

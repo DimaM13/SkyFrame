@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(SkyFrame VERSION 1.0.8 LANGUAGES CXX C)
+project(SkyFrame VERSION 1.0.9 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,7 +7,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(Vulkan REQUIRED)
 
-# Shader compilation
+# Compile compute shaders to C++ headers for embedded inclusion
 set(SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 set(SHADER_SOURCES
     "${SHADER_DIR}/warp_rgba.comp"
@@ -23,12 +23,13 @@ endif()
 set(SPIRV_HEADERS "")
 foreach(SHADER ${SHADER_SOURCES})
     get_filename_component(SHADER_NAME ${SHADER} NAME)
-    set(SPV_OUT "${CMAKE_CURRENT_BINARY_DIR}/${SHADER_NAME}.spv")
-    set(HEADER_OUT "${CMAKE_CURRENT_BINARY_DIR}/${SHADER_NAME}_spv.h")
+    string(REGEX REPLACE "[^a-zA-Z0-9_]" "_" SHADER_SAFE "${SHADER_NAME}")
+    set(SPV_OUT "${CMAKE_CURRENT_BINARY_DIR}/${SHADER_SAFE}.spv")
+    set(HEADER_OUT "${CMAKE_CURRENT_BINARY_DIR}/${SHADER_SAFE}_spv.h")
     add_custom_command(
         OUTPUT ${HEADER_OUT}
         COMMAND ${GLSL_VALIDATOR} -V ${SHADER} -o ${SPV_OUT}
-        COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/scripts/spv_to_header.py" "${SPV_OUT}" "${HEADER_OUT}" "${SHADER_NAME}"
+        COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/scripts/spv_to_header.py" "${SPV_OUT}" "${HEADER_OUT}" "${SHADER_SAFE}"
         DEPENDS ${SHADER} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/spv_to_header.py"
         COMMENT "Compiling compute shader to C++ header: ${SHADER_NAME}"
     )

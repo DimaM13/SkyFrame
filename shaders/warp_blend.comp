@@ -18,8 +18,8 @@ void main() {
         return;
     }
 
-    // Optional debug indicator on generated frame to prove visual delivery
-    if (pc.show_hud == 1 && coord.x >= 6 && coord.x <= 14 && coord.y >= 6 && coord.y <= 14) {
+    // Optional debug indicator on generated frame to prove visual delivery (neon green square)
+    if (pc.show_hud == 1 && coord.x >= 6 && coord.x <= 18 && coord.y >= 6 && coord.y <= 18) {
         imageStore(u_OutImage, coord, vec4(0.0, 1.0, 0.4, 1.0));
         return;
     }
@@ -27,7 +27,11 @@ void main() {
     vec4 c0 = imageLoad(u_Frame0, coord);
     vec4 c1 = imageLoad(u_Frame1, coord);
 
-    vec4 blended = mix(c0, c1, pc.alpha);
-    imageStore(u_OutImage, coord, blended);
+    // Forward motion extrapolation (project +0.5 frame ahead of Frame N)
+    vec4 delta = c1 - c0;
+    delta = clamp(delta, vec4(-0.25), vec4(0.25));
+    vec4 extrapolated = clamp(c1 + delta * pc.alpha, 0.0, 1.0);
+
+    imageStore(u_OutImage, coord, extrapolated);
 }
 

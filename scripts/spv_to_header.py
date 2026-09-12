@@ -6,6 +6,8 @@ if len(sys.argv) < 4:
 spv_path = sys.argv[1]
 header_path = sys.argv[2]
 var_name = sys.argv[3].replace('.', '_').replace('-', '_')
+if var_name.endswith('_spv'):
+    var_name = var_name[:-4]
 
 with open(spv_path, 'rb') as f:
     data = f.read()
