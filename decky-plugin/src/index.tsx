@@ -12,36 +12,57 @@ import {
   toaster
 } from "@decky/api";
 import { useState, useEffect } from "react";
-import { FaBolt, FaCopy, FaFileAlt } from "react-icons/fa";
+import { FaBolt, FaCopy, FaFileAlt, FaTerminal } from "react-icons/fa";
 
 interface SkyFrameConfig {
   enabled: boolean;
+  global_injection?: boolean;
   mode: number;
   hud_protection: boolean;
   multiplier: number;
 }
 
+interface StatusInfo {
+  user_home: string;
+  lib64: boolean;
+  lib32: boolean;
+  user_manifest: boolean;
+  sys_manifest: boolean;
+  enabled: boolean;
+  global_mode: boolean;
+}
+
 const getConfig = callable<[], SkyFrameConfig>("get_config");
 const setEnabledCall = callable<[enabled: boolean], SkyFrameConfig>("set_enabled");
+const setGlobalInjectionCall = callable<[global_injection: boolean], SkyFrameConfig>("set_global_injection");
 const setModeCall = callable<[mode: number], SkyFrameConfig>("set_mode");
 const setHudProtectionCall = callable<[hud_protection: boolean], SkyFrameConfig>("set_hud_protection");
 const getStatsCall = callable<[], { base_fps: number; output_fps: number }>("get_stats");
+const getStatusInfoCall = callable<[], StatusInfo>("get_status_info");
 
 function Content() {
   const [enabled, setEnabled] = useState<boolean>(false);
+  const [globalMode, setGlobalMode] = useState<boolean>(false);
   const [mode, setMode] = useState<number>(1);
   const [hudProtection, setHudProtection] = useState<boolean>(true);
   const [baseFps, setBaseFps] = useState<number>(30);
   const [outputFps, setOutputFps] = useState<number>(60);
+  const [status, setStatus] = useState<StatusInfo | null>(null);
 
   useEffect(() => {
     getConfig().then((res) => {
       if (res) {
         setEnabled(Boolean(res.enabled));
+        setGlobalMode(Boolean(res.global_injection ?? false));
         setMode(Number(res.mode ?? 1));
         setHudProtection(Boolean(res.hud_protection ?? true));
       }
     }).catch((e) => console.error("[SkyFrame] Error loading config:", e));
+
+    const loadStatus = () => {
+      getStatusInfoCall().then(setStatus).catch(() => {});
+    };
+    loadStatus();
 
     const interval = setInterval(() => {
       getStatsCall().then((stats) => {
@@ -50,7 +71,8 @@ function Content() {
           setOutputFps(Math.round(stats.output_fps));
         }
       }).catch(() => {});
-    }, 1500);
+      loadStatus();
+    }, 2000);
 
     return () => clearInterval(interval);
   }, []);
@@ -58,6 +80,13 @@ function Content() {
   const handleToggle = (val: boolean) => {
     setEnabled(val);
     setEnabledCall(val).catch(console.error);
+    setTimeout(() => getStatusInfoCall().then(setStatus).catch(() => {}), 500);
+  };
+
+  const handleGlobalToggle = (val: boolean) => {
+    setGlobalMode(val);
+    setGlobalInjectionCall(val).catch(console.error);
+    setTimeout(() => getStatusInfoCall().then(setStatus).catch(() => {}), 500);
   };
 
   const handleModeChange = (val: number) => {
@@ -92,7 +121,7 @@ function Content() {
   };
 
   const modeOptions = [
-    { data: 0, label: "🚀 Лёгкий (180p) — для AAA-игр" },
+    { data: 0, label: "🚀 Лёгкий (180p) — для тяжелых AAA" },
     { data: 1, label: "⚖️ Баланс (240p) — рекомендуемый" },
     { data: 2, label: "💎 Качество (360p) — макс. резкость" }
   ];
@@ -110,6 +139,15 @@ function Content() {
         </PanelSectionRow>
 
         <PanelSectionRow>
+          <ToggleField
+            label="Глобальный режим (без параметров)"
+            description="Слой активен во ВСЕХ играх без указания параметров в Steam"
+            checked={globalMode}
+            onChange={handleGlobalToggle}
+          />
+        </PanelSectionRow>
+
+        <PanelSectionRow>
           <DropdownItem
             label="Профиль вычислений"
             rgOptions={modeOptions}
@@ -121,7 +159,7 @@ function Content() {
         <PanelSectionRow>
           <ToggleField
             label="Защита интерфейса (HUD)"
-            description="Предотвращает двоение прицелов и текста миникарты"
+            description="Предотвращает артефакты на прицелах и миникарте"
             checked={hudProtection}
             onChange={handleHudChange}
           />
@@ -149,9 +187,17 @@ function Content() {
                 </span>
               </div>
               <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span style={{ color: "#aaa" }}>Движок интерполяции:</span>
+                <span style={{ color: "#aaa" }}>Движок:</span>
                 <span style={{ color: "#fff" }}>RIFE 4.6 + RDNA2 FP16</span>
               </div>
+              {status && (
+                <div style={{ display: "flex", justifyContent: "space-between", borderTop: "1px solid rgba(255,255,255,0.1)", paddingTop: "4px" }}>
+                  <span style={{ color: "#aaa" }}>Поддержка игр:</span>
+                  <span style={{ color: status.lib32 ? "#4ade80" : "#f87171" }}>
+                    64-bit: ✓ | 32-bit: {status.lib32 ? "✓" : "✗"}
+                  </span>
+                </div>
+              )}
             </div>
           </PanelSectionRow>
         )}
@@ -170,9 +216,18 @@ function Content() {
         <PanelSectionRow>
           <ButtonItem
             layout="below"
-            onClick={() => copyToClipboard("ENABLE_SKYFRAME=1 %command% > ~/skyframe_game.log 2>&1", "Запуск с логами")}
+            onClick={() => copyToClipboard("VK_LOADER_DEBUG=all ENABLE_SKYFRAME=1 %command% > ~/skyframe_game.log 2>&1", "Диагностический запуск")}
           >
-            📝 Скопировать запуск с подробным логом
+            🛠️ Скопировать запуск с подробным логом Vulkan
+          </ButtonItem>
+        </PanelSectionRow>
+
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            onClick={() => copyToClipboard("cat /tmp/skyframe.log", "Команда чтения логов")}
+          >
+            📄 Скопировать команду чтения логов (/tmp/skyframe.log)
           </ButtonItem>
         </PanelSectionRow>
       </PanelSection>

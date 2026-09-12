@@ -28,16 +28,27 @@ void Log(const char* fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
 
+    // 1. Output to stderr
     std::cerr << "[SkyFrame] " << buf << std::endl;
 
+    // 2. Global /tmp/skyframe.log (always accessible in any container/user)
+    FILE* fTmp = fopen("/tmp/skyframe.log", "a");
+    if (fTmp) {
+        fprintf(fTmp, "[SkyFrame] %s\n", buf);
+        fclose(fTmp);
+        chmod("/tmp/skyframe.log", 0666);
+    }
+
+    // 3. User directory log
     const char* home = getenv("HOME");
-    std::string logDir = home ? (std::string(home) + "/.local/share/skyframe") : "/home/deck/.local/share/skyframe";
+    std::string logDir = (home && strlen(home) > 0) ? (std::string(home) + "/.local/share/skyframe") : "/home/deck/.local/share/skyframe";
     mkdir(logDir.c_str(), 0755);
     std::string logPath = logDir + "/skyframe.log";
     FILE* f = fopen(logPath.c_str(), "a");
     if (f) {
         fprintf(f, "[SkyFrame] %s\n", buf);
         fclose(f);
+        chmod(logPath.c_str(), 0666);
     }
 }
 
@@ -49,22 +60,39 @@ LayerConfig& GetConfig() {
 void ReloadConfig() {
     std::lock_guard<std::mutex> lock(g_configMutex);
     const char* home = getenv("HOME");
-    std::string configPath = home ? (std::string(home) + "/.config/skyframe/config.json") : "/home/deck/.config/skyframe/config.json";
+    std::string configPath = (home && strlen(home) > 0) ? (std::string(home) + "/.config/skyframe/config.json") : "/home/deck/.config/skyframe/config.json";
 
     std::ifstream file(configPath);
-    if (!file.is_open()) return;
-
-    std::string line;
-    while (std::getline(file, line)) {
-        if (line.find("\"enabled\"") != std::string::npos) {
-            g_config.enabled = (line.find("true") != std::string::npos);
-        } else if (line.find("\"mode\"") != std::string::npos) {
-            if (line.find("0") != std::string::npos) g_config.mode = 0;
-            else if (line.find("2") != std::string::npos) g_config.mode = 2;
-            else g_config.mode = 1;
-        } else if (line.find("\"hud_protection\"") != std::string::npos) {
-            g_config.hud_protection = (line.find("true") != std::string::npos);
+    if (!file.is_open()) {
+        // Fallback check directly in /home/deck
+        if (configPath != "/home/deck/.config/skyframe/config.json") {
+            file.open("/home/deck/.config/skyframe/config.json");
         }
+    }
+
+    if (file.is_open()) {
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.find("\"enabled\"") != std::string::npos) {
+                g_config.enabled = (line.find("true") != std::string::npos);
+            } else if (line.find("\"mode\"") != std::string::npos) {
+                if (line.find("0") != std::string::npos) g_config.mode = 0;
+                else if (line.find("2") != std::string::npos) g_config.mode = 2;
+                else g_config.mode = 1;
+            } else if (line.find("\"hud_protection\"") != std::string::npos) {
+                g_config.hud_protection = (line.find("true") != std::string::npos);
+            }
+        }
+    }
+
+    // Explicit environment variable overrides
+    const char* envEnable = getenv("ENABLE_SKYFRAME");
+    if (envEnable && (strcmp(envEnable, "1") == 0 || strcmp(envEnable, "true") == 0)) {
+        g_config.enabled = true;
+    }
+    const char* envDisable = getenv("DISABLE_SKYFRAME");
+    if (envDisable && (strcmp(envDisable, "1") == 0 || strcmp(envDisable, "true") == 0)) {
+        g_config.enabled = false;
     }
 }
 
@@ -106,6 +134,12 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateInstance(
     VkInstance* pInstance
 ) {
     Log("Hook_vkCreateInstance called");
+    if (pCreateInfo && pCreateInfo->pApplicationInfo && pCreateInfo->pApplicationInfo->pApplicationName) {
+        Log("Target Application: %s (engine: %s)",
+            pCreateInfo->pApplicationInfo->pApplicationName,
+            pCreateInfo->pApplicationInfo->pEngineName ? pCreateInfo->pApplicationInfo->pEngineName : "unknown");
+    }
+
     VkLayerInstanceCreateInfo* chain_info = (VkLayerInstanceCreateInfo*)pCreateInfo->pNext;
     while (chain_info && (chain_info->sType != VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO ||
                           chain_info->function != VK_LAYER_LINK_INFO)) {
@@ -187,7 +221,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateDevice(
     g_pfnQueuePresentKHR = (PFN_vkQueuePresentKHR)g_nextGetDeviceProcAddr(*pDevice, "vkQueuePresentKHR");
 
     Log("Vulkan Device created successfully. Dispatch table initialized.");
-    Log("g_pfnQueuePresentKHR = %p, g_pfnCreateSwapchainKHR = %p", g_pfnQueuePresentKHR, g_pfnCreateSwapchainKHR);
+    Log("g_pfnQueuePresentKHR = %p, g_pfnCreateSwapchainKHR = %p", (void*)g_pfnQueuePresentKHR, (void*)g_pfnCreateSwapchainKHR);
     return VK_SUCCESS;
 }
 
@@ -220,12 +254,16 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateSwapchainKHR(
     ctx->device = device;
     ctx->format = pCreateInfo->imageFormat;
     ctx->extent = pCreateInfo->imageExtent;
+    ctx->isInitialized = true;
 
-    std::lock_guard<std::mutex> lock(g_contextMutex);
-    g_swapchains[*pSwapchain] = ctx;
+    {
+        std::lock_guard<std::mutex> lock(g_contextMutex);
+        g_swapchains[*pSwapchain] = ctx;
+    }
 
     ReloadConfig();
-    Log("Swapchain created: %dx%d, format=%d", ctx->extent.width, ctx->extent.height, ctx->format);
+    Log("Swapchain created: %ux%u, format=%d, swapchain=%p",
+        ctx->extent.width, ctx->extent.height, ctx->format, (void*)*pSwapchain);
     return res;
 }
 
@@ -234,7 +272,7 @@ VKAPI_ATTR void VKAPI_CALL Hook_vkDestroySwapchainKHR(
     VkSwapchainKHR swapchain,
     const VkAllocationCallbacks* pAllocator
 ) {
-    Log("Swapchain destroyed: %p", swapchain);
+    Log("Swapchain destroyed: %p", (void*)swapchain);
     {
         std::lock_guard<std::mutex> lock(g_contextMutex);
         g_swapchains.erase(swapchain);
@@ -258,7 +296,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkGetSwapchainImagesKHR(
     auto it = g_swapchains.find(swapchain);
     if (it != g_swapchains.end()) {
         it->second->images.assign(pSwapchainImages, pSwapchainImages + *pSwapchainImageCount);
-        Log("Swapchain images received count: %d", *pSwapchainImageCount);
+        Log("Swapchain images received: count=%u", *pSwapchainImageCount);
     }
     return res;
 }
@@ -295,6 +333,12 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
     // 1. Update frame pacer
     ctx->pacer.OnGamePresent();
 
+    static uint64_t s_presentCount = 0;
+    s_presentCount++;
+    if (s_presentCount % 180 == 1) {
+        Log("Present frame #%llu, baseFps=%.1f", (unsigned long long)s_presentCount, ctx->pacer.GetBaseFps());
+    }
+
     // 2. Present original game frame
     VkResult res = g_pfnQueuePresentKHR(queue, pPresentInfo);
 
@@ -309,9 +353,20 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
 } // namespace skyframe
 
 __attribute__((constructor)) void skyframe_init() {
+    char cmdline[512] = {0};
+    FILE* fcmd = fopen("/proc/self/cmdline", "r");
+    if (fcmd) {
+        size_t n = fread(cmdline, 1, sizeof(cmdline) - 1, fcmd);
+        fclose(fcmd);
+        for (size_t i = 0; i < n; ++i) {
+            if (cmdline[i] == '\0' && i + 1 < n) cmdline[i] = ' ';
+        }
+    }
+
     skyframe::Log("========================================");
     skyframe::Log("SkyFrame Native Vulkan Layer loaded!");
-    skyframe::Log("PID: %d", getpid());
+    skyframe::Log("PID: %d, Arch: %d-bit, Process: %s",
+                  getpid(), (int)(sizeof(void*) * 8), cmdline[0] ? cmdline : "unknown");
     skyframe::ReloadConfig();
     auto& cfg = skyframe::GetConfig();
     skyframe::Log("Config status: enabled=%d, mode=%d, hud=%d", cfg.enabled, cfg.mode, cfg.hud_protection);
