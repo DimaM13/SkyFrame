@@ -609,7 +609,15 @@ static bool InitRifePipeline(SwapchainContext* ctx) {
         InitFallbackMemProperties(ctx->memProperties);
     }
 
-    ctx->warper = std::make_unique<VulkanWarper>(ctx->device, ctx->memProperties, (VkQueue)VK_NULL_HANDLE, g_graphicsQueueFamily);
+    PFN_vkGetDeviceProcAddr gdpa = g_nextGetDeviceProcAddr;
+    {
+        std::lock_guard<std::mutex> lock(g_deviceMapMutex);
+        auto it = g_deviceToGetDeviceProcAddr.find(ctx->device);
+        if (it != g_deviceToGetDeviceProcAddr.end() && it->second) {
+            gdpa = it->second;
+        }
+    }
+    ctx->warper = std::make_unique<VulkanWarper>(ctx->device, ctx->memProperties, gdpa, (VkQueue)VK_NULL_HANDLE, g_graphicsQueueFamily);
 
 #if HAVE_WARP_RGBA
     size_t downSize = 0;

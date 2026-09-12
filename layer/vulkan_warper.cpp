@@ -4,21 +4,102 @@
 
 namespace skyframe {
 
-static VkShaderModule CreateShaderModule(VkDevice device, const uint32_t* pCode, size_t codeSize) {
+void InitWarperDispatch(VkDevice device, PFN_vkGetDeviceProcAddr gdpa, WarperDeviceDispatch& d) {
+    auto load = [&](const char* name) -> PFN_vkVoidFunction {
+        return gdpa ? gdpa(device, name) : nullptr;
+    };
+    d.CreateSampler = (PFN_vkCreateSampler)load("vkCreateSampler");
+    d.DestroySampler = (PFN_vkDestroySampler)load("vkDestroySampler");
+    d.CreateDescriptorPool = (PFN_vkCreateDescriptorPool)load("vkCreateDescriptorPool");
+    d.DestroyDescriptorPool = (PFN_vkDestroyDescriptorPool)load("vkDestroyDescriptorPool");
+    d.CreateDescriptorSetLayout = (PFN_vkCreateDescriptorSetLayout)load("vkCreateDescriptorSetLayout");
+    d.DestroyDescriptorSetLayout = (PFN_vkDestroyDescriptorSetLayout)load("vkDestroyDescriptorSetLayout");
+    d.CreatePipelineLayout = (PFN_vkCreatePipelineLayout)load("vkCreatePipelineLayout");
+    d.DestroyPipelineLayout = (PFN_vkDestroyPipelineLayout)load("vkDestroyPipelineLayout");
+    d.CreateComputePipelines = (PFN_vkCreateComputePipelines)load("vkCreateComputePipelines");
+    d.DestroyPipeline = (PFN_vkDestroyPipeline)load("vkDestroyPipeline");
+    d.CreateShaderModule = (PFN_vkCreateShaderModule)load("vkCreateShaderModule");
+    d.DestroyShaderModule = (PFN_vkDestroyShaderModule)load("vkDestroyShaderModule");
+    d.AllocateDescriptorSets = (PFN_vkAllocateDescriptorSets)load("vkAllocateDescriptorSets");
+    d.UpdateDescriptorSets = (PFN_vkUpdateDescriptorSets)load("vkUpdateDescriptorSets");
+    d.CreateImage = (PFN_vkCreateImage)load("vkCreateImage");
+    d.DestroyImage = (PFN_vkDestroyImage)load("vkDestroyImage");
+    d.GetImageMemoryRequirements = (PFN_vkGetImageMemoryRequirements)load("vkGetImageMemoryRequirements");
+    d.AllocateMemory = (PFN_vkAllocateMemory)load("vkAllocateMemory");
+    d.FreeMemory = (PFN_vkFreeMemory)load("vkFreeMemory");
+    d.BindImageMemory = (PFN_vkBindImageMemory)load("vkBindImageMemory");
+    d.CreateImageView = (PFN_vkCreateImageView)load("vkCreateImageView");
+    d.DestroyImageView = (PFN_vkDestroyImageView)load("vkDestroyImageView");
+    d.CreateBuffer = (PFN_vkCreateBuffer)load("vkCreateBuffer");
+    d.DestroyBuffer = (PFN_vkDestroyBuffer)load("vkDestroyBuffer");
+    d.GetBufferMemoryRequirements = (PFN_vkGetBufferMemoryRequirements)load("vkGetBufferMemoryRequirements");
+    d.BindBufferMemory = (PFN_vkBindBufferMemory)load("vkBindBufferMemory");
+    d.MapMemory = (PFN_vkMapMemory)load("vkMapMemory");
+    d.UnmapMemory = (PFN_vkUnmapMemory)load("vkUnmapMemory");
+    d.CmdPipelineBarrier = (PFN_vkCmdPipelineBarrier)load("vkCmdPipelineBarrier");
+    d.CmdBlitImage = (PFN_vkCmdBlitImage)load("vkCmdBlitImage");
+    d.CmdCopyImageToBuffer = (PFN_vkCmdCopyImageToBuffer)load("vkCmdCopyImageToBuffer");
+    d.CmdCopyBufferToImage = (PFN_vkCmdCopyBufferToImage)load("vkCmdCopyBufferToImage");
+    d.CmdBindPipeline = (PFN_vkCmdBindPipeline)load("vkCmdBindPipeline");
+    d.CmdBindDescriptorSets = (PFN_vkCmdBindDescriptorSets)load("vkCmdBindDescriptorSets");
+    d.CmdPushConstants = (PFN_vkCmdPushConstants)load("vkCmdPushConstants");
+    d.CmdDispatch = (PFN_vkCmdDispatch)load("vkCmdDispatch");
+
+    if (!d.CreateSampler) d.CreateSampler = &vkCreateSampler;
+    if (!d.DestroySampler) d.DestroySampler = &vkDestroySampler;
+    if (!d.CreateDescriptorPool) d.CreateDescriptorPool = &vkCreateDescriptorPool;
+    if (!d.DestroyDescriptorPool) d.DestroyDescriptorPool = &vkDestroyDescriptorPool;
+    if (!d.CreateDescriptorSetLayout) d.CreateDescriptorSetLayout = &vkCreateDescriptorSetLayout;
+    if (!d.DestroyDescriptorSetLayout) d.DestroyDescriptorSetLayout = &vkDestroyDescriptorSetLayout;
+    if (!d.CreatePipelineLayout) d.CreatePipelineLayout = &vkCreatePipelineLayout;
+    if (!d.DestroyPipelineLayout) d.DestroyPipelineLayout = &vkDestroyPipelineLayout;
+    if (!d.CreateComputePipelines) d.CreateComputePipelines = &vkCreateComputePipelines;
+    if (!d.DestroyPipeline) d.DestroyPipeline = &vkDestroyPipeline;
+    if (!d.CreateShaderModule) d.CreateShaderModule = &vkCreateShaderModule;
+    if (!d.DestroyShaderModule) d.DestroyShaderModule = &vkDestroyShaderModule;
+    if (!d.AllocateDescriptorSets) d.AllocateDescriptorSets = &vkAllocateDescriptorSets;
+    if (!d.UpdateDescriptorSets) d.UpdateDescriptorSets = &vkUpdateDescriptorSets;
+    if (!d.CreateImage) d.CreateImage = &vkCreateImage;
+    if (!d.DestroyImage) d.DestroyImage = &vkDestroyImage;
+    if (!d.GetImageMemoryRequirements) d.GetImageMemoryRequirements = &vkGetImageMemoryRequirements;
+    if (!d.AllocateMemory) d.AllocateMemory = &vkAllocateMemory;
+    if (!d.FreeMemory) d.FreeMemory = &vkFreeMemory;
+    if (!d.BindImageMemory) d.BindImageMemory = &vkBindImageMemory;
+    if (!d.CreateImageView) d.CreateImageView = &vkCreateImageView;
+    if (!d.DestroyImageView) d.DestroyImageView = &vkDestroyImageView;
+    if (!d.CreateBuffer) d.CreateBuffer = &vkCreateBuffer;
+    if (!d.DestroyBuffer) d.DestroyBuffer = &vkDestroyBuffer;
+    if (!d.GetBufferMemoryRequirements) d.GetBufferMemoryRequirements = &vkGetBufferMemoryRequirements;
+    if (!d.BindBufferMemory) d.BindBufferMemory = &vkBindBufferMemory;
+    if (!d.MapMemory) d.MapMemory = &vkMapMemory;
+    if (!d.UnmapMemory) d.UnmapMemory = &vkUnmapMemory;
+    if (!d.CmdPipelineBarrier) d.CmdPipelineBarrier = &vkCmdPipelineBarrier;
+    if (!d.CmdBlitImage) d.CmdBlitImage = &vkCmdBlitImage;
+    if (!d.CmdCopyImageToBuffer) d.CmdCopyImageToBuffer = &vkCmdCopyImageToBuffer;
+    if (!d.CmdCopyBufferToImage) d.CmdCopyBufferToImage = &vkCmdCopyBufferToImage;
+    if (!d.CmdBindPipeline) d.CmdBindPipeline = &vkCmdBindPipeline;
+    if (!d.CmdBindDescriptorSets) d.CmdBindDescriptorSets = &vkCmdBindDescriptorSets;
+    if (!d.CmdPushConstants) d.CmdPushConstants = &vkCmdPushConstants;
+    if (!d.CmdDispatch) d.CmdDispatch = &vkCmdDispatch;
+}
+
+static VkShaderModule CreateShaderModule(VkDevice device, const WarperDeviceDispatch& disp, const uint32_t* pCode, size_t codeSize) {
     VkShaderModuleCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     ci.codeSize = codeSize;
     ci.pCode = pCode;
     VkShaderModule mod = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(device, &ci, nullptr, &mod) != VK_SUCCESS) {
+    if (disp.CreateShaderModule(device, &ci, nullptr, &mod) != VK_SUCCESS) {
         return VK_NULL_HANDLE;
     }
     return mod;
 }
 
-VulkanWarper::VulkanWarper(VkDevice device, const VkPhysicalDeviceMemoryProperties& memProperties, VkQueue queue, uint32_t queueFamilyIndex)
+VulkanWarper::VulkanWarper(VkDevice device, const VkPhysicalDeviceMemoryProperties& memProperties, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue, uint32_t queueFamilyIndex)
     : m_device(device), m_memProperties(memProperties), m_queue(queue), m_queueFamily(queueFamilyIndex) {
     
+    InitWarperDispatch(m_device, gdpa, m_disp);
+
     // Linear clamp-to-edge sampler for hardware bilinear interpolation
     VkSamplerCreateInfo sci{};
     sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -28,7 +109,7 @@ VulkanWarper::VulkanWarper(VkDevice device, const VkPhysicalDeviceMemoryProperti
     sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    vkCreateSampler(m_device, &sci, nullptr, &m_linearSampler);
+    m_disp.CreateSampler(m_device, &sci, nullptr, &m_linearSampler);
 
     // Descriptor pool
     VkDescriptorPoolSize poolSizes[] = {
@@ -40,23 +121,23 @@ VulkanWarper::VulkanWarper(VkDevice device, const VkPhysicalDeviceMemoryProperti
     pci.maxSets = 64;
     pci.poolSizeCount = 2;
     pci.pPoolSizes = poolSizes;
-    vkCreateDescriptorPool(m_device, &pci, nullptr, &m_descriptorPool);
+    m_disp.CreateDescriptorPool(m_device, &pci, nullptr, &m_descriptorPool);
 }
 
 VulkanWarper::~VulkanWarper() {
     DestroyFlowAndMaskTextures();
     DestroyDownsampleStaging();
 
-    if (m_linearSampler) vkDestroySampler(m_device, m_linearSampler, nullptr);
-    if (m_descriptorPool) vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
+    if (m_linearSampler) m_disp.DestroySampler(m_device, m_linearSampler, nullptr);
+    if (m_descriptorPool) m_disp.DestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
 
-    if (m_warpPipeline) vkDestroyPipeline(m_device, m_warpPipeline, nullptr);
-    if (m_warpPipelineLayout) vkDestroyPipelineLayout(m_device, m_warpPipelineLayout, nullptr);
-    if (m_warpDescLayout) vkDestroyDescriptorSetLayout(m_device, m_warpDescLayout, nullptr);
+    if (m_warpPipeline) m_disp.DestroyPipeline(m_device, m_warpPipeline, nullptr);
+    if (m_warpPipelineLayout) m_disp.DestroyPipelineLayout(m_device, m_warpPipelineLayout, nullptr);
+    if (m_warpDescLayout) m_disp.DestroyDescriptorSetLayout(m_device, m_warpDescLayout, nullptr);
 
-    if (m_downsamplePipeline) vkDestroyPipeline(m_device, m_downsamplePipeline, nullptr);
-    if (m_downsamplePipelineLayout) vkDestroyPipelineLayout(m_device, m_downsamplePipelineLayout, nullptr);
-    if (m_downsampleDescLayout) vkDestroyDescriptorSetLayout(m_device, m_downsampleDescLayout, nullptr);
+    if (m_downsamplePipeline) m_disp.DestroyPipeline(m_device, m_downsamplePipeline, nullptr);
+    if (m_downsamplePipelineLayout) m_disp.DestroyPipelineLayout(m_device, m_downsamplePipelineLayout, nullptr);
+    if (m_downsampleDescLayout) m_disp.DestroyDescriptorSetLayout(m_device, m_downsampleDescLayout, nullptr);
 }
 
 uint32_t VulkanWarper::FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
@@ -90,12 +171,7 @@ uint32_t VulkanWarper::FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags
 bool VulkanWarper::InitPipelines(const uint32_t* warpSpv, size_t warpSize, const uint32_t* downSpv, size_t downSize) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    // 1. Warp Pipeline Descriptor Layout:
-    // Binding 0: Frame0 (sampler2D)
-    // Binding 1: Frame1 (sampler2D)
-    // Binding 2: Flow (sampler2D)
-    // Binding 3: Mask (sampler2D)
-    // Binding 4: OutImage (writeonly storage image)
+    // 1. Warp Pipeline Descriptor Layout
     VkDescriptorSetLayoutBinding warpBindings[5]{};
     for (int i = 0; i < 4; ++i) {
         warpBindings[i].binding = i;
@@ -112,7 +188,7 @@ bool VulkanWarper::InitPipelines(const uint32_t* warpSpv, size_t warpSize, const
     dlci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     dlci.bindingCount = 5;
     dlci.pBindings = warpBindings;
-    if (vkCreateDescriptorSetLayout(m_device, &dlci, nullptr, &m_warpDescLayout) != VK_SUCCESS) {
+    if (m_disp.CreateDescriptorSetLayout(m_device, &dlci, nullptr, &m_warpDescLayout) != VK_SUCCESS) {
         return false;
     }
 
@@ -127,11 +203,11 @@ bool VulkanWarper::InitPipelines(const uint32_t* warpSpv, size_t warpSize, const
     plci.pSetLayouts = &m_warpDescLayout;
     plci.pushConstantRangeCount = 1;
     plci.pPushConstantRanges = &pcr;
-    if (vkCreatePipelineLayout(m_device, &plci, nullptr, &m_warpPipelineLayout) != VK_SUCCESS) {
+    if (m_disp.CreatePipelineLayout(m_device, &plci, nullptr, &m_warpPipelineLayout) != VK_SUCCESS) {
         return false;
     }
 
-    VkShaderModule warpModule = CreateShaderModule(m_device, warpSpv, warpSize);
+    VkShaderModule warpModule = CreateShaderModule(m_device, m_disp, warpSpv, warpSize);
     if (!warpModule) return false;
 
     VkComputePipelineCreateInfo cpci{};
@@ -142,8 +218,8 @@ bool VulkanWarper::InitPipelines(const uint32_t* warpSpv, size_t warpSize, const
     cpci.stage.pName = "main";
     cpci.layout = m_warpPipelineLayout;
 
-    VkResult res = vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &cpci, nullptr, &m_warpPipeline);
-    vkDestroyShaderModule(m_device, warpModule, nullptr);
+    VkResult res = m_disp.CreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &cpci, nullptr, &m_warpPipeline);
+    m_disp.DestroyShaderModule(m_device, warpModule, nullptr);
     if (res != VK_SUCCESS) return false;
 
     // 2. Downsample Pipeline
@@ -162,7 +238,7 @@ bool VulkanWarper::InitPipelines(const uint32_t* warpSpv, size_t warpSize, const
         ddlci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         ddlci.bindingCount = 2;
         ddlci.pBindings = downBindings;
-        if (vkCreateDescriptorSetLayout(m_device, &ddlci, nullptr, &m_downsampleDescLayout) == VK_SUCCESS) {
+        if (m_disp.CreateDescriptorSetLayout(m_device, &ddlci, nullptr, &m_downsampleDescLayout) == VK_SUCCESS) {
             struct DownPushConstants { int in_w, in_h, out_w, out_h; };
             VkPushConstantRange dpcr{};
             dpcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -175,8 +251,8 @@ bool VulkanWarper::InitPipelines(const uint32_t* warpSpv, size_t warpSize, const
             dplci.pSetLayouts = &m_downsampleDescLayout;
             dplci.pushConstantRangeCount = 1;
             dplci.pPushConstantRanges = &dpcr;
-            if (vkCreatePipelineLayout(m_device, &dplci, nullptr, &m_downsamplePipelineLayout) == VK_SUCCESS) {
-                VkShaderModule downModule = CreateShaderModule(m_device, downSpv, downSize);
+            if (m_disp.CreatePipelineLayout(m_device, &dplci, nullptr, &m_downsamplePipelineLayout) == VK_SUCCESS) {
+                VkShaderModule downModule = CreateShaderModule(m_device, m_disp, downSpv, downSize);
                 if (downModule) {
                     VkComputePipelineCreateInfo dcpci{};
                     dcpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -185,8 +261,8 @@ bool VulkanWarper::InitPipelines(const uint32_t* warpSpv, size_t warpSize, const
                     dcpci.stage.module = downModule;
                     dcpci.stage.pName = "main";
                     dcpci.layout = m_downsamplePipelineLayout;
-                    vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &dcpci, nullptr, &m_downsamplePipeline);
-                    vkDestroyShaderModule(m_device, downModule, nullptr);
+                    m_disp.CreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &dcpci, nullptr, &m_downsamplePipeline);
+                    m_disp.DestroyShaderModule(m_device, downModule, nullptr);
                 }
             }
         }
@@ -217,16 +293,16 @@ bool VulkanWarper::CreateFlowAndMaskTextures(int flowWidth, int flowHeight) {
     iciFlow.tiling = VK_IMAGE_TILING_OPTIMAL;
     iciFlow.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     iciFlow.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkCreateImage(m_device, &iciFlow, nullptr, &m_flowImage) != VK_SUCCESS) return false;
+    if (m_disp.CreateImage(m_device, &iciFlow, nullptr, &m_flowImage) != VK_SUCCESS) return false;
 
     VkMemoryRequirements memReqFlow;
-    vkGetImageMemoryRequirements(m_device, m_flowImage, &memReqFlow);
+    m_disp.GetImageMemoryRequirements(m_device, m_flowImage, &memReqFlow);
     VkMemoryAllocateInfo maiFlow{};
     maiFlow.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     maiFlow.allocationSize = memReqFlow.size;
     maiFlow.memoryTypeIndex = FindMemoryType(memReqFlow.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (vkAllocateMemory(m_device, &maiFlow, nullptr, &m_flowMem) != VK_SUCCESS) return false;
-    vkBindImageMemory(m_device, m_flowImage, m_flowMem, 0);
+    if (m_disp.AllocateMemory(m_device, &maiFlow, nullptr, &m_flowMem) != VK_SUCCESS) return false;
+    m_disp.BindImageMemory(m_device, m_flowImage, m_flowMem, 0);
 
     VkImageViewCreateInfo ivciFlow{};
     ivciFlow.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -234,7 +310,7 @@ bool VulkanWarper::CreateFlowAndMaskTextures(int flowWidth, int flowHeight) {
     ivciFlow.viewType = VK_IMAGE_VIEW_TYPE_2D;
     ivciFlow.format = VK_FORMAT_R32G32_SFLOAT;
     ivciFlow.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    if (vkCreateImageView(m_device, &ivciFlow, nullptr, &m_flowView) != VK_SUCCESS) return false;
+    if (m_disp.CreateImageView(m_device, &ivciFlow, nullptr, &m_flowView) != VK_SUCCESS) return false;
 
     // 2. Create Mask Image (VK_FORMAT_R32_SFLOAT)
     VkImageCreateInfo iciMask{};
@@ -248,16 +324,16 @@ bool VulkanWarper::CreateFlowAndMaskTextures(int flowWidth, int flowHeight) {
     iciMask.tiling = VK_IMAGE_TILING_OPTIMAL;
     iciMask.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     iciMask.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkCreateImage(m_device, &iciMask, nullptr, &m_maskImage) != VK_SUCCESS) return false;
+    if (m_disp.CreateImage(m_device, &iciMask, nullptr, &m_maskImage) != VK_SUCCESS) return false;
 
     VkMemoryRequirements memReqMask;
-    vkGetImageMemoryRequirements(m_device, m_maskImage, &memReqMask);
+    m_disp.GetImageMemoryRequirements(m_device, m_maskImage, &memReqMask);
     VkMemoryAllocateInfo maiMask{};
     maiMask.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     maiMask.allocationSize = memReqMask.size;
     maiMask.memoryTypeIndex = FindMemoryType(memReqMask.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (vkAllocateMemory(m_device, &maiMask, nullptr, &m_maskMem) != VK_SUCCESS) return false;
-    vkBindImageMemory(m_device, m_maskImage, m_maskMem, 0);
+    if (m_disp.AllocateMemory(m_device, &maiMask, nullptr, &m_maskMem) != VK_SUCCESS) return false;
+    m_disp.BindImageMemory(m_device, m_maskImage, m_maskMem, 0);
 
     VkImageViewCreateInfo ivciMask{};
     ivciMask.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -265,7 +341,7 @@ bool VulkanWarper::CreateFlowAndMaskTextures(int flowWidth, int flowHeight) {
     ivciMask.viewType = VK_IMAGE_VIEW_TYPE_2D;
     ivciMask.format = VK_FORMAT_R32_SFLOAT;
     ivciMask.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    if (vkCreateImageView(m_device, &ivciMask, nullptr, &m_maskView) != VK_SUCCESS) return false;
+    if (m_disp.CreateImageView(m_device, &ivciMask, nullptr, &m_maskView) != VK_SUCCESS) return false;
 
     // 3. Staging Buffer for Flow (RG32F) + Mask (R32F)
     size_t flowBytes = (size_t)flowWidth * flowHeight * 2 * sizeof(float);
@@ -277,42 +353,42 @@ bool VulkanWarper::CreateFlowAndMaskTextures(int flowWidth, int flowHeight) {
     bci.size = stagingSize;
     bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateBuffer(m_device, &bci, nullptr, &m_flowStagingBuffer) != VK_SUCCESS) return false;
+    if (m_disp.CreateBuffer(m_device, &bci, nullptr, &m_flowStagingBuffer) != VK_SUCCESS) return false;
 
     VkMemoryRequirements memReqBuf;
-    vkGetBufferMemoryRequirements(m_device, m_flowStagingBuffer, &memReqBuf);
+    m_disp.GetBufferMemoryRequirements(m_device, m_flowStagingBuffer, &memReqBuf);
     VkMemoryAllocateInfo maiBuf{};
     maiBuf.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     maiBuf.allocationSize = memReqBuf.size;
     maiBuf.memoryTypeIndex = FindMemoryType(memReqBuf.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (vkAllocateMemory(m_device, &maiBuf, nullptr, &m_flowStagingMem) != VK_SUCCESS) return false;
-    vkBindBufferMemory(m_device, m_flowStagingBuffer, m_flowStagingMem, 0);
+    if (m_disp.AllocateMemory(m_device, &maiBuf, nullptr, &m_flowStagingMem) != VK_SUCCESS) return false;
+    m_disp.BindBufferMemory(m_device, m_flowStagingBuffer, m_flowStagingMem, 0);
 
-    vkMapMemory(m_device, m_flowStagingMem, 0, stagingSize, 0, &m_flowStagingPtr);
+    m_disp.MapMemory(m_device, m_flowStagingMem, 0, stagingSize, 0, &m_flowStagingPtr);
     return true;
 }
 
 void VulkanWarper::DestroyFlowAndMaskTextures() {
     if (m_flowStagingPtr) {
-        vkUnmapMemory(m_device, m_flowStagingMem);
+        m_disp.UnmapMemory(m_device, m_flowStagingMem);
         m_flowStagingPtr = nullptr;
     }
     if (m_flowStagingBuffer) {
-        vkDestroyBuffer(m_device, m_flowStagingBuffer, nullptr);
+        m_disp.DestroyBuffer(m_device, m_flowStagingBuffer, nullptr);
         m_flowStagingBuffer = VK_NULL_HANDLE;
     }
     if (m_flowStagingMem) {
-        vkFreeMemory(m_device, m_flowStagingMem, nullptr);
+        m_disp.FreeMemory(m_device, m_flowStagingMem, nullptr);
         m_flowStagingMem = VK_NULL_HANDLE;
     }
 
-    if (m_flowView) { vkDestroyImageView(m_device, m_flowView, nullptr); m_flowView = VK_NULL_HANDLE; }
-    if (m_flowImage) { vkDestroyImage(m_device, m_flowImage, nullptr); m_flowImage = VK_NULL_HANDLE; }
-    if (m_flowMem) { vkFreeMemory(m_device, m_flowMem, nullptr); m_flowMem = VK_NULL_HANDLE; }
+    if (m_flowView) { m_disp.DestroyImageView(m_device, m_flowView, nullptr); m_flowView = VK_NULL_HANDLE; }
+    if (m_flowImage) { m_disp.DestroyImage(m_device, m_flowImage, nullptr); m_flowImage = VK_NULL_HANDLE; }
+    if (m_flowMem) { m_disp.FreeMemory(m_device, m_flowMem, nullptr); m_flowMem = VK_NULL_HANDLE; }
 
-    if (m_maskView) { vkDestroyImageView(m_device, m_maskView, nullptr); m_maskView = VK_NULL_HANDLE; }
-    if (m_maskImage) { vkDestroyImage(m_device, m_maskImage, nullptr); m_maskImage = VK_NULL_HANDLE; }
-    if (m_maskMem) { vkFreeMemory(m_device, m_maskMem, nullptr); m_maskMem = VK_NULL_HANDLE; }
+    if (m_maskView) { m_disp.DestroyImageView(m_device, m_maskView, nullptr); m_maskView = VK_NULL_HANDLE; }
+    if (m_maskImage) { m_disp.DestroyImage(m_device, m_maskImage, nullptr); m_maskImage = VK_NULL_HANDLE; }
+    if (m_maskMem) { m_disp.FreeMemory(m_device, m_maskMem, nullptr); m_maskMem = VK_NULL_HANDLE; }
 }
 
 bool VulkanWarper::CreateDownsampleStaging(int flowWidth, int flowHeight, VkFormat format) {
@@ -335,16 +411,16 @@ bool VulkanWarper::CreateDownsampleStaging(int flowWidth, int flowHeight, VkForm
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
     ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkCreateImage(m_device, &ici, nullptr, &m_downImage) != VK_SUCCESS) return false;
+    if (m_disp.CreateImage(m_device, &ici, nullptr, &m_downImage) != VK_SUCCESS) return false;
 
     VkMemoryRequirements memReq;
-    vkGetImageMemoryRequirements(m_device, m_downImage, &memReq);
+    m_disp.GetImageMemoryRequirements(m_device, m_downImage, &memReq);
     VkMemoryAllocateInfo mai{};
     mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = memReq.size;
     mai.memoryTypeIndex = FindMemoryType(memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (vkAllocateMemory(m_device, &mai, nullptr, &m_downMem) != VK_SUCCESS) return false;
-    vkBindImageMemory(m_device, m_downImage, m_downMem, 0);
+    if (m_disp.AllocateMemory(m_device, &mai, nullptr, &m_downMem) != VK_SUCCESS) return false;
+    m_disp.BindImageMemory(m_device, m_downImage, m_downMem, 0);
 
     VkImageViewCreateInfo ivci{};
     ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -352,7 +428,7 @@ bool VulkanWarper::CreateDownsampleStaging(int flowWidth, int flowHeight, VkForm
     ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
     ivci.format = format;
     ivci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    if (vkCreateImageView(m_device, &ivci, nullptr, &m_downView) != VK_SUCCESS) return false;
+    if (m_disp.CreateImageView(m_device, &ivci, nullptr, &m_downView) != VK_SUCCESS) return false;
 
     // 2. Readback staging buffer
     VkDeviceSize bufSize = (size_t)flowWidth * flowHeight * 4;
@@ -361,38 +437,38 @@ bool VulkanWarper::CreateDownsampleStaging(int flowWidth, int flowHeight, VkForm
     bci.size = bufSize;
     bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateBuffer(m_device, &bci, nullptr, &m_downStagingBuffer) != VK_SUCCESS) return false;
+    if (m_disp.CreateBuffer(m_device, &bci, nullptr, &m_downStagingBuffer) != VK_SUCCESS) return false;
 
     VkMemoryRequirements memReqBuf;
-    vkGetBufferMemoryRequirements(m_device, m_downStagingBuffer, &memReqBuf);
+    m_disp.GetBufferMemoryRequirements(m_device, m_downStagingBuffer, &memReqBuf);
     VkMemoryAllocateInfo maiBuf{};
     maiBuf.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     maiBuf.allocationSize = memReqBuf.size;
     maiBuf.memoryTypeIndex = FindMemoryType(memReqBuf.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (vkAllocateMemory(m_device, &maiBuf, nullptr, &m_downStagingMem) != VK_SUCCESS) return false;
-    vkBindBufferMemory(m_device, m_downStagingBuffer, m_downStagingMem, 0);
+    if (m_disp.AllocateMemory(m_device, &maiBuf, nullptr, &m_downStagingMem) != VK_SUCCESS) return false;
+    m_disp.BindBufferMemory(m_device, m_downStagingBuffer, m_downStagingMem, 0);
 
-    vkMapMemory(m_device, m_downStagingMem, 0, bufSize, 0, &m_downStagingPtr);
+    m_disp.MapMemory(m_device, m_downStagingMem, 0, bufSize, 0, &m_downStagingPtr);
     return true;
 }
 
 void VulkanWarper::DestroyDownsampleStaging() {
     if (m_downStagingPtr) {
-        vkUnmapMemory(m_device, m_downStagingMem);
+        m_disp.UnmapMemory(m_device, m_downStagingMem);
         m_downStagingPtr = nullptr;
     }
     if (m_downStagingBuffer) {
-        vkDestroyBuffer(m_device, m_downStagingBuffer, nullptr);
+        m_disp.DestroyBuffer(m_device, m_downStagingBuffer, nullptr);
         m_downStagingBuffer = VK_NULL_HANDLE;
     }
     if (m_downStagingMem) {
-        vkFreeMemory(m_device, m_downStagingMem, nullptr);
+        m_disp.FreeMemory(m_device, m_downStagingMem, nullptr);
         m_downStagingMem = VK_NULL_HANDLE;
     }
 
-    if (m_downView) { vkDestroyImageView(m_device, m_downView, nullptr); m_downView = VK_NULL_HANDLE; }
-    if (m_downImage) { vkDestroyImage(m_device, m_downImage, nullptr); m_downImage = VK_NULL_HANDLE; }
-    if (m_downMem) { vkFreeMemory(m_device, m_downMem, nullptr); m_downMem = VK_NULL_HANDLE; }
+    if (m_downView) { m_disp.DestroyImageView(m_device, m_downView, nullptr); m_downView = VK_NULL_HANDLE; }
+    if (m_downImage) { m_disp.DestroyImage(m_device, m_downImage, nullptr); m_downImage = VK_NULL_HANDLE; }
+    if (m_downMem) { m_disp.FreeMemory(m_device, m_downMem, nullptr); m_downMem = VK_NULL_HANDLE; }
 }
 
 bool VulkanWarper::ReadbackDownsample(
@@ -422,7 +498,7 @@ bool VulkanWarper::ReadbackDownsample(
     barriers[1].image = m_downImage;
     barriers[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
+    m_disp.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
 
     // Blit from srcImage (1280x800) to m_downImage (288x180) with hardware linear downsample
     VkImageBlit blit{};
@@ -433,9 +509,9 @@ bool VulkanWarper::ReadbackDownsample(
     blit.dstOffsets[0] = { 0, 0, 0 };
     blit.dstOffsets[1] = { dstW, dstH, 1 };
 
-    vkCmdBlitImage(cmd, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   m_downImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                   1, &blit, VK_FILTER_LINEAR);
+    m_disp.CmdBlitImage(cmd, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        m_downImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        1, &blit, VK_FILTER_LINEAR);
 
     // Transition m_downImage to TRANSFER_SRC_OPTIMAL and restore srcImage to PRESENT_SRC_KHR
     barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -448,7 +524,7 @@ bool VulkanWarper::ReadbackDownsample(
     barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
+    m_disp.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
 
     // Copy m_downImage to host-visible staging buffer
     VkBufferImageCopy copyRegion{};
@@ -458,7 +534,7 @@ bool VulkanWarper::ReadbackDownsample(
     copyRegion.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     copyRegion.imageExtent = { (uint32_t)dstW, (uint32_t)dstH, 1 };
 
-    vkCmdCopyImageToBuffer(cmd, m_downImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_downStagingBuffer, 1, &copyRegion);
+    m_disp.CmdCopyImageToBuffer(cmd, m_downImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_downStagingBuffer, 1, &copyRegion);
     return true;
 }
 
@@ -497,7 +573,7 @@ bool VulkanWarper::UpdateFlowAndMask(
     barriers[1].image = m_maskImage;
     barriers[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
+    m_disp.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
 
     // Copy buffer to flow image (RG32F)
     VkBufferImageCopy flowCopy{};
@@ -506,7 +582,7 @@ bool VulkanWarper::UpdateFlowAndMask(
     flowCopy.bufferImageHeight = height;
     flowCopy.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     flowCopy.imageExtent = { (uint32_t)width, (uint32_t)height, 1 };
-    vkCmdCopyBufferToImage(cmd, m_flowStagingBuffer, m_flowImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &flowCopy);
+    m_disp.CmdCopyBufferToImage(cmd, m_flowStagingBuffer, m_flowImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &flowCopy);
 
     // Copy buffer to mask image (R32F)
     VkBufferImageCopy maskCopy{};
@@ -515,7 +591,7 @@ bool VulkanWarper::UpdateFlowAndMask(
     maskCopy.bufferImageHeight = height;
     maskCopy.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     maskCopy.imageExtent = { (uint32_t)width, (uint32_t)height, 1 };
-    vkCmdCopyBufferToImage(cmd, m_flowStagingBuffer, m_maskImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &maskCopy);
+    m_disp.CmdCopyBufferToImage(cmd, m_flowStagingBuffer, m_maskImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &maskCopy);
 
     // Transition images to SHADER_READ_ONLY_OPTIMAL for sampler2D in warp_rgba
     barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -528,7 +604,7 @@ bool VulkanWarper::UpdateFlowAndMask(
     barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barriers[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
+    m_disp.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
     return true;
 }
 
@@ -542,12 +618,13 @@ VkDescriptorSet VulkanWarper::AllocateWarpDescriptorSet() {
     ai.descriptorPool = m_descriptorPool;
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &m_warpDescLayout;
-    if (vkAllocateDescriptorSets(m_device, &ai, &descSet) != VK_SUCCESS) {
+    if (m_disp.AllocateDescriptorSets(m_device, &ai, &descSet) != VK_SUCCESS) {
         return VK_NULL_HANDLE;
     }
     return descSet;
 }
 
+// Warps frame0 and frame1 using optical flow and mask into outImage
 bool VulkanWarper::WarpFrame(
     VkCommandBuffer cmd,
     VkDescriptorSet descSet,
@@ -594,10 +671,10 @@ bool VulkanWarper::WarpFrame(
     writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     writes[4].pImageInfo = &outInfo;
 
-    vkUpdateDescriptorSets(m_device, 5, writes, 0, nullptr);
+    m_disp.UpdateDescriptorSets(m_device, 5, writes, 0, nullptr);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_warpPipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_warpPipelineLayout, 0, 1, &descSet, 0, nullptr);
+    m_disp.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_warpPipeline);
+    m_disp.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_warpPipelineLayout, 0, 1, &descSet, 0, nullptr);
 
     WarpPushConstants pc{};
     pc.time_step = timeStep;
@@ -606,15 +683,16 @@ bool VulkanWarper::WarpFrame(
     pc.width = width;
     pc.height = height;
     pc.show_hud = showHud ? 1 : 0;
-    vkCmdPushConstants(cmd, m_warpPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(WarpPushConstants), &pc);
+    m_disp.CmdPushConstants(cmd, m_warpPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(WarpPushConstants), &pc);
 
     uint32_t groupX = (width + 15) / 16;
     uint32_t groupY = (height + 15) / 16;
-    vkCmdDispatch(cmd, groupX, groupY, 1);
+    m_disp.CmdDispatch(cmd, groupX, groupY, 1);
 
     return true;
 }
 
+// Downsamples high-res frame to low-res for RIFE
 bool VulkanWarper::Downsample(
     VkCommandBuffer cmd,
     VkImageView inView,
@@ -633,7 +711,7 @@ bool VulkanWarper::Downsample(
     ai.descriptorPool = m_descriptorPool;
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &m_downsampleDescLayout;
-    if (vkAllocateDescriptorSets(m_device, &ai, &descSet) != VK_SUCCESS) {
+    if (m_disp.AllocateDescriptorSets(m_device, &ai, &descSet) != VK_SUCCESS) {
         return false;
     }
 
@@ -661,17 +739,17 @@ bool VulkanWarper::Downsample(
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     writes[1].pImageInfo = &outInfo;
 
-    vkUpdateDescriptorSets(m_device, 2, writes, 0, nullptr);
+    m_disp.UpdateDescriptorSets(m_device, 2, writes, 0, nullptr);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_downsamplePipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_downsamplePipelineLayout, 0, 1, &descSet, 0, nullptr);
+    m_disp.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_downsamplePipeline);
+    m_disp.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_downsamplePipelineLayout, 0, 1, &descSet, 0, nullptr);
 
     struct DownPushConstants { int in_w, in_h, out_w, out_h; } pc = { inWidth, inHeight, outWidth, outHeight };
-    vkCmdPushConstants(cmd, m_downsamplePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    m_disp.CmdPushConstants(cmd, m_downsamplePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
     uint32_t groupX = (outWidth + 15) / 16;
     uint32_t groupY = (outHeight + 15) / 16;
-    vkCmdDispatch(cmd, groupX, groupY, 1);
+    m_disp.CmdDispatch(cmd, groupX, groupY, 1);
 
     return true;
 }

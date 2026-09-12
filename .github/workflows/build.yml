@@ -94,16 +94,15 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: github.ref == 'refs/heads/main'
         with:
-          tag_name: v1.1.7
-          name: "SkyFrame v1.1.7 for Steam Deck (Critical Fix: Vulkan Memory Properties & APU Fallback)"
+          tag_name: v1.1.8
+          name: "SkyFrame v1.1.8 for Steam Deck (Critical Fix: Downstream Command Dispatch & Zero Loader Trampolines)"
           body: |
-            ## 🚀 SkyFrame v1.1.7 — Полное устранение ошибки Physical Device Memory Properties и краша
+            ## 🚀 SkyFrame v1.1.8 — Полное устранение ошибки Invalid Command Buffer и вывод кадров на экран
 
-            ### Что исправлено в v1.1.7:
-            - **Устранен краш при создании текстур оптического потока (SIGSEGV):** устранена ошибка `vkGetPhysicalDeviceMemoryProperties: Invalid physicalDevice [VUID-vkGetPhysicalDeviceMemoryProperties-physicalDevice-parameter]`.
-            - **Прямое кэширование свойств памяти устройства:** `VulkanWarper` больше не обращается к трамплину `libvulkan.so` во время распределения памяти, а использует свойства памяти устройства, перехваченные при создании устройства (`Hook_vkCreateDevice`).
-            - **Безотказный APU Fallback:** добавлен встроенный профиль свойств памяти для APU VanGogh (Steam Deck), гарантирующий 100% успех выделения памяти под RG32F/R32F и промежуточные буферы даже при изоляции или уничтожении вспомогательных экземпляров Vulkan.
-            - **Чистый запуск игры:** устранен темный экран и зависание на 1 кадре. Полноценная интерполяция 30 -> 60 FPS через RIFE FlowNet + FastWarp.
+            ### Что исправлено в v1.1.8:
+            - **Устранен краш `vkCmdPipelineBarrier: Invalid commandBuffer`:** все вызовы Vulkan внутри `VulkanWarper` переведены на прямое выполнение через таблицу диспетчеризации драйвера устройства (`WarperDeviceDispatch` через `vkGetDeviceProcAddr`).
+            - **Полный обход трамплина `libvulkan.so`:** команды пайплайна, копирования текстур, push-констант и dispatch теперь направляются напрямую в драйвер RADV/Mesa без валидации глобального загрузчика Vulkan.
+            - **Гарантированный вывод кадров:** устранено зависание и падение до 0 FPS при вызове первого ReadbackDownsample/Warp. Полноценная интерполяция 30 -> 60 FPS через RIFE FlowNet + FastWarp.
           files: SkyFrame.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

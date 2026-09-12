@@ -17,9 +17,48 @@ struct WarpPushConstants {
     int   show_hud;
 };
 
+struct WarperDeviceDispatch {
+    PFN_vkCreateSampler CreateSampler = nullptr;
+    PFN_vkDestroySampler DestroySampler = nullptr;
+    PFN_vkCreateDescriptorPool CreateDescriptorPool = nullptr;
+    PFN_vkDestroyDescriptorPool DestroyDescriptorPool = nullptr;
+    PFN_vkCreateDescriptorSetLayout CreateDescriptorSetLayout = nullptr;
+    PFN_vkDestroyDescriptorSetLayout DestroyDescriptorSetLayout = nullptr;
+    PFN_vkCreatePipelineLayout CreatePipelineLayout = nullptr;
+    PFN_vkDestroyPipelineLayout DestroyPipelineLayout = nullptr;
+    PFN_vkCreateComputePipelines CreateComputePipelines = nullptr;
+    PFN_vkDestroyPipeline DestroyPipeline = nullptr;
+    PFN_vkCreateShaderModule CreateShaderModule = nullptr;
+    PFN_vkDestroyShaderModule DestroyShaderModule = nullptr;
+    PFN_vkAllocateDescriptorSets AllocateDescriptorSets = nullptr;
+    PFN_vkUpdateDescriptorSets UpdateDescriptorSets = nullptr;
+    PFN_vkCreateImage CreateImage = nullptr;
+    PFN_vkDestroyImage DestroyImage = nullptr;
+    PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements = nullptr;
+    PFN_vkAllocateMemory AllocateMemory = nullptr;
+    PFN_vkFreeMemory FreeMemory = nullptr;
+    PFN_vkBindImageMemory BindImageMemory = nullptr;
+    PFN_vkCreateImageView CreateImageView = nullptr;
+    PFN_vkDestroyImageView DestroyImageView = nullptr;
+    PFN_vkCreateBuffer CreateBuffer = nullptr;
+    PFN_vkDestroyBuffer DestroyBuffer = nullptr;
+    PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements = nullptr;
+    PFN_vkBindBufferMemory BindBufferMemory = nullptr;
+    PFN_vkMapMemory MapMemory = nullptr;
+    PFN_vkUnmapMemory UnmapMemory = nullptr;
+    PFN_vkCmdPipelineBarrier CmdPipelineBarrier = nullptr;
+    PFN_vkCmdBlitImage CmdBlitImage = nullptr;
+    PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer = nullptr;
+    PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage = nullptr;
+    PFN_vkCmdBindPipeline CmdBindPipeline = nullptr;
+    PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets = nullptr;
+    PFN_vkCmdPushConstants CmdPushConstants = nullptr;
+    PFN_vkCmdDispatch CmdDispatch = nullptr;
+};
+
 class VulkanWarper {
 public:
-    VulkanWarper(VkDevice device, const VkPhysicalDeviceMemoryProperties& memProperties, VkQueue queue, uint32_t queueFamilyIndex);
+    VulkanWarper(VkDevice device, const VkPhysicalDeviceMemoryProperties& memProperties, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue, uint32_t queueFamilyIndex);
     ~VulkanWarper();
 
     bool InitPipelines(const uint32_t* warpSpv, size_t warpSize, const uint32_t* downSpv, size_t downSize);
@@ -88,6 +127,7 @@ private:
 
     VkDevice m_device = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties m_memProperties{};
+    WarperDeviceDispatch m_disp{};
     VkQueue m_queue = VK_NULL_HANDLE;
     uint32_t m_queueFamily = 0;
 
