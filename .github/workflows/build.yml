@@ -42,6 +42,7 @@ jobs:
           cmake .. \
             -DCMAKE_BUILD_TYPE=Release \
             -DNCNN_VULKAN=ON \
+            -DNCNN_SIMPLEVK=OFF \
             -DNCNN_SYSTEM_GLSLANG=OFF \
             -DNCNN_BUILD_EXAMPLES=OFF \
             -DNCNN_BUILD_TESTS=OFF \
