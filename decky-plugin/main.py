@@ -75,10 +75,12 @@ class Plugin:
         try:
             os.makedirs(CONFIG_DIR, exist_ok=True)
             fix_perms(CONFIG_DIR)
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            tmp_path = CONFIG_PATH + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2)
+            fix_perms(tmp_path)
+            os.replace(tmp_path, CONFIG_PATH)
             fix_perms(CONFIG_PATH)
-            self.sync_vulkan_layer()
         except Exception as e:
             logging.error(f"[SkyFrame] Failed to save config: {e}")
 
@@ -130,94 +132,84 @@ class Plugin:
             sys_manifest_64 = os.path.join(SYSTEM_LAYER_DIR, "vk_layer_skyframe.json")
             sys_manifest_32 = os.path.join(SYSTEM_LAYER_DIR, "vk_layer_skyframe_32.json")
 
-            if self.config.get("enabled", False):
-                global_mode = self.config.get("global_injection", False)
+            global_mode = self.config.get("global_injection", False)
 
-                # 64-bit layer definition
-                layer_64 = {
-                    "name": "VK_LAYER_SKYFRAME_framegen",
-                    "type": "GLOBAL",
-                    "library_path": lib64_dst,
-                    "api_version": "1.3.0",
-                    "implementation_version": "1",
-                    "description": "SkyFrame Native AI Frame Generation Layer (64-bit)",
-                    "functions": {
-                        "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion",
-                        "vkGetInstanceProcAddr": "skyframe_GetInstanceProcAddr",
-                        "vkGetDeviceProcAddr": "skyframe_GetDeviceProcAddr"
-                    },
-                    "disable_environment": {
-                        "DISABLE_SKYFRAME": "1"
-                    }
+            # 64-bit layer definition
+            layer_64 = {
+                "name": "VK_LAYER_SKYFRAME_framegen",
+                "type": "GLOBAL",
+                "library_path": lib64_dst,
+                "api_version": "1.3.0",
+                "implementation_version": "1",
+                "description": "SkyFrame Native AI Frame Generation Layer (64-bit)",
+                "functions": {
+                    "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion",
+                    "vkGetInstanceProcAddr": "skyframe_GetInstanceProcAddr",
+                    "vkGetDeviceProcAddr": "skyframe_GetDeviceProcAddr"
+                },
+                "disable_environment": {
+                    "DISABLE_SKYFRAME": "1"
                 }
-                if not global_mode:
-                    layer_64["enable_environment"] = { "ENABLE_SKYFRAME": "1" }
+            }
+            if not global_mode:
+                layer_64["enable_environment"] = { "ENABLE_SKYFRAME": "1" }
 
-                manifest_64 = {
-                    "file_format_version": "1.0.0",
-                    "layer": layer_64
+            manifest_64 = {
+                "file_format_version": "1.0.0",
+                "layer": layer_64
+            }
+
+            # 32-bit layer definition (uses same layer name for canonical multilib match)
+            layer_32 = {
+                "name": "VK_LAYER_SKYFRAME_framegen",
+                "type": "GLOBAL",
+                "library_path": lib32_dst,
+                "api_version": "1.3.0",
+                "implementation_version": "1",
+                "description": "SkyFrame Native AI Frame Generation Layer (32-bit)",
+                "functions": {
+                    "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion",
+                    "vkGetInstanceProcAddr": "skyframe_GetInstanceProcAddr",
+                    "vkGetDeviceProcAddr": "skyframe_GetDeviceProcAddr"
+                },
+                "disable_environment": {
+                    "DISABLE_SKYFRAME": "1"
                 }
+            }
+            if not global_mode:
+                layer_32["enable_environment"] = { "ENABLE_SKYFRAME": "1" }
 
-                # 32-bit layer definition (uses same layer name for canonical multilib match)
-                layer_32 = {
-                    "name": "VK_LAYER_SKYFRAME_framegen",
-                    "type": "GLOBAL",
-                    "library_path": lib32_dst,
-                    "api_version": "1.3.0",
-                    "implementation_version": "1",
-                    "description": "SkyFrame Native AI Frame Generation Layer (32-bit)",
-                    "functions": {
-                        "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion",
-                        "vkGetInstanceProcAddr": "skyframe_GetInstanceProcAddr",
-                        "vkGetDeviceProcAddr": "skyframe_GetDeviceProcAddr"
-                    },
-                    "disable_environment": {
-                        "DISABLE_SKYFRAME": "1"
-                    }
-                }
-                if not global_mode:
-                    layer_32["enable_environment"] = { "ENABLE_SKYFRAME": "1" }
+            manifest_32 = {
+                "file_format_version": "1.0.0",
+                "layer": layer_32
+            }
 
-                manifest_32 = {
-                    "file_format_version": "1.0.0",
-                    "layer": layer_32
-                }
+            # 1. Write user manifests (~/.local/share/vulkan/implicit_layer.d/)
+            with open(user_manifest_64, "w", encoding="utf-8") as f:
+                json.dump(manifest_64, f, indent=2)
+            fix_perms(user_manifest_64)
 
-                # 1. Write user manifests (~/.local/share/vulkan/implicit_layer.d/)
-                with open(user_manifest_64, "w", encoding="utf-8") as f:
-                    json.dump(manifest_64, f, indent=2)
-                fix_perms(user_manifest_64)
+            if os.path.isfile(lib32_dst):
+                with open(user_manifest_32, "w", encoding="utf-8") as f:
+                    json.dump(manifest_32, f, indent=2)
+                fix_perms(user_manifest_32)
 
-                if os.path.isfile(lib32_dst):
-                    with open(user_manifest_32, "w", encoding="utf-8") as f:
-                        json.dump(manifest_32, f, indent=2)
-                    fix_perms(user_manifest_32)
+            # 2. Write system manifests (/etc/vulkan/implicit_layer.d/) if root
+            try:
+                if os.getuid() == 0:
+                    os.makedirs(SYSTEM_LAYER_DIR, exist_ok=True)
+                    with open(sys_manifest_64, "w", encoding="utf-8") as f:
+                        json.dump(manifest_64, f, indent=2)
+                    os.chmod(sys_manifest_64, 0o644)
 
-                # 2. Write system manifests (/etc/vulkan/implicit_layer.d/) if root
-                try:
-                    if os.getuid() == 0:
-                        os.makedirs(SYSTEM_LAYER_DIR, exist_ok=True)
-                        with open(sys_manifest_64, "w", encoding="utf-8") as f:
-                            json.dump(manifest_64, f, indent=2)
-                        os.chmod(sys_manifest_64, 0o644)
+                    if os.path.isfile(lib32_dst):
+                        with open(sys_manifest_32, "w", encoding="utf-8") as f:
+                            json.dump(manifest_32, f, indent=2)
+                        os.chmod(sys_manifest_32, 0o644)
+            except Exception as e:
+                logging.warning(f"[SkyFrame] Could not write system manifest: {e}")
 
-                        if os.path.isfile(lib32_dst):
-                            with open(sys_manifest_32, "w", encoding="utf-8") as f:
-                                json.dump(manifest_32, f, indent=2)
-                            os.chmod(sys_manifest_32, 0o644)
-                except Exception as e:
-                    logging.warning(f"[SkyFrame] Could not write system manifest: {e}")
-
-                logging.info(f"[SkyFrame] Layers registered successfully. Global injection: {global_mode}")
-            else:
-                # Remove manifests when disabled
-                for p in [user_manifest_64, user_manifest_32, sys_manifest_64, sys_manifest_32]:
-                    if os.path.isfile(p):
-                        try:
-                            os.remove(p)
-                        except Exception:
-                            pass
-                logging.info("[SkyFrame] Vulkan layer manifests removed (disabled).")
+            logging.info(f"[SkyFrame] Layers registered successfully. Global injection: {global_mode}")
         except Exception as e:
             logging.error(f"[SkyFrame] Error updating Vulkan layer: {e}")
 
@@ -239,6 +231,7 @@ class Plugin:
     async def set_global_injection(self, global_injection: bool):
         self.config["global_injection"] = bool(global_injection)
         self.save_config()
+        self.sync_vulkan_layer()
         return self.config
 
     async def set_mode(self, mode: int):
@@ -257,9 +250,20 @@ class Plugin:
         return self.config
 
     async def get_stats(self):
+        try:
+            if os.path.isfile("/tmp/skyframe_stats.json"):
+                with open("/tmp/skyframe_stats.json", "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return {
+                            "base_fps": float(data.get("base_fps", 0.0)),
+                            "output_fps": float(data.get("output_fps", 0.0))
+                        }
+        except Exception:
+            pass
         return {
-            "base_fps": 30.0 if not self.config["enabled"] else 40.0,
-            "output_fps": 30.0 if not self.config["enabled"] else 80.0
+            "base_fps": 0.0 if not self.config.get("enabled", False) else 30.0,
+            "output_fps": 0.0 if not self.config.get("enabled", False) else 60.0
         }
 
     async def get_status_info(self):

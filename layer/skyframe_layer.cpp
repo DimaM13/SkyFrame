@@ -67,6 +67,8 @@ LayerConfig& GetConfig() {
     return g_config;
 }
 
+static time_t g_lastConfigMtime = 0;
+
 void ReloadConfig() {
     std::lock_guard<std::mutex> lock(g_configMutex);
     const char* home = getenv("HOME");
@@ -76,10 +78,19 @@ void ReloadConfig() {
     if (!file.is_open()) {
         if (configPath != "/home/deck/.config/skyframe/config.json") {
             file.open("/home/deck/.config/skyframe/config.json");
+            if (file.is_open()) {
+                configPath = "/home/deck/.config/skyframe/config.json";
+            }
         }
     }
 
-    if (file.is_open()) {
+    bool fileOpened = file.is_open();
+    if (fileOpened) {
+        struct stat st;
+        if (stat(configPath.c_str(), &st) == 0) {
+            g_lastConfigMtime = st.st_mtime;
+        }
+
         std::string line;
         while (std::getline(file, line)) {
             if (line.find("\"enabled\"") != std::string::npos) {
@@ -90,17 +101,21 @@ void ReloadConfig() {
                 else g_config.mode = 1;
             } else if (line.find("\"hud_protection\"") != std::string::npos) {
                 g_config.hud_protection = (line.find("true") != std::string::npos);
-            } else if (line.find("\"show_hud\"") != std::string::npos || line.find("\"hud\"") != std::string::npos) {
-                g_config.show_hud = (line.find("true") != std::string::npos || line.find("1") != std::string::npos);
+            } else if (line.find("\"show_hud\"") != std::string::npos) {
+                g_config.show_hud = (line.find("true") != std::string::npos);
             }
         }
     }
 
     // Explicit environment variable overrides
-    const char* envEnable = getenv("ENABLE_SKYFRAME");
-    if (envEnable && (strcmp(envEnable, "1") == 0 || strcmp(envEnable, "true") == 0)) {
-        g_config.enabled = true;
+    // Note: If config.json was NOT found, fall back to ENABLE_SKYFRAME.
+    if (!fileOpened) {
+        const char* envEnable = getenv("ENABLE_SKYFRAME");
+        if (envEnable && (strcmp(envEnable, "1") == 0 || strcmp(envEnable, "true") == 0)) {
+            g_config.enabled = true;
+        }
     }
+
     const char* envDisable = getenv("DISABLE_SKYFRAME");
     if (envDisable && (strcmp(envDisable, "1") == 0 || strcmp(envDisable, "true") == 0)) {
         g_config.enabled = false;
@@ -108,6 +123,37 @@ void ReloadConfig() {
     const char* envHud = getenv("SKYFRAME_HUD");
     if (envHud && (strcmp(envHud, "1") == 0 || strcmp(envHud, "true") == 0)) {
         g_config.show_hud = true;
+    }
+}
+
+static void CheckHotReload() {
+    static auto lastCheck = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    if (now - lastCheck < std::chrono::milliseconds(250)) {
+        return;
+    }
+    lastCheck = now;
+
+    const char* home = getenv("HOME");
+    std::string configPath = (home && strlen(home) > 0) ? (std::string(home) + "/.config/skyframe/config.json") : "/home/deck/.config/skyframe/config.json";
+
+    struct stat st;
+    if (stat(configPath.c_str(), &st) != 0) {
+        if (configPath != "/home/deck/.config/skyframe/config.json") {
+            configPath = "/home/deck/.config/skyframe/config.json";
+            if (stat(configPath.c_str(), &st) != 0) {
+                return;
+            }
+        } else {
+            return;
+        }
+    }
+
+    if (st.st_mtime != g_lastConfigMtime) {
+        ReloadConfig();
+        auto& cfg = GetConfig();
+        Log("Hot-reload applied: enabled=%d, mode=%d, show_hud=%d, hud_protection=%d",
+            cfg.enabled, cfg.mode, cfg.show_hud, cfg.hud_protection);
     }
 }
 
@@ -250,6 +296,31 @@ static void PresentWorkerLoop(std::shared_ptr<SwapchainContext> ctx) {
                 g_pfnQueuePresentKHR(job.queue, &pi);
             }
         }
+    }
+}
+
+static void DrainPendingPresents(SwapchainContext* ctx) {
+    if (!ctx) return;
+    std::unique_lock<std::mutex> lock(ctx->presentMutex);
+    while (!ctx->pendingPresents.empty()) {
+        auto oldJob = ctx->pendingPresents.front();
+        ctx->pendingPresents.pop_front();
+        lock.unlock();
+
+        VkPresentInfoKHR pi{};
+        pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        pi.waitSemaphoreCount = (oldJob.waitSemaphore != VK_NULL_HANDLE) ? 1 : 0;
+        pi.pWaitSemaphores = (oldJob.waitSemaphore != VK_NULL_HANDLE) ? &oldJob.waitSemaphore : nullptr;
+        pi.swapchainCount = 1;
+        pi.pSwapchains = &oldJob.swapchain;
+        pi.pImageIndices = &oldJob.imageIndex;
+        {
+            std::lock_guard<std::mutex> qlock(ctx->queueMutex);
+            if (g_pfnQueuePresentKHR && oldJob.queue != VK_NULL_HANDLE) {
+                g_pfnQueuePresentKHR(oldJob.queue, &pi);
+            }
+        }
+        lock.lock();
     }
 }
 
@@ -735,10 +806,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
         return g_pfnQueuePresentKHR(queue, pPresentInfo);
     }
 
-    auto& cfg = GetConfig();
-    if (!cfg.enabled) {
-        return g_pfnQueuePresentKHR(queue, pPresentInfo);
-    }
+    CheckHotReload();
 
     VkSwapchainKHR swapchain = pPresentInfo->pSwapchains[0];
     std::shared_ptr<SwapchainContext> ctx;
@@ -750,7 +818,25 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
         }
     }
 
-    if (!ctx || !ctx->isInitialized || ctx->images.empty()) {
+    auto& cfg = GetConfig();
+    if (!cfg.enabled || !ctx || !ctx->isInitialized || ctx->images.empty()) {
+        if (ctx) {
+            DrainPendingPresents(ctx.get());
+            ctx->pacer.Reset();
+            ctx->prevGameIdx = UINT32_MAX;
+
+            static uint64_t s_disabledCount = 0;
+            if (s_disabledCount++ % 60 == 1) {
+                FILE* fStats = fopen("/tmp/skyframe_stats.json", "w");
+                if (fStats) {
+                    fprintf(fStats, "{\"base_fps\": 0.0, \"output_fps\": 0.0, \"enabled\": false}\n");
+                    fclose(fStats);
+                }
+            }
+
+            std::lock_guard<std::mutex> qlock(ctx->queueMutex);
+            return g_pfnQueuePresentKHR(queue, pPresentInfo);
+        }
         return g_pfnQueuePresentKHR(queue, pPresentInfo);
     }
 
@@ -769,29 +855,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
     uint64_t halfIntervalNs = ctx->pacer.GetTargetPacingDelayNs();
 
     // Flush any pending presentation from prior frame if game produced a fast burst
-    {
-        std::unique_lock<std::mutex> lock(ctx->presentMutex);
-        while (!ctx->pendingPresents.empty()) {
-            auto oldJob = ctx->pendingPresents.front();
-            ctx->pendingPresents.pop_front();
-            lock.unlock();
-
-            VkPresentInfoKHR pi{};
-            pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-            pi.waitSemaphoreCount = (oldJob.waitSemaphore != VK_NULL_HANDLE) ? 1 : 0;
-            pi.pWaitSemaphores = (oldJob.waitSemaphore != VK_NULL_HANDLE) ? &oldJob.waitSemaphore : nullptr;
-            pi.swapchainCount = 1;
-            pi.pSwapchains = &oldJob.swapchain;
-            pi.pImageIndices = &oldJob.imageIndex;
-            {
-                std::lock_guard<std::mutex> qlock(ctx->queueMutex);
-                if (g_pfnQueuePresentKHR && oldJob.queue != VK_NULL_HANDLE) {
-                    g_pfnQueuePresentKHR(oldJob.queue, &pi);
-                }
-            }
-            lock.lock();
-        }
-    }
+    DrainPendingPresents(ctx.get());
 
     // 2. FastWarp 2x Frame Generation: Acquire next image for intermediate frame
     uint32_t intermediateIdx = 0;
@@ -1015,6 +1079,15 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                 usedBlend ? "Compute Motion Blend" : "Fallback Copy",
                 static_cast<float>(ctx->pacer.GetAverageFrameTimeNs()) / 1e6f,
                 static_cast<float>(halfIntervalNs) / 1e6f);
+        }
+
+        if (s_presentCount % 60 == 1) {
+            FILE* fStats = fopen("/tmp/skyframe_stats.json", "w");
+            if (fStats) {
+                fprintf(fStats, "{\"base_fps\": %.1f, \"output_fps\": %.1f, \"enabled\": true}\n",
+                        ctx->pacer.GetBaseFps(), ctx->pacer.GetOutputFps());
+                fclose(fStats);
+            }
         }
         return res;
     }
