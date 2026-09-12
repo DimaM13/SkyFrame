@@ -29,11 +29,22 @@
 #define HAVE_WARP_BLEND 1
 #endif
 
+#if __has_include("warp_rgba_comp_spv.h")
+#include "warp_rgba_comp_spv.h"
+#define HAVE_WARP_RGBA 1
+#endif
+
+#if __has_include("downsample_comp_spv.h")
+#include "downsample_comp_spv.h"
+#define HAVE_DOWNSAMPLE 1
+#endif
+
 namespace skyframe {
 
 static LayerConfig g_config;
 static std::mutex g_configMutex;
 static uint32_t g_graphicsQueueFamily = 0;
+static VkPhysicalDevice g_physicalDevice = VK_NULL_HANDLE;
 
 void Log(const char* fmt, ...) {
     va_list args;
@@ -205,6 +216,11 @@ PFN_vkCreateSemaphore        g_pfnCreateSemaphore = nullptr;
 PFN_vkDestroySemaphore       g_pfnDestroySemaphore = nullptr;
 PFN_vkQueueSubmit            g_pfnQueueSubmit = nullptr;
 
+PFN_vkCreateFence            g_pfnCreateFence = nullptr;
+PFN_vkDestroyFence           g_pfnDestroyFence = nullptr;
+PFN_vkResetFences            g_pfnResetFences = nullptr;
+PFN_vkWaitForFences          g_pfnWaitForFences = nullptr;
+
 PFN_vkCreateShaderModule        g_pfnCreateShaderModule = nullptr;
 PFN_vkDestroyShaderModule       g_pfnDestroyShaderModule = nullptr;
 PFN_vkCreateDescriptorSetLayout g_pfnCreateDescriptorSetLayout = nullptr;
@@ -228,10 +244,13 @@ constexpr size_t RING_SIZE = 4;
 
 struct FrameSlot {
     VkCommandBuffer cmdBuffer = VK_NULL_HANDLE;
+    VkCommandBuffer readbackCmdBuffer = VK_NULL_HANDLE;
     VkSemaphore acqSemaphore = VK_NULL_HANDLE;
     VkSemaphore interDoneSemaphore = VK_NULL_HANDLE;
     VkSemaphore finalDoneSemaphore = VK_NULL_HANDLE;
+    VkFence readbackFence = VK_NULL_HANDLE;
     VkDescriptorSet blendDescSet = VK_NULL_HANDLE;
+    VkDescriptorSet warpDescSet = VK_NULL_HANDLE;
 };
 
 struct PendingPresent {
@@ -265,6 +284,15 @@ struct SwapchainContext {
     std::unique_ptr<VulkanWarper> warper;
     std::unique_ptr<FlowEstimator> flowEstimator;
     FramePacer pacer;
+
+    // FastWarp RIFE neural flow buffers
+    int flowWidth = 288;
+    int flowHeight = 180;
+    std::vector<float> flowBuffer;
+    std::vector<float> maskBuffer;
+    std::vector<uint8_t> prevDownsample;
+    bool hasPrevDownsample = false;
+    bool rifeEnabled = false;
 
     // Asynchronous Frame Pacer Worker
     std::thread presentWorkerThread;
@@ -515,6 +543,87 @@ static bool InitBlendPipeline(SwapchainContext* ctx) {
 #endif
 }
 
+static bool InitRifePipeline(SwapchainContext* ctx) {
+    if (!ctx) return false;
+
+    ctx->flowEstimator = std::make_unique<FlowEstimator>();
+
+    const char* home = getenv("HOME");
+    std::vector<std::string> modelDirs;
+    if (home && strlen(home) > 0) {
+        modelDirs.push_back(std::string(home) + "/.local/share/skyframe/models");
+        modelDirs.push_back(std::string(home) + "/homebrew/plugins/SkyFrame/bin/models");
+    }
+    modelDirs.push_back("/home/deck/.local/share/skyframe/models");
+    modelDirs.push_back("/home/deck/homebrew/plugins/SkyFrame/bin/models");
+    modelDirs.push_back("./models");
+
+    bool modelLoaded = false;
+    for (const auto& dir : modelDirs) {
+        std::string param = dir + "/flownet.param";
+        if (access(param.c_str(), R_OK) == 0) {
+            if (ctx->flowEstimator->LoadModel(dir)) {
+                Log("FlowEstimator loaded RIFE model from %s", dir.c_str());
+                modelLoaded = true;
+                break;
+            }
+        }
+    }
+
+    if (!modelLoaded) {
+        Log("RIFE model (flownet.param / flownet.bin) not found or failed to load, falling back to compute blend.");
+        return false;
+    }
+
+    if (g_physicalDevice == VK_NULL_HANDLE) {
+        Log("g_physicalDevice is null, cannot init VulkanWarper for RIFE");
+        return false;
+    }
+
+    ctx->warper = std::make_unique<VulkanWarper>(ctx->device, g_physicalDevice, VK_NULL_HANDLE, g_graphicsQueueFamily);
+
+#if HAVE_WARP_RGBA
+    size_t downSize = 0;
+    const uint32_t* downPtr = nullptr;
+#if HAVE_DOWNSAMPLE
+    downSize = downsample_comp_spv_size;
+    downPtr = downsample_comp_spv;
+#endif
+
+    if (!ctx->warper->InitPipelines(warp_rgba_comp_spv, warp_rgba_comp_spv_size, downPtr, downSize)) {
+        Log("Failed to initialize VulkanWarper pipelines");
+        return false;
+    }
+#else
+    Log("warp_rgba_comp_spv.h not available");
+    return false;
+#endif
+
+    auto& cfg = GetConfig();
+    ctx->flowWidth = ctx->flowEstimator->GetOptimalFlowWidth(cfg.mode, ctx->extent.width);
+    ctx->flowHeight = ctx->flowEstimator->GetOptimalFlowHeight(cfg.mode, ctx->extent.height);
+
+    if (!ctx->warper->CreateFlowAndMaskTextures(ctx->flowWidth, ctx->flowHeight) ||
+        !ctx->warper->CreateDownsampleStaging(ctx->flowWidth, ctx->flowHeight, ctx->format)) {
+        Log("Failed to create Flow/Mask or Downsample textures in VulkanWarper");
+        return false;
+    }
+
+    for (size_t i = 0; i < RING_SIZE; ++i) {
+        ctx->slots[i].warpDescSet = ctx->warper->AllocateWarpDescriptorSet();
+    }
+
+    ctx->flowBuffer.resize(ctx->flowWidth * ctx->flowHeight * 2);
+    ctx->maskBuffer.resize(ctx->flowWidth * ctx->flowHeight);
+    ctx->prevDownsample.resize(ctx->flowWidth * ctx->flowHeight * 4);
+    ctx->hasPrevDownsample = false;
+    ctx->rifeEnabled = true;
+
+    Log("RIFE FastWarp initialized: %dx%d dense optical flow for %ux%u native output!",
+        ctx->flowWidth, ctx->flowHeight, ctx->extent.width, ctx->extent.height);
+    return true;
+}
+
 static std::mutex g_contextMutex;
 static std::unordered_map<VkSwapchainKHR, std::shared_ptr<SwapchainContext>> g_swapchains;
 
@@ -604,6 +713,8 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateDevice(
         return res;
     }
 
+    g_physicalDevice = physicalDevice;
+
     if (pCreateInfo && pCreateInfo->queueCreateInfoCount > 0) {
         g_graphicsQueueFamily = pCreateInfo->pQueueCreateInfos[0].queueFamilyIndex;
     }
@@ -626,6 +737,11 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateDevice(
     g_pfnCreateSemaphore = (PFN_vkCreateSemaphore)g_nextGetDeviceProcAddr(*pDevice, "vkCreateSemaphore");
     g_pfnDestroySemaphore = (PFN_vkDestroySemaphore)g_nextGetDeviceProcAddr(*pDevice, "vkDestroySemaphore");
     g_pfnQueueSubmit = (PFN_vkQueueSubmit)g_nextGetDeviceProcAddr(*pDevice, "vkQueueSubmit");
+
+    g_pfnCreateFence = (PFN_vkCreateFence)g_nextGetDeviceProcAddr(*pDevice, "vkCreateFence");
+    g_pfnDestroyFence = (PFN_vkDestroyFence)g_nextGetDeviceProcAddr(*pDevice, "vkDestroyFence");
+    g_pfnResetFences = (PFN_vkResetFences)g_nextGetDeviceProcAddr(*pDevice, "vkResetFences");
+    g_pfnWaitForFences = (PFN_vkWaitForFences)g_nextGetDeviceProcAddr(*pDevice, "vkWaitForFences");
 
     g_pfnCreateShaderModule = (PFN_vkCreateShaderModule)g_nextGetDeviceProcAddr(*pDevice, "vkCreateShaderModule");
     g_pfnDestroyShaderModule = (PFN_vkDestroyShaderModule)g_nextGetDeviceProcAddr(*pDevice, "vkDestroyShaderModule");
@@ -658,6 +774,10 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateDevice(
     if (!g_pfnCreateSemaphore) g_pfnCreateSemaphore = &vkCreateSemaphore;
     if (!g_pfnDestroySemaphore) g_pfnDestroySemaphore = &vkDestroySemaphore;
     if (!g_pfnQueueSubmit) g_pfnQueueSubmit = &vkQueueSubmit;
+    if (!g_pfnCreateFence) g_pfnCreateFence = &vkCreateFence;
+    if (!g_pfnDestroyFence) g_pfnDestroyFence = &vkDestroyFence;
+    if (!g_pfnResetFences) g_pfnResetFences = &vkResetFences;
+    if (!g_pfnWaitForFences) g_pfnWaitForFences = &vkWaitForFences;
 
     if (!g_pfnCreateShaderModule) g_pfnCreateShaderModule = &vkCreateShaderModule;
     if (!g_pfnDestroyShaderModule) g_pfnDestroyShaderModule = &vkDestroyShaderModule;
@@ -707,14 +827,19 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateSwapchainKHR(
     if (modifiedCi.minImageCount < 4) {
         modifiedCi.minImageCount = 4;
     }
-    modifiedCi.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    modifiedCi.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 
     VkResult res = g_pfnCreateSwapchainKHR(device, &modifiedCi, pAllocator, pSwapchain);
     if (res != VK_SUCCESS) {
-        Log("Swapchain creation with STORAGE_BIT failed (%d), retrying without STORAGE_BIT", res);
-        modifiedCi.imageUsage = pCreateInfo->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        Log("Swapchain creation with SAMPLED_BIT failed (%d), retrying with STORAGE_BIT", res);
+        modifiedCi.imageUsage = pCreateInfo->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
         if (modifiedCi.minImageCount < 4) modifiedCi.minImageCount = 4;
         res = g_pfnCreateSwapchainKHR(device, &modifiedCi, pAllocator, pSwapchain);
+        if (res != VK_SUCCESS) {
+            Log("Swapchain creation with STORAGE_BIT failed (%d), retrying default", res);
+            modifiedCi.imageUsage = pCreateInfo->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            res = g_pfnCreateSwapchainKHR(device, &modifiedCi, pAllocator, pSwapchain);
+        }
     }
     if (res != VK_SUCCESS || !pSwapchain) return res;
 
@@ -736,27 +861,36 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateSwapchainKHR(
         cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         cpci.queueFamilyIndex = g_graphicsQueueFamily;
         if (g_pfnCreateCommandPool(device, &cpci, nullptr, &ctx->cmdPool) == VK_SUCCESS && g_pfnAllocateCommandBuffers) {
-            VkCommandBuffer rawCmds[RING_SIZE];
+            VkCommandBuffer rawCmds[RING_SIZE * 2];
             VkCommandBufferAllocateInfo cbai{};
             cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
             cbai.commandPool = ctx->cmdPool;
             cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cbai.commandBufferCount = RING_SIZE;
+            cbai.commandBufferCount = RING_SIZE * 2;
             if (g_pfnAllocateCommandBuffers(device, &cbai, rawCmds) == VK_SUCCESS) {
                 VkSemaphoreCreateInfo sci{};
                 sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 
+                VkFenceCreateInfo fci{};
+                fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+                fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+
                 for (size_t i = 0; i < RING_SIZE; ++i) {
                     ctx->slots[i].cmdBuffer = rawCmds[i];
+                    ctx->slots[i].readbackCmdBuffer = rawCmds[RING_SIZE + i];
                     g_pfnCreateSemaphore(device, &sci, nullptr, &ctx->slots[i].acqSemaphore);
                     g_pfnCreateSemaphore(device, &sci, nullptr, &ctx->slots[i].interDoneSemaphore);
                     g_pfnCreateSemaphore(device, &sci, nullptr, &ctx->slots[i].finalDoneSemaphore);
+                    if (g_pfnCreateFence) {
+                        g_pfnCreateFence(device, &fci, nullptr, &ctx->slots[i].readbackFence);
+                    }
                 }
             }
         }
     }
 
     InitBlendPipeline(ctx.get());
+    InitRifePipeline(ctx.get());
 
     ctx->isInitialized = true;
     ctx->workerRunning = true;
@@ -803,10 +937,13 @@ VKAPI_ATTR void VKAPI_CALL Hook_vkDestroySwapchainKHR(
                 if (ctx->slots[i].acqSemaphore && g_pfnDestroySemaphore) g_pfnDestroySemaphore(device, ctx->slots[i].acqSemaphore, nullptr);
                 if (ctx->slots[i].interDoneSemaphore && g_pfnDestroySemaphore) g_pfnDestroySemaphore(device, ctx->slots[i].interDoneSemaphore, nullptr);
                 if (ctx->slots[i].finalDoneSemaphore && g_pfnDestroySemaphore) g_pfnDestroySemaphore(device, ctx->slots[i].finalDoneSemaphore, nullptr);
+                if (ctx->slots[i].readbackFence && g_pfnDestroyFence) g_pfnDestroyFence(device, ctx->slots[i].readbackFence, nullptr);
             }
             if (ctx->cmdPool && g_pfnDestroyCommandPool) {
                 g_pfnDestroyCommandPool(device, ctx->cmdPool, nullptr);
             }
+            ctx->warper.reset();
+            ctx->flowEstimator.reset();
             g_swapchains.erase(it);
         }
     }
@@ -897,8 +1034,59 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
     // Flush any pending presentation from prior frame if game produced a fast burst
     DrainPendingPresents(ctx.get());
 
-    // 0. Base frame initialization: if this is the very first frame, establish baseline directly
-    if (ctx->prevGameIdx == UINT32_MAX) {
+    // 0. Base frame initialization: if this is the very first frame or prevDownsample is unseeded
+    if (ctx->prevGameIdx == UINT32_MAX || !ctx->hasPrevDownsample) {
+        if (ctx->rifeEnabled && ctx->warper && ctx->flowEstimator && ctx->flowEstimator->IsLoaded() &&
+            slot.readbackCmdBuffer != VK_NULL_HANDLE && slot.readbackFence != VK_NULL_HANDLE &&
+            g_pfnBeginCommandBuffer && g_pfnEndCommandBuffer && g_pfnResetFences && g_pfnWaitForFences && g_pfnQueueSubmit) {
+
+            VkCommandBufferBeginInfo rbi{};
+            rbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            rbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            g_pfnBeginCommandBuffer(slot.readbackCmdBuffer, &rbi);
+
+            ctx->warper->ReadbackDownsample(
+                slot.readbackCmdBuffer,
+                ctx->images[currentGameIdx],
+                static_cast<int>(ctx->extent.width), static_cast<int>(ctx->extent.height),
+                ctx->flowWidth, ctx->flowHeight
+            );
+
+            g_pfnEndCommandBuffer(slot.readbackCmdBuffer);
+
+            g_pfnResetFences(ctx->device, 1, &slot.readbackFence);
+
+            std::vector<VkPipelineStageFlags> waitStages(pPresentInfo->waitSemaphoreCount, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            VkSubmitInfo si{};
+            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            si.waitSemaphoreCount = pPresentInfo->waitSemaphoreCount;
+            si.pWaitSemaphores = pPresentInfo->pWaitSemaphores;
+            si.pWaitDstStageMask = waitStages.data();
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &slot.readbackCmdBuffer;
+
+            {
+                std::lock_guard<std::mutex> qlock(ctx->queueMutex);
+                g_pfnQueueSubmit(queue, 1, &si, slot.readbackFence);
+            }
+
+            if (g_pfnWaitForFences(ctx->device, 1, &slot.readbackFence, VK_TRUE, 50000000ULL) == VK_SUCCESS) {
+                const unsigned char* pixels = ctx->warper->GetDownsamplePixels();
+                if (pixels) {
+                    size_t downBytes = (size_t)ctx->flowWidth * ctx->flowHeight * 4;
+                    memcpy(ctx->prevDownsample.data(), pixels, downBytes);
+                    ctx->hasPrevDownsample = true;
+                }
+            }
+
+            ctx->prevGameIdx = currentGameIdx;
+            VkPresentInfoKHR initialPresent = *pPresentInfo;
+            initialPresent.waitSemaphoreCount = 0;
+            initialPresent.pWaitSemaphores = nullptr;
+            std::lock_guard<std::mutex> qlock(ctx->queueMutex);
+            return g_pfnQueuePresentKHR(queue, &initialPresent);
+        }
+
         ctx->prevGameIdx = currentGameIdx;
         std::lock_guard<std::mutex> qlock(ctx->queueMutex);
         return g_pfnQueuePresentKHR(queue, pPresentInfo);
@@ -918,183 +1106,355 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
         slot.cmdBuffer != VK_NULL_HANDLE && g_pfnBeginCommandBuffer &&
         g_pfnCmdPipelineBarrier && g_pfnEndCommandBuffer && g_pfnQueueSubmit) {
 
-        VkCommandBufferBeginInfo bi{};
-        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        g_pfnBeginCommandBuffer(slot.cmdBuffer, &bi);
-
+        bool usedRife = false;
         bool usedBlend = false;
-        if (ctx->blendPipeline != VK_NULL_HANDLE && ctx->prevGameIdx != UINT32_MAX &&
+
+        // PATH A: RIFE FlowNet (NCNN Vulkan) + Native FastWarp (1280x800)
+        if (ctx->rifeEnabled && ctx->warper && ctx->flowEstimator && ctx->flowEstimator->IsLoaded() &&
+            ctx->hasPrevDownsample && ctx->prevGameIdx != UINT32_MAX &&
             ctx->prevGameIdx < ctx->images.size() && ctx->prevGameIdx != intermediateIdx &&
+            ctx->prevGameIdx != currentGameIdx &&
             ctx->prevGameIdx < ctx->imageViews.size() && currentGameIdx < ctx->imageViews.size() &&
             intermediateIdx < ctx->imageViews.size() &&
             ctx->imageViews[ctx->prevGameIdx] != VK_NULL_HANDLE &&
             ctx->imageViews[currentGameIdx] != VK_NULL_HANDLE &&
             ctx->imageViews[intermediateIdx] != VK_NULL_HANDLE &&
-            slot.blendDescSet != VK_NULL_HANDLE && g_pfnUpdateDescriptorSets &&
-            g_pfnCmdBindPipeline && g_pfnCmdBindDescriptorSets && g_pfnCmdPushConstants && g_pfnCmdDispatch) {
+            slot.readbackCmdBuffer != VK_NULL_HANDLE && slot.readbackFence != VK_NULL_HANDLE &&
+            slot.warpDescSet != VK_NULL_HANDLE &&
+            g_pfnResetFences && g_pfnWaitForFences) {
 
-            // Motion Smoothing: Blend Frame N-1 and Frame N into intermediateIdx at phase 0.5
-            VkDescriptorImageInfo imageInfos[3]{};
-            imageInfos[0].imageView = ctx->imageViews[ctx->prevGameIdx];
-            imageInfos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            imageInfos[1].imageView = ctx->imageViews[currentGameIdx];
-            imageInfos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            imageInfos[2].imageView = ctx->imageViews[intermediateIdx];
-            imageInfos[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            // 1. Hardware downsample readback for currentGameIdx
+            VkCommandBufferBeginInfo rbi{};
+            rbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            rbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            g_pfnBeginCommandBuffer(slot.readbackCmdBuffer, &rbi);
 
-            VkWriteDescriptorSet writes[3]{};
-            for (int i = 0; i < 3; ++i) {
-                writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                writes[i].dstSet = slot.blendDescSet;
-                writes[i].dstBinding = i;
-                writes[i].descriptorCount = 1;
-                writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-                writes[i].pImageInfo = &imageInfos[i];
+            ctx->warper->ReadbackDownsample(
+                slot.readbackCmdBuffer,
+                ctx->images[currentGameIdx],
+                static_cast<int>(ctx->extent.width), static_cast<int>(ctx->extent.height),
+                ctx->flowWidth, ctx->flowHeight
+            );
+
+            g_pfnEndCommandBuffer(slot.readbackCmdBuffer);
+
+            g_pfnResetFences(ctx->device, 1, &slot.readbackFence);
+
+            std::vector<VkPipelineStageFlags> waitStages(pPresentInfo->waitSemaphoreCount, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            VkSubmitInfo rsi{};
+            rsi.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            rsi.waitSemaphoreCount = pPresentInfo->waitSemaphoreCount;
+            rsi.pWaitSemaphores = pPresentInfo->pWaitSemaphores;
+            rsi.pWaitDstStageMask = waitStages.data();
+            rsi.commandBufferCount = 1;
+            rsi.pCommandBuffers = &slot.readbackCmdBuffer;
+
+            {
+                std::lock_guard<std::mutex> qlock(ctx->queueMutex);
+                g_pfnQueueSubmit(queue, 1, &rsi, slot.readbackFence);
             }
-            g_pfnUpdateDescriptorSets(ctx->device, 3, writes, 0, nullptr);
 
-            VkImageMemoryBarrier barriers[3]{};
-            barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-            barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            barriers[0].image = ctx->images[ctx->prevGameIdx];
-            barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barriers[0].subresourceRange.levelCount = 1;
-            barriers[0].subresourceRange.layerCount = 1;
+            if (g_pfnWaitForFences(ctx->device, 1, &slot.readbackFence, VK_TRUE, 50000000ULL) == VK_SUCCESS) {
+                const unsigned char* currPixels = ctx->warper->GetDownsamplePixels();
+                if (currPixels) {
+                    int pixelType = (ctx->format == VK_FORMAT_B8G8R8A8_UNORM || ctx->format == VK_FORMAT_B8G8R8A8_SRGB) ? 1 : 0;
 
-            barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barriers[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-            barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            barriers[1].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            barriers[1].image = ctx->images[currentGameIdx];
-            barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barriers[1].subresourceRange.levelCount = 1;
-            barriers[1].subresourceRange.layerCount = 1;
+                    // 2. RIFE FlowNet optical flow & mask inference
+                    bool estOk = ctx->flowEstimator->EstimateFlow(
+                        ctx->prevDownsample.data(),
+                        currPixels,
+                        ctx->flowWidth, ctx->flowHeight,
+                        pixelType,
+                        ctx->flowBuffer.data(),
+                        ctx->maskBuffer.data(),
+                        ctx->flowWidth, ctx->flowHeight
+                    );
 
-            barriers[2].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barriers[2].srcAccessMask = 0;
-            barriers[2].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            barriers[2].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            barriers[2].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            barriers[2].image = ctx->images[intermediateIdx];
-            barriers[2].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barriers[2].subresourceRange.levelCount = 1;
-            barriers[2].subresourceRange.layerCount = 1;
+                    if (estOk) {
+                        size_t downBytes = (size_t)ctx->flowWidth * ctx->flowHeight * 4;
+                        memcpy(ctx->prevDownsample.data(), currPixels, downBytes);
 
-            g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 3, barriers);
+                        // 3. Record FastWarp command buffer at 100% native resolution
+                        VkCommandBufferBeginInfo bi{};
+                        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                        g_pfnBeginCommandBuffer(slot.cmdBuffer, &bi);
 
-            g_pfnCmdBindPipeline(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->blendPipeline);
-            g_pfnCmdBindDescriptorSets(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->blendPipelineLayout, 0, 1, &slot.blendDescSet, 0, nullptr);
+                        ctx->warper->UpdateFlowAndMask(
+                            slot.cmdBuffer,
+                            ctx->flowBuffer.data(),
+                            ctx->maskBuffer.data(),
+                            ctx->flowWidth, ctx->flowHeight
+                        );
 
-            BlendPushConstants pc{
-                0.5f,
-                static_cast<int>(ctx->extent.width),
-                static_cast<int>(ctx->extent.height),
-                cfg.show_hud ? 1 : 0,
-                cfg.hud_protection ? 1 : 0,
-                cfg.mode
-            };
-            g_pfnCmdPushConstants(slot.cmdBuffer, ctx->blendPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+                        VkImageMemoryBarrier barriers[3]{};
+                        barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                        barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                        barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                        barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                        barriers[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        barriers[0].image = ctx->images[ctx->prevGameIdx];
+                        barriers[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
-            uint32_t groupX = (ctx->extent.width + 7) / 8;
-            uint32_t groupY = (ctx->extent.height + 7) / 8;
-            g_pfnCmdDispatch(slot.cmdBuffer, groupX, groupY, 1);
+                        barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                        barriers[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                        barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                        barriers[1].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                        barriers[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        barriers[1].image = ctx->images[currentGameIdx];
+                        barriers[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
-            barriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            barriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-            barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                        barriers[2].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                        barriers[2].srcAccessMask = 0;
+                        barriers[2].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                        barriers[2].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                        barriers[2].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                        barriers[2].image = ctx->images[intermediateIdx];
+                        barriers[2].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
-            barriers[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            barriers[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-            barriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            barriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                        g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 3, barriers);
 
-            barriers[2].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            barriers[2].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-            barriers[2].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            barriers[2].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                        ctx->warper->WarpFrame(
+                            slot.cmdBuffer,
+                            slot.warpDescSet,
+                            ctx->imageViews[ctx->prevGameIdx],
+                            ctx->imageViews[currentGameIdx],
+                            ctx->warper->GetFlowImageView(),
+                            ctx->warper->GetMaskImageView(),
+                            ctx->imageViews[intermediateIdx],
+                            static_cast<int>(ctx->extent.width),
+                            static_cast<int>(ctx->extent.height),
+                            0.5f,
+                            cfg.hud_protection != 0,
+                            0.08f,
+                            cfg.show_hud != 0
+                        );
 
-            g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 3, barriers);
+                        barriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                        barriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+                        barriers[0].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
-            usedBlend = true;
-        } else if (g_pfnCmdCopyImage) {
-            // Direct copy fallback
-            VkImageMemoryBarrier barriers[2]{};
-            barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-            barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            barriers[0].image = ctx->images[currentGameIdx];
-            barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barriers[0].subresourceRange.levelCount = 1;
-            barriers[0].subresourceRange.layerCount = 1;
+                        barriers[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                        barriers[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+                        barriers[1].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        barriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
-            barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barriers[1].srcAccessMask = 0;
-            barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            barriers[1].image = ctx->images[intermediateIdx];
-            barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barriers[1].subresourceRange.levelCount = 1;
-            barriers[1].subresourceRange.layerCount = 1;
+                        barriers[2].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                        barriers[2].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+                        barriers[2].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                        barriers[2].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
-            g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
+                        g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 3, barriers);
 
-            VkImageCopy copyRegion{};
-            copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            copyRegion.srcSubresource.layerCount = 1;
-            copyRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            copyRegion.dstSubresource.layerCount = 1;
-            copyRegion.extent.width = ctx->extent.width;
-            copyRegion.extent.height = ctx->extent.height;
-            copyRegion.extent.depth = 1;
+                        g_pfnEndCommandBuffer(slot.cmdBuffer);
 
-            g_pfnCmdCopyImage(slot.cmdBuffer, ctx->images[currentGameIdx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ctx->images[intermediateIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
-
-            barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            barriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-            barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-
-            barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            barriers[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-            barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            barriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-
-            g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
+                        usedRife = true;
+                    }
+                }
+            }
         }
 
-        g_pfnEndCommandBuffer(slot.cmdBuffer);
+        if (usedRife) {
+            // Readback already waited on game's pWaitSemaphores, so we only wait on slot.acqSemaphore
+            VkPipelineStageFlags waitDstStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            VkSemaphore signalSems[2] = { slot.finalDoneSemaphore, slot.interDoneSemaphore };
 
-        std::vector<VkSemaphore> waitSems;
-        for (uint32_t i = 0; i < pPresentInfo->waitSemaphoreCount; ++i) {
-            waitSems.push_back(pPresentInfo->pWaitSemaphores[i]);
-        }
-        waitSems.push_back(slot.acqSemaphore);
-        std::vector<VkPipelineStageFlags> waitStages(waitSems.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            VkSubmitInfo wsi{};
+            wsi.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            wsi.waitSemaphoreCount = 1;
+            wsi.pWaitSemaphores = &slot.acqSemaphore;
+            wsi.pWaitDstStageMask = &waitDstStage;
+            wsi.commandBufferCount = 1;
+            wsi.pCommandBuffers = &slot.cmdBuffer;
+            wsi.signalSemaphoreCount = 2;
+            wsi.pSignalSemaphores = signalSems;
 
-        VkSemaphore signalSems[2] = { slot.finalDoneSemaphore, slot.interDoneSemaphore };
+            {
+                std::lock_guard<std::mutex> qlock(ctx->queueMutex);
+                g_pfnQueueSubmit(queue, 1, &wsi, VK_NULL_HANDLE);
+            }
+        } else {
+            // PATH B: Fallback Compute Blend or Copy
+            VkCommandBufferBeginInfo bi{};
+            bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            g_pfnBeginCommandBuffer(slot.cmdBuffer, &bi);
 
-        VkSubmitInfo si{};
-        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        si.waitSemaphoreCount = static_cast<uint32_t>(waitSems.size());
-        si.pWaitSemaphores = waitSems.data();
-        si.pWaitDstStageMask = waitStages.data();
-        si.commandBufferCount = 1;
-        si.pCommandBuffers = &slot.cmdBuffer;
-        si.signalSemaphoreCount = 2;
-        si.pSignalSemaphores = signalSems;
+            if (ctx->blendPipeline != VK_NULL_HANDLE && ctx->prevGameIdx != UINT32_MAX &&
+                ctx->prevGameIdx < ctx->images.size() && ctx->prevGameIdx != intermediateIdx &&
+                ctx->prevGameIdx < ctx->imageViews.size() && currentGameIdx < ctx->imageViews.size() &&
+                intermediateIdx < ctx->imageViews.size() &&
+                ctx->imageViews[ctx->prevGameIdx] != VK_NULL_HANDLE &&
+                ctx->imageViews[currentGameIdx] != VK_NULL_HANDLE &&
+                ctx->imageViews[intermediateIdx] != VK_NULL_HANDLE &&
+                slot.blendDescSet != VK_NULL_HANDLE && g_pfnUpdateDescriptorSets &&
+                g_pfnCmdBindPipeline && g_pfnCmdBindDescriptorSets && g_pfnCmdPushConstants && g_pfnCmdDispatch) {
 
-        {
-            std::lock_guard<std::mutex> qlock(ctx->queueMutex);
-            g_pfnQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+                // Motion Smoothing: Blend Frame N-1 and Frame N into intermediateIdx at phase 0.5
+                VkDescriptorImageInfo imageInfos[3]{};
+                imageInfos[0].imageView = ctx->imageViews[ctx->prevGameIdx];
+                imageInfos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                imageInfos[1].imageView = ctx->imageViews[currentGameIdx];
+                imageInfos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                imageInfos[2].imageView = ctx->imageViews[intermediateIdx];
+                imageInfos[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+                VkWriteDescriptorSet writes[3]{};
+                for (int i = 0; i < 3; ++i) {
+                    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    writes[i].dstSet = slot.blendDescSet;
+                    writes[i].dstBinding = i;
+                    writes[i].descriptorCount = 1;
+                    writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                    writes[i].pImageInfo = &imageInfos[i];
+                }
+                g_pfnUpdateDescriptorSets(ctx->device, 3, writes, 0, nullptr);
+
+                VkImageMemoryBarrier barriers[3]{};
+                barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barriers[0].image = ctx->images[ctx->prevGameIdx];
+                barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                barriers[0].subresourceRange.levelCount = 1;
+                barriers[0].subresourceRange.layerCount = 1;
+
+                barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                barriers[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                barriers[1].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barriers[1].image = ctx->images[currentGameIdx];
+                barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                barriers[1].subresourceRange.levelCount = 1;
+                barriers[1].subresourceRange.layerCount = 1;
+
+                barriers[2].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                barriers[2].srcAccessMask = 0;
+                barriers[2].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                barriers[2].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                barriers[2].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barriers[2].image = ctx->images[intermediateIdx];
+                barriers[2].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                barriers[2].subresourceRange.levelCount = 1;
+                barriers[2].subresourceRange.layerCount = 1;
+
+                g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 3, barriers);
+
+                g_pfnCmdBindPipeline(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->blendPipeline);
+                g_pfnCmdBindDescriptorSets(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->blendPipelineLayout, 0, 1, &slot.blendDescSet, 0, nullptr);
+
+                BlendPushConstants pc{
+                    0.5f,
+                    static_cast<int>(ctx->extent.width),
+                    static_cast<int>(ctx->extent.height),
+                    cfg.show_hud ? 1 : 0,
+                    cfg.hud_protection ? 1 : 0,
+                    cfg.mode
+                };
+                g_pfnCmdPushConstants(slot.cmdBuffer, ctx->blendPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+
+                uint32_t groupX = (ctx->extent.width + 7) / 8;
+                uint32_t groupY = (ctx->extent.height + 7) / 8;
+                g_pfnCmdDispatch(slot.cmdBuffer, groupX, groupY, 1);
+
+                barriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                barriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+                barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+                barriers[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                barriers[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+                barriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+                barriers[2].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                barriers[2].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+                barriers[2].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barriers[2].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+                g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 3, barriers);
+
+                usedBlend = true;
+            } else if (g_pfnCmdCopyImage) {
+                // Direct copy fallback
+                VkImageMemoryBarrier barriers[2]{};
+                barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                barriers[0].image = ctx->images[currentGameIdx];
+                barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                barriers[0].subresourceRange.levelCount = 1;
+                barriers[0].subresourceRange.layerCount = 1;
+
+                barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                barriers[1].srcAccessMask = 0;
+                barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                barriers[1].image = ctx->images[intermediateIdx];
+                barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                barriers[1].subresourceRange.levelCount = 1;
+                barriers[1].subresourceRange.layerCount = 1;
+
+                g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
+
+                VkImageCopy copyRegion{};
+                copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                copyRegion.srcSubresource.layerCount = 1;
+                copyRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                copyRegion.dstSubresource.layerCount = 1;
+                copyRegion.extent.width = ctx->extent.width;
+                copyRegion.extent.height = ctx->extent.height;
+                copyRegion.extent.depth = 1;
+
+                g_pfnCmdCopyImage(slot.cmdBuffer, ctx->images[currentGameIdx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ctx->images[intermediateIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+
+                barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                barriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+                barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+                barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                barriers[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+                barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                barriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+                g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
+            }
+
+            g_pfnEndCommandBuffer(slot.cmdBuffer);
+
+            std::vector<VkSemaphore> waitSems;
+            for (uint32_t i = 0; i < pPresentInfo->waitSemaphoreCount; ++i) {
+                waitSems.push_back(pPresentInfo->pWaitSemaphores[i]);
+            }
+            waitSems.push_back(slot.acqSemaphore);
+            std::vector<VkPipelineStageFlags> waitStages(waitSems.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+
+            VkSemaphore signalSems[2] = { slot.finalDoneSemaphore, slot.interDoneSemaphore };
+
+            VkSubmitInfo si{};
+            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            si.waitSemaphoreCount = static_cast<uint32_t>(waitSems.size());
+            si.pWaitSemaphores = waitSems.data();
+            si.pWaitDstStageMask = waitStages.data();
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &slot.cmdBuffer;
+            si.signalSemaphoreCount = 2;
+            si.pSignalSemaphores = signalSems;
+
+            {
+                std::lock_guard<std::mutex> qlock(ctx->queueMutex);
+                g_pfnQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+            }
         }
 
         // A. Present Intermediate Frame (F_{N-0.5}) IMMEDIATELY at t
@@ -1131,7 +1491,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             Log("FrameGen ACTIVE: 2x presents paced! Base: %.1f FPS -> Output: %.1f FPS (Display: %d Hz | %s, step: %.1f ms / avg: %.1f ms)",
                 ctx->pacer.GetBaseFps(), ctx->pacer.GetOutputFps(),
                 ctx->pacer.GetTargetHz(),
-                usedBlend ? "Compute Motion Blend" : "Fallback Copy",
+                usedRife ? "RIFE FlowNet + Native FastWarp (1280x800)" : (usedBlend ? "Compute Motion Blend" : "Fallback Copy"),
                 static_cast<float>(halfIntervalNs) / 1e6f,
                 static_cast<float>(ctx->pacer.GetAverageFrameTimeNs()) / 1e6f);
         }

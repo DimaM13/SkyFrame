@@ -5,7 +5,7 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(binding = 0) uniform sampler2D u_Frame0;
 layout(binding = 1) uniform sampler2D u_Frame1;
 
-// Optical flow vectors from FlowNet (R = flow_x, G = flow_y in normalized pixel coordinates)
+// Optical flow vectors from FlowNet (R = flow_x, G = flow_y in normalized coordinates)
 layout(binding = 2) uniform sampler2D u_Flow;
 
 // Occlusion and confidence mask from FlowNet (R = mask)
@@ -20,6 +20,7 @@ layout(push_constant) uniform PushConstants {
     float hud_threshold;   // Threshold to detect static HUD (e.g. 0.08)
     int   width;
     int   height;
+    int   show_hud;        // 1 = show visual marker dot
 } pc;
 
 void main() {
@@ -28,15 +29,20 @@ void main() {
         return;
     }
 
+    if (pc.show_hud == 1 && coord.x < 14 && coord.y < 14) {
+        imageStore(u_OutImage, coord, vec4(0.0, 1.0, 0.0, 1.0));
+        return;
+    }
+
     vec2 texCoord = (vec2(coord) + 0.5) / vec2(pc.width, pc.height);
 
-    // 1. Sample bidirectional optical flow vectors
+    // 1. Sample bidirectional optical flow vectors (hardware bilinear filtering)
     vec4 flow_data = texture(u_Flow, texCoord);
     vec2 flow_forward  = flow_data.xy; // Motion from Frame 0 to Frame 1
 
     // 2. HUD & UI Protection:
     // If pixel color between Frame 0 and Frame 1 at exact same coordinate is nearly identical,
-    // but optical flow is fast (moving camera / background), this pixel is static HUD (crosshair, healthbar, minimap).
+    // but optical flow is fast (moving camera / background), this pixel is static HUD.
     vec4 raw0_here = texture(u_Frame0, texCoord);
     vec4 raw1_here = texture(u_Frame1, texCoord);
     float color_diff = dot(abs(raw0_here.rgb - raw1_here.rgb), vec3(0.299, 0.587, 0.114));

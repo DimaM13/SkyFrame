@@ -131,9 +131,10 @@ class Plugin:
                 for mf in os.listdir(models_src):
                     src_f = os.path.join(models_src, mf)
                     dst_f = os.path.join(MODELS_DIR, mf)
-                    if os.path.isfile(src_f) and not os.path.isfile(dst_f):
-                        shutil.copy2(src_f, dst_f)
-                        fix_perms(dst_f)
+                    if os.path.isfile(src_f):
+                        if not os.path.isfile(dst_f) or os.path.getsize(src_f) != os.path.getsize(dst_f):
+                            shutil.copy2(src_f, dst_f)
+                            fix_perms(dst_f)
 
             # Copy 64-bit library
             lib64_src = os.path.join(bin_dir, "libVkLayer_skyframe.so")

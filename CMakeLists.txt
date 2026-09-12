@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(SkyFrame VERSION 1.1.3 LANGUAGES CXX C)
+project(SkyFrame VERSION 1.1.4 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,6 +42,7 @@ add_custom_target(SkyFrameShaders DEPENDS ${SPIRV_HEADERS})
 add_library(VkLayer_skyframe SHARED
     layer/skyframe_layer.cpp
     layer/vulkan_warper.cpp
+    layer/rife_warp.cpp
     layer/flow_ncnn.cpp
     layer/frame_pacer.cpp
 )
@@ -58,6 +59,22 @@ target_link_libraries(VkLayer_skyframe PRIVATE
     Vulkan::Vulkan
     pthread
 )
+
+# NCNN Integration for RIFE Dense Optical Flow (64-bit)
+option(ENABLE_NCNN "Enable RIFE NCNN neural network optical flow" ON)
+if (ENABLE_NCNN AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    find_package(ncnn QUIET PATHS "${NCNN_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/ncnn_install" "/usr/local/lib/cmake/ncnn" "/usr/lib/cmake/ncnn")
+    if (ncnn_FOUND)
+        message(STATUS "Found NCNN: ${ncnn_DIR}")
+        target_compile_definitions(VkLayer_skyframe PRIVATE HAVE_NCNN=1)
+        target_link_libraries(VkLayer_skyframe PRIVATE ncnn)
+    else()
+        message(WARNING "NCNN not found, building with blend compute fallback")
+        target_compile_definitions(VkLayer_skyframe PRIVATE HAVE_NCNN=0)
+    endif()
+else()
+    target_compile_definitions(VkLayer_skyframe PRIVATE HAVE_NCNN=0)
+endif()
 
 set_target_properties(VkLayer_skyframe PROPERTIES
     PREFIX "lib"

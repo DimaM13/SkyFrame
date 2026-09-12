@@ -12,15 +12,21 @@ public:
     ~FlowEstimator();
 
     bool LoadModel(const std::string& modelDir, int gpuDeviceIndex = 0);
+    bool IsLoaded() const;
 
-    // Estimates optical flow between frame0 and frame1 at target flow resolution
-    // Outputs flow (RG32F) and mask (R32F) textures
+    // Estimates optical flow and mask between frame0 and frame1
+    // frame0Pixels, frame1Pixels: pointers to frame data
+    // pixelType: 0 = RGBA, 1 = BGRA, 2 = RGB
+    // outFlow: float array of size (flowWidth * flowHeight * 2) containing normalized (dx, dy)
+    // outMask: float array of size (flowWidth * flowHeight) containing occlusion mask [0, 1]
     bool EstimateFlow(
-        VkCommandBuffer cmd,
-        VkImageView frame0View,
-        VkImageView frame1View,
-        VkImageView outFlowView,
-        VkImageView outMaskView,
+        const unsigned char* frame0Pixels,
+        const unsigned char* frame1Pixels,
+        int srcWidth,
+        int srcHeight,
+        int pixelType,
+        float* outFlow,
+        float* outMask,
         int flowWidth,
         int flowHeight
     );
