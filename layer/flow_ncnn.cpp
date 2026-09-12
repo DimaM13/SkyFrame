@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <mutex>
 
 #if HAVE_NCNN
 #if __has_include(<ncnn/net.h>)
@@ -21,6 +22,7 @@ class FlowEstimator::Impl {
 public:
     bool initialized = false;
     std::string modelPath;
+    std::mutex estimateMutex;
 
 #if HAVE_NCNN
     ncnn::Net flownet;
@@ -87,6 +89,25 @@ bool FlowEstimator::LoadModel(const std::string& modelDir, int gpuDeviceIndex) {
 #endif
 }
 
+bool FlowEstimator::Warmup(int width, int height) {
+#if HAVE_NCNN
+    if (!pImpl || !pImpl->initialized) return false;
+    std::cerr << "[SkyFrame] FlowEstimator: Pre-compiling Vulkan neural pipelines (warmup " << width << "x" << height << ")..." << std::endl;
+    std::vector<unsigned char> dummy(width * height * 4, 0);
+    std::vector<float> flow(width * height * 2, 0.0f);
+    std::vector<float> mask(width * height, 0.0f);
+    bool ok = EstimateFlow(dummy.data(), dummy.data(), width, height, 0, flow.data(), mask.data(), width, height);
+    if (ok) {
+        std::cerr << "[SkyFrame] FlowEstimator: Warmup successful! Neural pipelines cached for zero-latency frame generation." << std::endl;
+    } else {
+        std::cerr << "[SkyFrame] FlowEstimator: Warmup failed! RIFE will fall back to native compute motion blend." << std::endl;
+    }
+    return ok;
+#else
+    return false;
+#endif
+}
+
 int FlowEstimator::GetOptimalFlowWidth(int mode, int screenWidth) {
     // mode: 0 = Lite (180p base), 1 = Balanced (240p base), 2 = Quality (360p base)
     int target_h = 180;
@@ -126,6 +147,7 @@ bool FlowEstimator::EstimateFlow(
     if (!pImpl->initialized || !frame0Pixels || !frame1Pixels || !outFlow || !outMask) {
         return false;
     }
+    std::lock_guard<std::mutex> lock(pImpl->estimateMutex);
 
     int w = flowWidth;
     int h = flowHeight;

@@ -94,15 +94,18 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: github.ref == 'refs/heads/main'
         with:
-          tag_name: v1.1.8
-          name: "SkyFrame v1.1.8 for Steam Deck (Critical Fix: Downstream Command Dispatch & Zero Loader Trampolines)"
+          tag_name: v1.1.9
+          name: "SkyFrame v1.1.9 for Steam Deck (Instant Startup, Async Neural Warmup & Zero Hang)"
           body: |
-            ## 🚀 SkyFrame v1.1.8 — Полное устранение ошибки Invalid Command Buffer и вывод кадров на экран
+            ## 🚀 SkyFrame v1.1.9 — Мгновенный запуск игр, устранение зависания 0 FPS и фоновый прогрев нейросети
 
-            ### Что исправлено в v1.1.8:
-            - **Устранен краш `vkCmdPipelineBarrier: Invalid commandBuffer`:** все вызовы Vulkan внутри `VulkanWarper` переведены на прямое выполнение через таблицу диспетчеризации драйвера устройства (`WarperDeviceDispatch` через `vkGetDeviceProcAddr`).
-            - **Полный обход трамплина `libvulkan.so`:** команды пайплайна, копирования текстур, push-констант и dispatch теперь направляются напрямую в драйвер RADV/Mesa без валидации глобального загрузчика Vulkan.
-            - **Гарантированный вывод кадров:** устранено зависание и падение до 0 FPS при вызове первого ReadbackDownsample/Warp. Полноценная интерполяция 30 -> 60 FPS через RIFE FlowNet + FastWarp.
+            ### Что исправлено в v1.1.9:
+            - **Устранено зависание и падение до 0 FPS на старте игр:** компиляция 295 шейдеров NCNN вынесена в фоновый поток (асинхронный Warmup). Игра стартует мгновенно на полных 60 FPS через сверхбыстрый шейдер сглаживания движения (`warp_blend.comp`), не вызывая срабатывания сторожевых таймеров (watchdog).
+            - **Исправлена компиляция шейдеров RifeWarp:** добавлены все необходимые преамбулы и макросы GLSL (`sfp`, `afp`, `buffer_ld1`, `buffer_st1`, `buffer_ld4`, `buffer_st4`), что устранило падение при расчете оптического потока.
+            - **Синглтон и кеширование FlowEstimator:** модель RIFE больше не выгружается и не компилируется заново при пересоздании swapchain в Gamescope.
+            - **Неблокирующий захват кадров:** вызов `vkAcquireNextImageKHR` переведен в неблокирующий режим (`timeout = 0`), устраняя любые задержки рендер-потока.
+            - **Устранение блокировки рабочего потока:** рабочий поток пейсинга больше не держит `presentMutex` во время ожидания интервала времени, ликвидируя взаимные блокировки.
+            - **Прямая диспетчеризация команд:** все барьеры и команды в `Hook_vkQueuePresentKHR` выполняются напрямую через таблицу диспетчеризации драйвера RADV.
           files: SkyFrame.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

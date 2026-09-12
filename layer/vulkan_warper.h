@@ -93,6 +93,7 @@ public:
     VkImageView GetFlowImageView() const { return m_flowView; }
     VkImageView GetMaskImageView() const { return m_maskView; }
     bool HasTextures() const { return m_flowImage != VK_NULL_HANDLE; }
+    const WarperDeviceDispatch& GetDispatch() const { return m_disp; }
 
     // Warps frame0 and frame1 using optical flow and mask into outImage
     bool WarpFrame(

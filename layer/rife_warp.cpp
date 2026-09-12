@@ -19,10 +19,26 @@ static const char warp_comp_data[] = R"(
 
 #if NCNN_fp16_storage
 #extension GL_EXT_shader_16bit_storage: require
+#define sfp float16_t
+#define sfpvec4 f16vec4
+#else
+#define sfp float
+#define sfpvec4 vec4
 #endif
+
 #if NCNN_fp16_arithmetic
 #extension GL_EXT_shader_explicit_arithmetic_types_float16: require
+#define afp float16_t
+#define afpvec4 f16vec4
+#else
+#define afp float
+#define afpvec4 vec4
 #endif
+
+#define buffer_ld1(buf, i) buf[i]
+#define buffer_st1(buf, i, v) buf[i] = v
+#define buffer_ld4(buf, i) buf[i]
+#define buffer_st4(buf, i, v) buf[i] = v
 
 layout (binding = 0) readonly buffer image_blob { sfp image_blob_data[]; };
 layout (binding = 1) readonly buffer flow_blob { sfp flow_blob_data[]; };
@@ -89,10 +105,26 @@ static const char warp_pack4_comp_data[] = R"(
 
 #if NCNN_fp16_storage
 #extension GL_EXT_shader_16bit_storage: require
+#define sfp float16_t
+#define sfpvec4 f16vec4
+#else
+#define sfp float
+#define sfpvec4 vec4
 #endif
+
 #if NCNN_fp16_arithmetic
 #extension GL_EXT_shader_explicit_arithmetic_types_float16: require
+#define afp float16_t
+#define afpvec4 f16vec4
+#else
+#define afp float
+#define afpvec4 vec4
 #endif
+
+#define buffer_ld1(buf, i) buf[i]
+#define buffer_st1(buf, i, v) buf[i] = v
+#define buffer_ld4(buf, i) buf[i]
+#define buffer_st4(buf, i, v) buf[i] = v
 
 layout (binding = 0) readonly buffer image_blob { sfpvec4 image_blob_data[]; };
 layout (binding = 1) readonly buffer flow_blob { sfp flow_blob_data[]; };
@@ -173,7 +205,10 @@ int RifeWarp::create_pipeline(const ncnn::Option& opt) {
         {
             ncnn::MutexLockGuard guard(lock);
             if (spirv.empty()) {
-                ncnn::compile_spirv_module(warp_comp_data, opt, spirv);
+                int ret = ncnn::compile_spirv_module(warp_comp_data, opt, spirv);
+                if (ret != 0 || spirv.empty()) {
+                    fprintf(stderr, "[SkyFrame] RifeWarp: Failed to compile warp_comp_data GLSL (ret=%d)!\n", ret);
+                }
             }
         }
 
@@ -191,7 +226,10 @@ int RifeWarp::create_pipeline(const ncnn::Option& opt) {
         {
             ncnn::MutexLockGuard guard(lock);
             if (spirv.empty()) {
-                ncnn::compile_spirv_module(warp_pack4_comp_data, opt, spirv);
+                int ret = ncnn::compile_spirv_module(warp_pack4_comp_data, opt, spirv);
+                if (ret != 0 || spirv.empty()) {
+                    fprintf(stderr, "[SkyFrame] RifeWarp: Failed to compile warp_pack4_comp_data GLSL (ret=%d)!\n", ret);
+                }
             }
         }
 

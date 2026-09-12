@@ -309,7 +309,7 @@ struct SwapchainContext {
     size_t ringIndex = 0;
 
     std::unique_ptr<VulkanWarper> warper;
-    std::unique_ptr<FlowEstimator> flowEstimator;
+    std::shared_ptr<FlowEstimator> flowEstimator;
     FramePacer pacer;
 
     // FastWarp RIFE neural flow buffers
@@ -352,15 +352,16 @@ static void PresentWorkerLoop(std::shared_ptr<SwapchainContext> ctx) {
             if (!ctx->workerRunning.load()) break;
 
             job = ctx->pendingPresents.front();
+            ctx->pendingPresents.pop_front();
+        }
 
-            // High precision pacing until targetTime (system sleep to eliminate 100% CPU usage)
-            if (job.targetTime > std::chrono::steady_clock::now()) {
-                ctx->presentCv.wait_until(lock, job.targetTime, [&]() {
-                    return !ctx->workerRunning.load() || ctx->pendingPresents.empty();
-                });
-                if (!ctx->workerRunning.load() || ctx->pendingPresents.empty()) continue;
+        // Pacing until targetTime without holding presentMutex (avoids blocking main thread)
+        auto now = std::chrono::steady_clock::now();
+        if (job.targetTime > now) {
+            auto waitDuration = job.targetTime - now;
+            if (waitDuration > std::chrono::milliseconds(2)) {
+                std::this_thread::sleep_for(waitDuration - std::chrono::milliseconds(1));
             }
-
             while (std::chrono::steady_clock::now() < job.targetTime) {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #if defined(_MSC_VER)
@@ -370,9 +371,6 @@ static void PresentWorkerLoop(std::shared_ptr<SwapchainContext> ctx) {
 #endif
 #endif
             }
-
-            job = ctx->pendingPresents.front();
-            ctx->pendingPresents.pop_front();
         }
 
         VkPresentInfoKHR pi{};
@@ -570,38 +568,54 @@ static bool InitBlendPipeline(SwapchainContext* ctx) {
 #endif
 }
 
+static std::shared_ptr<FlowEstimator> g_globalFlowEstimator;
+static std::mutex g_flowInitMutex;
+static std::atomic<bool> g_rifeReady{false};
+static std::atomic<bool> g_rifeWarmingUp{false};
+
 static bool InitRifePipeline(SwapchainContext* ctx) {
     if (!ctx) return false;
 
-    ctx->flowEstimator = std::make_unique<FlowEstimator>();
+    {
+        std::lock_guard<std::mutex> lock(g_flowInitMutex);
+        if (!g_globalFlowEstimator) {
+            auto est = std::make_shared<FlowEstimator>();
 
-    const char* home = getenv("HOME");
-    std::vector<std::string> modelDirs;
-    if (home && strlen(home) > 0) {
-        modelDirs.push_back(std::string(home) + "/.local/share/skyframe/models");
-        modelDirs.push_back(std::string(home) + "/homebrew/plugins/SkyFrame/bin/models");
-    }
-    modelDirs.push_back("/home/deck/.local/share/skyframe/models");
-    modelDirs.push_back("/home/deck/homebrew/plugins/SkyFrame/bin/models");
-    modelDirs.push_back("./models");
+            const char* home = getenv("HOME");
+            std::vector<std::string> modelDirs;
+            if (home && strlen(home) > 0) {
+                modelDirs.push_back(std::string(home) + "/.local/share/skyframe/models");
+                modelDirs.push_back(std::string(home) + "/homebrew/plugins/SkyFrame/bin/models");
+            }
+            modelDirs.push_back("/home/deck/.local/share/skyframe/models");
+            modelDirs.push_back("/home/deck/homebrew/plugins/SkyFrame/bin/models");
+            modelDirs.push_back("./models");
 
-    bool modelLoaded = false;
-    for (const auto& dir : modelDirs) {
-        std::string param = dir + "/flownet.param";
-        if (access(param.c_str(), R_OK) == 0) {
-            g_isInternalNcnnCall.store(true);
-            bool ok = ctx->flowEstimator->LoadModel(dir);
-            g_isInternalNcnnCall.store(false);
-            if (ok) {
-                Log("FlowEstimator loaded RIFE model from %s", dir.c_str());
-                modelLoaded = true;
-                break;
+            bool modelLoaded = false;
+            for (const auto& dir : modelDirs) {
+                std::string param = dir + "/flownet.param";
+                if (access(param.c_str(), R_OK) == 0) {
+                    g_isInternalNcnnCall.store(true);
+                    bool ok = est->LoadModel(dir);
+                    g_isInternalNcnnCall.store(false);
+                    if (ok) {
+                        Log("FlowEstimator loaded RIFE model from %s", dir.c_str());
+                        modelLoaded = true;
+                        break;
+                    }
+                }
+            }
+            if (modelLoaded) {
+                g_globalFlowEstimator = est;
+            } else {
+                Log("RIFE model not found or failed to load, falling back to compute blend.");
             }
         }
     }
 
-    if (!modelLoaded) {
-        Log("RIFE model (flownet.param / flownet.bin) not found or failed to load, falling back to compute blend.");
+    ctx->flowEstimator = g_globalFlowEstimator;
+    if (!ctx->flowEstimator || !ctx->flowEstimator->IsLoaded()) {
+        ctx->rifeEnabled = false;
         return false;
     }
 
@@ -609,15 +623,17 @@ static bool InitRifePipeline(SwapchainContext* ctx) {
         InitFallbackMemProperties(ctx->memProperties);
     }
 
-    PFN_vkGetDeviceProcAddr gdpa = g_nextGetDeviceProcAddr;
-    {
-        std::lock_guard<std::mutex> lock(g_deviceMapMutex);
-        auto it = g_deviceToGetDeviceProcAddr.find(ctx->device);
-        if (it != g_deviceToGetDeviceProcAddr.end() && it->second) {
-            gdpa = it->second;
+    if (!ctx->warper) {
+        PFN_vkGetDeviceProcAddr gdpa = g_nextGetDeviceProcAddr;
+        {
+            std::lock_guard<std::mutex> lock(g_deviceMapMutex);
+            auto it = g_deviceToGetDeviceProcAddr.find(ctx->device);
+            if (it != g_deviceToGetDeviceProcAddr.end() && it->second) {
+                gdpa = it->second;
+            }
         }
+        ctx->warper = std::make_unique<VulkanWarper>(ctx->device, ctx->memProperties, gdpa, (VkQueue)VK_NULL_HANDLE, g_graphicsQueueFamily);
     }
-    ctx->warper = std::make_unique<VulkanWarper>(ctx->device, ctx->memProperties, gdpa, (VkQueue)VK_NULL_HANDLE, g_graphicsQueueFamily);
 
 #if HAVE_WARP_RGBA
     size_t downSize = 0;
@@ -629,10 +645,12 @@ static bool InitRifePipeline(SwapchainContext* ctx) {
 
     if (!ctx->warper->InitPipelines(warp_rgba_comp_spv, warp_rgba_comp_spv_size, downPtr, downSize)) {
         Log("Failed to initialize VulkanWarper pipelines");
+        ctx->rifeEnabled = false;
         return false;
     }
 #else
     Log("warp_rgba_comp_spv.h not available");
+    ctx->rifeEnabled = false;
     return false;
 #endif
 
@@ -643,6 +661,7 @@ static bool InitRifePipeline(SwapchainContext* ctx) {
     if (!ctx->warper->CreateFlowAndMaskTextures(ctx->flowWidth, ctx->flowHeight) ||
         !ctx->warper->CreateDownsampleStaging(ctx->flowWidth, ctx->flowHeight, ctx->format)) {
         Log("Failed to create Flow/Mask or Downsample textures in VulkanWarper");
+        ctx->rifeEnabled = false;
         return false;
     }
 
@@ -656,8 +675,26 @@ static bool InitRifePipeline(SwapchainContext* ctx) {
     ctx->hasPrevDownsample = false;
     ctx->rifeEnabled = true;
 
-    Log("RIFE FastWarp initialized: %dx%d dense optical flow for %ux%u native output!",
-        ctx->flowWidth, ctx->flowHeight, ctx->extent.width, ctx->extent.height);
+    // Trigger asynchronous background warmup so gamescope/game never freeze at startup
+    if (!g_rifeReady.load() && !g_rifeWarmingUp.exchange(true)) {
+        int w = ctx->flowWidth;
+        int h = ctx->flowHeight;
+        std::thread([w, h]() {
+            Log("RIFE FlowNet background warmup started (%dx%d)...", w, h);
+            bool warmupOk = g_globalFlowEstimator->Warmup(w, h);
+            if (warmupOk) {
+                Log("RIFE FlowNet background warmup complete! FastWarp neural frame generation active.");
+                g_rifeReady.store(true);
+            } else {
+                Log("RIFE FlowNet warmup failed, continuing on high-speed compute blend.");
+            }
+            g_rifeWarmingUp.store(false);
+        }).detach();
+    }
+
+    Log("RIFE FastWarp initialized: %dx%d dense optical flow for %ux%u native output (neural pipelines: %s)!",
+        ctx->flowWidth, ctx->flowHeight, ctx->extent.width, ctx->extent.height,
+        g_rifeReady.load() ? "ready" : "warming up in background");
     return true;
 }
 
@@ -1008,6 +1045,16 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateSwapchainKHR(
         }
     }
 
+    PFN_vkGetDeviceProcAddr gdpa = g_nextGetDeviceProcAddr;
+    {
+        std::lock_guard<std::mutex> lock(g_deviceMapMutex);
+        auto it = g_deviceToGetDeviceProcAddr.find(device);
+        if (it != g_deviceToGetDeviceProcAddr.end() && it->second) {
+            gdpa = it->second;
+        }
+    }
+    ctx->warper = std::make_unique<VulkanWarper>(ctx->device, ctx->memProperties, gdpa, (VkQueue)VK_NULL_HANDLE, g_graphicsQueueFamily);
+
     InitBlendPipeline(ctx.get());
     InitRifePipeline(ctx.get());
 
@@ -1150,87 +1197,49 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
 
     uint64_t halfIntervalNs = ctx->pacer.GetTargetPacingDelayNs();
 
+    if (s_presentCount <= 10 || s_presentCount % 120 == 1) {
+        Log("Present #%llu: currentGameIdx=%u, prevGameIdx=%u, hasPrevDownsample=%d, rifeEnabled=%d",
+            s_presentCount, currentGameIdx, ctx->prevGameIdx, ctx->hasPrevDownsample ? 1 : 0, ctx->rifeEnabled ? 1 : 0);
+    }
+
     // Flush any pending presentation from prior frame if game produced a fast burst
     DrainPendingPresents(ctx.get());
 
-    // 0. Base frame initialization: if this is the very first frame or prevDownsample is unseeded
-    if (ctx->prevGameIdx == UINT32_MAX || !ctx->hasPrevDownsample) {
-        if (ctx->rifeEnabled && ctx->warper && ctx->flowEstimator && ctx->flowEstimator->IsLoaded() &&
-            slot.readbackCmdBuffer != VK_NULL_HANDLE && slot.readbackFence != VK_NULL_HANDLE &&
-            g_pfnBeginCommandBuffer && g_pfnEndCommandBuffer && g_pfnResetFences && g_pfnWaitForFences && g_pfnQueueSubmit) {
-
-            VkCommandBufferBeginInfo rbi{};
-            rbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            rbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            g_pfnBeginCommandBuffer(slot.readbackCmdBuffer, &rbi);
-
-            ctx->warper->ReadbackDownsample(
-                slot.readbackCmdBuffer,
-                ctx->images[currentGameIdx],
-                static_cast<int>(ctx->extent.width), static_cast<int>(ctx->extent.height),
-                ctx->flowWidth, ctx->flowHeight
-            );
-
-            g_pfnEndCommandBuffer(slot.readbackCmdBuffer);
-
-            g_pfnResetFences(ctx->device, 1, &slot.readbackFence);
-
-            std::vector<VkPipelineStageFlags> waitStages(pPresentInfo->waitSemaphoreCount, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-            VkSubmitInfo si{};
-            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            si.waitSemaphoreCount = pPresentInfo->waitSemaphoreCount;
-            si.pWaitSemaphores = pPresentInfo->pWaitSemaphores;
-            si.pWaitDstStageMask = waitStages.data();
-            si.commandBufferCount = 1;
-            si.pCommandBuffers = &slot.readbackCmdBuffer;
-
-            {
-                std::lock_guard<std::mutex> qlock(ctx->queueMutex);
-                g_pfnQueueSubmit(queue, 1, &si, slot.readbackFence);
-            }
-
-            if (g_pfnWaitForFences(ctx->device, 1, &slot.readbackFence, VK_TRUE, 50000000ULL) == VK_SUCCESS) {
-                const unsigned char* pixels = ctx->warper->GetDownsamplePixels();
-                if (pixels) {
-                    size_t downBytes = (size_t)ctx->flowWidth * ctx->flowHeight * 4;
-                    memcpy(ctx->prevDownsample.data(), pixels, downBytes);
-                    ctx->hasPrevDownsample = true;
-                }
-            }
-
-            ctx->prevGameIdx = currentGameIdx;
-            VkPresentInfoKHR initialPresent = *pPresentInfo;
-            initialPresent.waitSemaphoreCount = 0;
-            initialPresent.pWaitSemaphores = nullptr;
-            std::lock_guard<std::mutex> qlock(ctx->queueMutex);
-            return g_pfnQueuePresentKHR(queue, &initialPresent);
-        }
-
+    // 0. Base frame initialization: on the very first frame, present cleanly without stall
+    if (ctx->prevGameIdx == UINT32_MAX) {
         ctx->prevGameIdx = currentGameIdx;
         std::lock_guard<std::mutex> qlock(ctx->queueMutex);
         return g_pfnQueuePresentKHR(queue, pPresentInfo);
     }
 
-    // 2. FastWarp 2x Frame Generation: Acquire next image for intermediate frame
+    // 2. FastWarp 2x Frame Generation: Non-blocking acquisition of next image
     uint32_t intermediateIdx = 0;
     VkResult acqRes = VK_NOT_READY;
     if (g_pfnAcquireNextImageKHR && slot.acqSemaphore) {
         acqRes = g_pfnAcquireNextImageKHR(
-            ctx->device, ctx->swapchain, 50000000ULL, slot.acqSemaphore, VK_NULL_HANDLE, &intermediateIdx
+            ctx->device, ctx->swapchain, 0, slot.acqSemaphore, VK_NULL_HANDLE, &intermediateIdx
         );
+    }
+
+    if (s_presentCount <= 10) {
+        Log("Present #%llu: AcquireNextImageKHR (non-blocking) returned %d (intermediateIdx=%u)",
+            s_presentCount, acqRes, intermediateIdx);
     }
 
     if (acqRes == VK_SUCCESS && intermediateIdx != currentGameIdx &&
         intermediateIdx < ctx->images.size() && currentGameIdx < ctx->images.size() &&
         slot.cmdBuffer != VK_NULL_HANDLE && g_pfnBeginCommandBuffer &&
-        g_pfnCmdPipelineBarrier && g_pfnEndCommandBuffer && g_pfnQueueSubmit) {
+        g_pfnEndCommandBuffer && g_pfnQueueSubmit) {
 
         bool usedRife = false;
         bool usedBlend = false;
+        bool rsiSubmitted = false;
+
+        const WarperDeviceDispatch* pDisp = ctx->warper ? &ctx->warper->GetDispatch() : nullptr;
 
         // PATH A: RIFE FlowNet (NCNN Vulkan) + Native FastWarp (1280x800)
-        if (ctx->rifeEnabled && ctx->warper && ctx->flowEstimator && ctx->flowEstimator->IsLoaded() &&
-            ctx->hasPrevDownsample && ctx->prevGameIdx != UINT32_MAX &&
+        if (ctx->rifeEnabled && g_rifeReady.load() && ctx->warper && ctx->flowEstimator && ctx->flowEstimator->IsLoaded() &&
+            ctx->prevGameIdx != UINT32_MAX &&
             ctx->prevGameIdx < ctx->images.size() && ctx->prevGameIdx != intermediateIdx &&
             ctx->prevGameIdx != currentGameIdx &&
             ctx->prevGameIdx < ctx->imageViews.size() && currentGameIdx < ctx->imageViews.size() &&
@@ -1239,10 +1248,9 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             ctx->imageViews[currentGameIdx] != VK_NULL_HANDLE &&
             ctx->imageViews[intermediateIdx] != VK_NULL_HANDLE &&
             slot.readbackCmdBuffer != VK_NULL_HANDLE && slot.readbackFence != VK_NULL_HANDLE &&
-            slot.warpDescSet != VK_NULL_HANDLE &&
+            slot.warpDescSet != VK_NULL_HANDLE && pDisp && pDisp->CmdPipelineBarrier &&
             g_pfnResetFences && g_pfnWaitForFences) {
 
-            // 1. Hardware downsample readback for currentGameIdx
             VkCommandBufferBeginInfo rbi{};
             rbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             rbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -1257,6 +1265,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
 
             g_pfnEndCommandBuffer(slot.readbackCmdBuffer);
 
+            g_pfnWaitForFences(ctx->device, 1, &slot.readbackFence, VK_TRUE, 1000000000ULL);
             g_pfnResetFences(ctx->device, 1, &slot.readbackFence);
 
             std::vector<VkPipelineStageFlags> waitStages(pPresentInfo->waitSemaphoreCount, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
@@ -1272,28 +1281,40 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                 std::lock_guard<std::mutex> qlock(ctx->queueMutex);
                 g_pfnQueueSubmit(queue, 1, &rsi, slot.readbackFence);
             }
+            rsiSubmitted = true;
 
-            if (g_pfnWaitForFences(ctx->device, 1, &slot.readbackFence, VK_TRUE, 50000000ULL) == VK_SUCCESS) {
+            if (g_pfnWaitForFences(ctx->device, 1, &slot.readbackFence, VK_TRUE, 1000000000ULL) == VK_SUCCESS) {
                 const unsigned char* currPixels = ctx->warper->GetDownsamplePixels();
                 if (currPixels) {
-                    int pixelType = (ctx->format == VK_FORMAT_B8G8R8A8_UNORM || ctx->format == VK_FORMAT_B8G8R8A8_SRGB) ? 1 : 0;
-
-                    // 2. RIFE FlowNet optical flow & mask inference
-                    bool estOk = ctx->flowEstimator->EstimateFlow(
-                        ctx->prevDownsample.data(),
-                        currPixels,
-                        ctx->flowWidth, ctx->flowHeight,
-                        pixelType,
-                        ctx->flowBuffer.data(),
-                        ctx->maskBuffer.data(),
-                        ctx->flowWidth, ctx->flowHeight
-                    );
-
-                    if (estOk) {
+                    if (!ctx->hasPrevDownsample) {
                         size_t downBytes = (size_t)ctx->flowWidth * ctx->flowHeight * 4;
                         memcpy(ctx->prevDownsample.data(), currPixels, downBytes);
+                        ctx->hasPrevDownsample = true;
+                        Log("RIFE: prevDownsample seeded successfully! FastWarp will engage on next frame.");
+                    } else {
+                        int pixelType = (ctx->format == VK_FORMAT_B8G8R8A8_UNORM || ctx->format == VK_FORMAT_B8G8R8A8_SRGB) ? 1 : 0;
 
-                        // 3. Record FastWarp command buffer at 100% native resolution
+                        auto t0 = std::chrono::steady_clock::now();
+                        bool estOk = ctx->flowEstimator->EstimateFlow(
+                            ctx->prevDownsample.data(),
+                            currPixels,
+                            ctx->flowWidth, ctx->flowHeight,
+                            pixelType,
+                            ctx->flowBuffer.data(),
+                            ctx->maskBuffer.data(),
+                            ctx->flowWidth, ctx->flowHeight
+                        );
+                        auto t1 = std::chrono::steady_clock::now();
+                        float flowMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
+
+                        if (s_presentCount <= 10 || s_presentCount % 120 == 1) {
+                            Log("Present #%llu: RIFE EstimateFlow completed in %.2f ms (ok=%d)", s_presentCount, flowMs, estOk);
+                        }
+
+                        if (estOk) {
+                            size_t downBytes = (size_t)ctx->flowWidth * ctx->flowHeight * 4;
+                            memcpy(ctx->prevDownsample.data(), currPixels, downBytes);
+
                         VkCommandBufferBeginInfo bi{};
                         bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
                         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -1331,8 +1352,8 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                         barriers[2].image = ctx->images[intermediateIdx];
                         barriers[2].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
-                        g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 3, barriers);
+                        pDisp->CmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 3, barriers);
 
                         ctx->warper->WarpFrame(
                             slot.cmdBuffer,
@@ -1365,8 +1386,8 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                         barriers[2].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
                         barriers[2].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
-                        g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 3, barriers);
+                        pDisp->CmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                                  VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 3, barriers);
 
                         g_pfnEndCommandBuffer(slot.cmdBuffer);
 
@@ -1409,8 +1430,9 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                 ctx->imageViews[ctx->prevGameIdx] != VK_NULL_HANDLE &&
                 ctx->imageViews[currentGameIdx] != VK_NULL_HANDLE &&
                 ctx->imageViews[intermediateIdx] != VK_NULL_HANDLE &&
-                slot.blendDescSet != VK_NULL_HANDLE && g_pfnUpdateDescriptorSets &&
-                g_pfnCmdBindPipeline && g_pfnCmdBindDescriptorSets && g_pfnCmdPushConstants && g_pfnCmdDispatch) {
+                slot.blendDescSet != VK_NULL_HANDLE && g_pfnUpdateDescriptorSets && pDisp &&
+                pDisp->CmdBindPipeline && pDisp->CmdBindDescriptorSets && pDisp->CmdPushConstants &&
+                pDisp->CmdDispatch && pDisp->CmdPipelineBarrier) {
 
                 // Motion Smoothing: Blend Frame N-1 and Frame N into intermediateIdx at phase 0.5
                 VkDescriptorImageInfo imageInfos[3]{};
@@ -1463,10 +1485,10 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                 barriers[2].subresourceRange.levelCount = 1;
                 barriers[2].subresourceRange.layerCount = 1;
 
-                g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 3, barriers);
+                pDisp->CmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 3, barriers);
 
-                g_pfnCmdBindPipeline(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->blendPipeline);
-                g_pfnCmdBindDescriptorSets(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->blendPipelineLayout, 0, 1, &slot.blendDescSet, 0, nullptr);
+                pDisp->CmdBindPipeline(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->blendPipeline);
+                pDisp->CmdBindDescriptorSets(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->blendPipelineLayout, 0, 1, &slot.blendDescSet, 0, nullptr);
 
                 BlendPushConstants pc{
                     0.5f,
@@ -1476,11 +1498,11 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                     cfg.hud_protection ? 1 : 0,
                     cfg.mode
                 };
-                g_pfnCmdPushConstants(slot.cmdBuffer, ctx->blendPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+                pDisp->CmdPushConstants(slot.cmdBuffer, ctx->blendPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
                 uint32_t groupX = (ctx->extent.width + 7) / 8;
                 uint32_t groupY = (ctx->extent.height + 7) / 8;
-                g_pfnCmdDispatch(slot.cmdBuffer, groupX, groupY, 1);
+                pDisp->CmdDispatch(slot.cmdBuffer, groupX, groupY, 1);
 
                 barriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
                 barriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
@@ -1497,11 +1519,19 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                 barriers[2].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
                 barriers[2].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
-                g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 3, barriers);
+                pDisp->CmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 3, barriers);
 
                 usedBlend = true;
-            } else if (g_pfnCmdCopyImage) {
-                // Direct copy fallback
+            } else if (pDisp && pDisp->CmdBlitImage) {
+                // Safe blit / copy fallback using device dispatch
+                VkImageBlit blit{};
+                blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                blit.srcOffsets[0] = { 0, 0, 0 };
+                blit.srcOffsets[1] = { static_cast<int32_t>(ctx->extent.width), static_cast<int32_t>(ctx->extent.height), 1 };
+                blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                blit.dstOffsets[0] = { 0, 0, 0 };
+                blit.dstOffsets[1] = { static_cast<int32_t>(ctx->extent.width), static_cast<int32_t>(ctx->extent.height), 1 };
+
                 VkImageMemoryBarrier barriers[2]{};
                 barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
                 barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -1509,9 +1539,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                 barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
                 barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
                 barriers[0].image = ctx->images[currentGameIdx];
-                barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                barriers[0].subresourceRange.levelCount = 1;
-                barriers[0].subresourceRange.layerCount = 1;
+                barriers[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
                 barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
                 barriers[1].srcAccessMask = 0;
@@ -1519,22 +1547,12 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                 barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
                 barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
                 barriers[1].image = ctx->images[intermediateIdx];
-                barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                barriers[1].subresourceRange.levelCount = 1;
-                barriers[1].subresourceRange.layerCount = 1;
+                barriers[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
-                g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
+                pDisp->CmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
 
-                VkImageCopy copyRegion{};
-                copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                copyRegion.srcSubresource.layerCount = 1;
-                copyRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                copyRegion.dstSubresource.layerCount = 1;
-                copyRegion.extent.width = ctx->extent.width;
-                copyRegion.extent.height = ctx->extent.height;
-                copyRegion.extent.depth = 1;
-
-                g_pfnCmdCopyImage(slot.cmdBuffer, ctx->images[currentGameIdx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ctx->images[intermediateIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+                pDisp->CmdBlitImage(slot.cmdBuffer, ctx->images[currentGameIdx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                    ctx->images[intermediateIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
 
                 barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
                 barriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
@@ -1546,14 +1564,16 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                 barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
                 barriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
-                g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
+                pDisp->CmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
             }
 
             g_pfnEndCommandBuffer(slot.cmdBuffer);
 
             std::vector<VkSemaphore> waitSems;
-            for (uint32_t i = 0; i < pPresentInfo->waitSemaphoreCount; ++i) {
-                waitSems.push_back(pPresentInfo->pWaitSemaphores[i]);
+            if (!rsiSubmitted) {
+                for (uint32_t i = 0; i < pPresentInfo->waitSemaphoreCount; ++i) {
+                    waitSems.push_back(pPresentInfo->pWaitSemaphores[i]);
+                }
             }
             waitSems.push_back(slot.acqSemaphore);
             std::vector<VkPipelineStageFlags> waitStages(waitSems.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
@@ -1606,11 +1626,11 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
 
         ctx->prevGameIdx = currentGameIdx;
 
-        if (s_presentCount % 120 == 1) {
+        if (s_presentCount <= 10 || s_presentCount % 120 == 1) {
             Log("FrameGen ACTIVE: 2x presents paced! Base: %.1f FPS -> Output: %.1f FPS (Display: %d Hz | %s, step: %.1f ms / avg: %.1f ms)",
                 ctx->pacer.GetBaseFps(), ctx->pacer.GetOutputFps(),
                 ctx->pacer.GetTargetHz(),
-                usedRife ? "RIFE FlowNet + Native FastWarp (1280x800)" : (usedBlend ? "Compute Motion Blend" : "Fallback Copy"),
+                usedRife ? "RIFE FlowNet + Native FastWarp (1280x800)" : (usedBlend ? "Compute Motion Blend" : "Fallback Blit"),
                 static_cast<float>(halfIntervalNs) / 1e6f,
                 static_cast<float>(ctx->pacer.GetAverageFrameTimeNs()) / 1e6f);
         }

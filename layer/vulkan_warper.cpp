@@ -364,7 +364,10 @@ bool VulkanWarper::CreateFlowAndMaskTextures(int flowWidth, int flowHeight) {
     if (m_disp.AllocateMemory(m_device, &maiBuf, nullptr, &m_flowStagingMem) != VK_SUCCESS) return false;
     m_disp.BindBufferMemory(m_device, m_flowStagingBuffer, m_flowStagingMem, 0);
 
-    m_disp.MapMemory(m_device, m_flowStagingMem, 0, stagingSize, 0, &m_flowStagingPtr);
+    if (m_disp.MapMemory(m_device, m_flowStagingMem, 0, stagingSize, 0, &m_flowStagingPtr) != VK_SUCCESS) {
+        m_flowStagingPtr = nullptr;
+        return false;
+    }
     return true;
 }
 
@@ -448,7 +451,10 @@ bool VulkanWarper::CreateDownsampleStaging(int flowWidth, int flowHeight, VkForm
     if (m_disp.AllocateMemory(m_device, &maiBuf, nullptr, &m_downStagingMem) != VK_SUCCESS) return false;
     m_disp.BindBufferMemory(m_device, m_downStagingBuffer, m_downStagingMem, 0);
 
-    m_disp.MapMemory(m_device, m_downStagingMem, 0, bufSize, 0, &m_downStagingPtr);
+    if (m_disp.MapMemory(m_device, m_downStagingMem, 0, bufSize, 0, &m_downStagingPtr) != VK_SUCCESS) {
+        m_downStagingPtr = nullptr;
+        return false;
+    }
     return true;
 }
 
