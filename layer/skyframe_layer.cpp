@@ -305,18 +305,6 @@ struct FrameSlot {
     VkImageView denseFlowView = VK_NULL_HANDLE;
 };
 
-struct PresentJob {
-    VkQueue queue = VK_NULL_HANDLE;
-    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
-    uint32_t intermediateIdx = 0;
-    uint32_t currentGameIdx = 0;
-    VkSemaphore interDoneSemaphore = VK_NULL_HANDLE;
-    VkSemaphore finalDoneSemaphore = VK_NULL_HANDLE;
-    std::chrono::steady_clock::time_point targetTimeInter;
-    std::chrono::steady_clock::time_point targetTimeReal;
-    uint64_t pacingDelayNs = 16666666;
-};
-
 struct GradientPushConstants {
     int in_width;
     int in_height;
@@ -390,13 +378,6 @@ struct SwapchainContext {
     std::unique_ptr<FlowEstimator> flowEstimator;
     FramePacer pacer;
 
-    // Presentation Sequencer for Hardware Pacing (guarantees ~16.6ms separation between presents)
-    std::thread presentWorkerThread;
-    std::atomic<bool> workerRunning{false};
-    std::mutex jobMutex;
-    std::condition_variable jobCv;
-    std::condition_variable jobEmptyCv;
-    std::deque<PresentJob> pendingJobs;
     std::mutex queueMutex;
 
     // Dedicated VRAM History Image (Frame 0)
@@ -457,7 +438,7 @@ static uint32_t FindMemoryType(VkPhysicalDevice physDev, uint32_t typeFilter, Vk
     return 0;
 }
 
-static void SleepUntil(std::chrono::steady_clock::time_point targetTime, const std::atomic<bool>& running) {
+static void SleepUntil(std::chrono::steady_clock::time_point targetTime) {
     auto now = std::chrono::steady_clock::now();
     if (now >= targetTime) return;
 
@@ -466,7 +447,7 @@ static void SleepUntil(std::chrono::steady_clock::time_point targetTime, const s
         std::this_thread::sleep_for(remaining - std::chrono::microseconds(1200));
     }
 
-    while (running.load() && std::chrono::steady_clock::now() < targetTime) {
+    while (std::chrono::steady_clock::now() < targetTime) {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #if defined(_MSC_VER)
         _mm_pause();
@@ -474,74 +455,6 @@ static void SleepUntil(std::chrono::steady_clock::time_point targetTime, const s
         __builtin_ia32_pause();
 #endif
 #endif
-    }
-}
-
-static void PresentationWorkerLoop(std::shared_ptr<SwapchainContext> ctx) {
-    while (ctx->workerRunning.load()) {
-        PresentJob job;
-        {
-            std::unique_lock<std::mutex> lock(ctx->jobMutex);
-            ctx->jobCv.wait(lock, [&]() {
-                return !ctx->workerRunning.load() || !ctx->pendingJobs.empty();
-            });
-            if (!ctx->workerRunning.load()) break;
-
-            job = ctx->pendingJobs.front();
-            ctx->pendingJobs.pop_front();
-            ctx->jobEmptyCv.notify_one();
-        }
-
-        // 1. Present Intermediate Frame (F_{N-0.5}) at targetTimeInter
-        SleepUntil(job.targetTimeInter, ctx->workerRunning);
-        if (!ctx->workerRunning.load()) break;
-
-        VkPresentInfoKHR interPresent{};
-        interPresent.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-        interPresent.waitSemaphoreCount = (job.interDoneSemaphore != VK_NULL_HANDLE) ? 1 : 0;
-        interPresent.pWaitSemaphores = (job.interDoneSemaphore != VK_NULL_HANDLE) ? &job.interDoneSemaphore : nullptr;
-        interPresent.swapchainCount = 1;
-        interPresent.pSwapchains = &job.swapchain;
-        interPresent.pImageIndices = &job.intermediateIdx;
-
-        {
-            std::lock_guard<std::mutex> qlock(ctx->queueMutex);
-            if (g_pfnQueuePresentKHR && job.queue != VK_NULL_HANDLE) {
-                g_pfnQueuePresentKHR(job.queue, &interPresent);
-            }
-        }
-
-        // Hardware VBlank pacing guarantee:
-        // Ensure real frame is presented strictly after the intermediate frame has been scanned out by Gamescope
-        auto interPresentedTime = std::chrono::steady_clock::now();
-        if (job.targetTimeReal <= interPresentedTime) {
-            job.targetTimeReal = interPresentedTime + std::chrono::nanoseconds(job.pacingDelayNs);
-        }
-
-        // 2. Present Real Game Frame (F_N) at targetTimeReal (~16.6ms later)
-        SleepUntil(job.targetTimeReal, ctx->workerRunning);
-        if (!ctx->workerRunning.load()) break;
-
-        VkPresentInfoKHR realPresent{};
-        realPresent.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-        realPresent.waitSemaphoreCount = (job.finalDoneSemaphore != VK_NULL_HANDLE) ? 1 : 0;
-        realPresent.pWaitSemaphores = (job.finalDoneSemaphore != VK_NULL_HANDLE) ? &job.finalDoneSemaphore : nullptr;
-        realPresent.swapchainCount = 1;
-        realPresent.pSwapchains = &job.swapchain;
-        realPresent.pImageIndices = &job.currentGameIdx;
-
-        {
-            std::lock_guard<std::mutex> qlock(ctx->queueMutex);
-            if (g_pfnQueuePresentKHR && job.queue != VK_NULL_HANDLE) {
-                g_pfnQueuePresentKHR(job.queue, &realPresent);
-            }
-        }
-
-        static uint64_t s_workerPresents = 0;
-        if (++s_workerPresents % 120 == 1) {
-            Log("PresentationWorker: delivered frame pair (interIdx=%u, realIdx=%u, cadence=%llu ms)",
-                job.intermediateIdx, job.currentGameIdx, (unsigned long long)(job.pacingDelayNs / 1000000ULL));
-        }
     }
 }
 
@@ -1050,23 +963,6 @@ VKAPI_ATTR void VKAPI_CALL Hook_vkDestroyDevice(
     const VkAllocationCallbacks* pAllocator
 ) {
     Log("Hook_vkDestroyDevice called");
-    std::vector<std::shared_ptr<SwapchainContext>> contextsToStop;
-    {
-        std::lock_guard<std::mutex> lock(g_contextMutex);
-        for (auto& pair : g_swapchains) {
-            if (pair.second && pair.second->device == device) {
-                contextsToStop.push_back(pair.second);
-            }
-        }
-    }
-    for (auto& ctx : contextsToStop) {
-        ctx->workerRunning = false;
-        ctx->jobCv.notify_all();
-        ctx->jobEmptyCv.notify_all();
-        if (ctx->presentWorkerThread.joinable()) {
-            ctx->presentWorkerThread.join();
-        }
-    }
     if (g_nextDestroyDevice) {
         g_nextDestroyDevice(device, pAllocator);
     }
@@ -1142,8 +1038,6 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateSwapchainKHR(
     InitPipelines(ctx.get());
 
     ctx->isInitialized = true;
-    ctx->workerRunning = true;
-    ctx->presentWorkerThread = std::thread(PresentationWorkerLoop, ctx);
 
     {
         std::lock_guard<std::mutex> lock(g_contextMutex);
@@ -1173,12 +1067,6 @@ VKAPI_ATTR void VKAPI_CALL Hook_vkDestroySwapchainKHR(
     }
 
     if (ctx) {
-        ctx->workerRunning = false;
-        ctx->jobCv.notify_all();
-        ctx->jobEmptyCv.notify_all();
-        if (ctx->presentWorkerThread.joinable()) {
-            ctx->presentWorkerThread.join();
-        }
 
             if (ctx->blendPipeline && g_pfnDestroyPipeline) g_pfnDestroyPipeline(device, ctx->blendPipeline, nullptr);
             if (ctx->blendPipelineLayout && g_pfnDestroyPipelineLayout) g_pfnDestroyPipelineLayout(device, ctx->blendPipelineLayout, nullptr);
@@ -1273,12 +1161,6 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
     auto& cfg = GetConfig();
     if (!cfg.enabled || !ctx || !ctx->isInitialized || ctx->images.empty()) {
         if (ctx) {
-            {
-                std::unique_lock<std::mutex> lock(ctx->jobMutex);
-                ctx->jobEmptyCv.wait(lock, [&]() {
-                    return ctx->pendingJobs.empty() || !ctx->workerRunning.load();
-                });
-            }
             ctx->pacer.Reset();
             ctx->hasHistory = false;
 
@@ -1860,38 +1742,46 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             g_pfnQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
         }
 
-        // Presentation Sequencer: Queue job to dedicated presentation worker thread
-        PresentJob job;
-        job.queue = queue;
-        job.swapchain = ctx->swapchain;
-        job.intermediateIdx = intermediateIdx;
-        job.currentGameIdx = currentGameIdx;
-        job.interDoneSemaphore = slot.interDoneSemaphore;
-        job.finalDoneSemaphore = slot.finalDoneSemaphore;
-        job.targetTimeInter = now;
-        job.targetTimeReal = now + std::chrono::nanoseconds(halfIntervalNs);
-        job.pacingDelayNs = halfIntervalNs;
+        // 1. Present Intermediate Frame (F_{N-0.5}) to Gamescope
+        VkPresentInfoKHR interPresent = *pPresentInfo;
+        interPresent.pNext = nullptr;
+        interPresent.pResults = nullptr;
+        interPresent.waitSemaphoreCount = 1;
+        interPresent.pWaitSemaphores = &slot.interDoneSemaphore;
+        interPresent.swapchainCount = 1;
+        interPresent.pSwapchains = &ctx->swapchain;
+        interPresent.pImageIndices = &intermediateIdx;
 
+        VkResult resInter = VK_SUCCESS;
         {
-            std::unique_lock<std::mutex> lock(ctx->jobMutex);
-            ctx->jobEmptyCv.wait(lock, [&]() {
-                return !ctx->workerRunning.load() || ctx->pendingJobs.size() < 2;
-            });
-            if (!ctx->workerRunning.load()) {
-                return VK_SUCCESS;
-            }
-            ctx->pendingJobs.push_back(job);
+            std::lock_guard<std::mutex> qlock(ctx->queueMutex);
+            resInter = g_pfnQueuePresentKHR(queue, &interPresent);
         }
-        ctx->jobCv.notify_one();
 
-        if (pPresentInfo->pResults) {
-            for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i) {
-                pPresentInfo->pResults[i] = VK_SUCCESS;
-            }
+        // Hardware VBlank Pacing:
+        // Wait for exactly 1 display refresh cycle (~16.67 ms at 60 Hz).
+        // This physically guarantees Gamescope scans out intermediateIdx via DRM Direct Scanout
+        // before currentGameIdx is presented, eliminating Wayland commit replacement!
+        auto interPresentedTime = std::chrono::steady_clock::now();
+        uint64_t pacingDelayNs = halfIntervalNs;
+        SleepUntil(interPresentedTime + std::chrono::nanoseconds(pacingDelayNs));
+
+        // 2. Present Real Game Frame (F_N) to Gamescope for the next VBlank
+        VkPresentInfoKHR realPresent = *pPresentInfo;
+        realPresent.waitSemaphoreCount = 1;
+        realPresent.pWaitSemaphores = &slot.finalDoneSemaphore;
+        realPresent.swapchainCount = 1;
+        realPresent.pSwapchains = &ctx->swapchain;
+        realPresent.pImageIndices = &currentGameIdx;
+
+        VkResult res = VK_SUCCESS;
+        {
+            std::lock_guard<std::mutex> qlock(ctx->queueMutex);
+            res = g_pfnQueuePresentKHR(queue, &realPresent);
         }
 
         if (s_presentCount % 120 == 1) {
-            Log("FrameGen ACTIVE: 2x presents FIFO queued! Base: %.1f FPS -> Output: %.1f FPS (Display: %d Hz | %s, step: %.1f ms / avg: %.1f ms)",
+            Log("FrameGen ACTIVE: 2x presents delivered! Base: %.1f FPS -> Output: %.1f FPS (Display: %d Hz | %s, step: %.1f ms / avg: %.1f ms)",
                 ctx->pacer.GetBaseFps(), ctx->pacer.GetOutputFps(),
                 ctx->pacer.GetTargetHz(),
                 usedHierarchical ? "DIS-Flow + TV-L1 Variational Regularization" : "Fallback Copy",
@@ -1907,7 +1797,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                 fclose(fStats);
             }
         }
-        return VK_SUCCESS;
+        return res;
     }
 
     // Fallback: If intermediate frame couldn't be acquired, present original frame cleanly
