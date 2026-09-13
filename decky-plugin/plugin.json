@@ -5,7 +5,7 @@
     "root"
   ],
   "api_version": 1,
-  "version": "1.4.0",
-  "description": "Native AI Frame Generation for Steam Deck (Dense Bilinear Flow)",
+  "version": "1.5.0",
+  "description": "Native Frame Generation for Steam Deck (Pyramidal Coarse-to-Fine Optical Flow)",
   "icon": "icon.svg"
 }

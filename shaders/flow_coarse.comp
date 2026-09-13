@@ -1,0 +1,115 @@
+#version 450
+layout(local_size_x = 4, local_size_y = 4) in;
+
+layout(binding = 0, r32f) uniform readonly image2D u_Luma0;
+layout(binding = 1, r32f) uniform readonly image2D u_Luma1;
+layout(binding = 2, rgba16f) uniform writeonly image2D u_CoarseFlow;
+
+layout(push_constant) uniform CoarsePushConstants {
+    int luma_width;  // 320
+    int luma_height; // 200
+    int grid_width;  // 80  (320 / 4)
+    int grid_height; // 50  (200 / 4)
+} pc;
+
+shared float s_candSAD[64];
+shared int   s_candIdx[64];
+shared ivec2 s_bestVec;
+shared float s_zeroSAD;
+
+// 64 multi-speed candidates on the quarter-resolution scale (radii up to 12 px = 48 px full-res)
+const ivec2 kCoarseCandidates[64] = ivec2[64](
+    ivec2(0, 0), ivec2(1, 0), ivec2(0, 1), ivec2(-1, 0),
+    ivec2(0, -1), ivec2(2, 0), ivec2(1, 1), ivec2(0, 2),
+    ivec2(-1, 1), ivec2(-2, 0), ivec2(-1, -1), ivec2(0, -2),
+    ivec2(1, -1), ivec2(3, 1), ivec2(-1, 3), ivec2(-3, -1),
+    ivec2(1, -3), ivec2(4, 0), ivec2(3, 3), ivec2(0, 4),
+    ivec2(-3, 3), ivec2(-4, 0), ivec2(-3, -3), ivec2(0, -4),
+    ivec2(3, -3), ivec2(5, 2), ivec2(-2, 5), ivec2(-5, -2),
+    ivec2(2, -5), ivec2(6, 0), ivec2(4, 4), ivec2(0, 6),
+    ivec2(-4, 4), ivec2(-6, 0), ivec2(-4, -4), ivec2(0, -6),
+    ivec2(4, -4), ivec2(7, 3), ivec2(-3, 7), ivec2(-7, -3),
+    ivec2(3, -7), ivec2(8, 0), ivec2(6, 6), ivec2(0, 8),
+    ivec2(-6, 6), ivec2(-8, 0), ivec2(-6, -6), ivec2(0, -8),
+    ivec2(6, -6), ivec2(10, 0), ivec2(7, 7), ivec2(0, 10),
+    ivec2(-7, 7), ivec2(-10, 0), ivec2(-7, -7), ivec2(0, -10),
+    ivec2(7, -7), ivec2(12, 0), ivec2(8, 8), ivec2(0, 12),
+    ivec2(-8, 8), ivec2(-12, 0), ivec2(-8, -8), ivec2(0, -12)
+);
+
+// 4 sample points covering the 4x4 block in luma pyramid
+const ivec2 kSamples[4] = ivec2[4](
+    ivec2(0, 0), ivec2(2, 0),
+    ivec2(1, 2), ivec2(3, 2)
+);
+
+void main() {
+    ivec2 blockCoord = ivec2(gl_WorkGroupID.xy);
+    if (blockCoord.x >= pc.grid_width || blockCoord.y >= pc.grid_height) {
+        return;
+    }
+
+    ivec2 basePixel = blockCoord * 4;
+    ivec2 maxCoord = ivec2(pc.luma_width - 1, pc.luma_height - 1);
+    uint tid = gl_LocalInvocationIndex; // 0..15
+
+    // Each thread evaluates 4 candidates
+    for (int k = 0; k < 4; ++k) {
+        int candIdx = int(tid) + k * 16;
+        ivec2 cand = kCoarseCandidates[candIdx];
+
+        float diff = 0.0;
+        for (int s = 0; s < 4; ++s) {
+            ivec2 p1 = clamp(basePixel + kSamples[s], ivec2(0), maxCoord);
+            ivec2 p0 = clamp(p1 - cand, ivec2(0), maxCoord);
+            float l1 = imageLoad(u_Luma1, p1).r;
+            float l0 = imageLoad(u_Luma0, p0).r;
+            diff += abs(l1 - l0);
+        }
+
+        if (candIdx == 0) {
+            s_zeroSAD = diff;
+        }
+
+        s_candSAD[candIdx] = diff;
+        s_candIdx[candIdx] = candIdx;
+    }
+
+    barrier();
+
+    // Parallel reduction across 64 candidates
+    if (tid < 8) {
+        int i1 = int(tid);
+        for (int step = 8; step < 64; step += 8) {
+            int i2 = i1 + step;
+            if (s_candSAD[i2] < s_candSAD[i1]) {
+                s_candSAD[i1] = s_candSAD[i2];
+                s_candIdx[i1] = s_candIdx[i2];
+            }
+        }
+    }
+
+    barrier();
+
+    if (tid == 0) {
+        float minVal = s_candSAD[0];
+        int bestIdx = s_candIdx[0];
+        for (int i = 1; i < 8; ++i) {
+            if (s_candSAD[i] < minVal) {
+                minVal = s_candSAD[i];
+                bestIdx = s_candIdx[i];
+            }
+        }
+
+        // Flat surface lock
+        if (s_zeroSAD < 0.04 || s_zeroSAD <= minVal * 1.25) {
+            s_bestVec = ivec2(0, 0);
+        } else {
+            s_bestVec = kCoarseCandidates[bestIdx];
+        }
+
+        // Store vector scaled to FULL-RESOLUTION pixel coordinates
+        vec2 fullResVector = vec2(s_bestVec) * 4.0;
+        imageStore(u_CoarseFlow, blockCoord, vec4(fullResVector, minVal, 0.0));
+    }
+}

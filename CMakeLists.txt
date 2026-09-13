@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(SkyFrame VERSION 1.4.0 LANGUAGES CXX C)
+project(SkyFrame VERSION 1.5.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,7 +13,9 @@ set(SHADER_SOURCES
     "${SHADER_DIR}/warp_rgba.comp"
     "${SHADER_DIR}/downsample.comp"
     "${SHADER_DIR}/warp_blend.comp"
-    "${SHADER_DIR}/motion_field.comp"
+    "${SHADER_DIR}/pyramid_down.comp"
+    "${SHADER_DIR}/flow_coarse.comp"
+    "${SHADER_DIR}/flow_refine.comp"
 )
 
 find_program(GLSL_VALIDATOR glslangValidator HINTS /usr/bin /usr/local/bin)
