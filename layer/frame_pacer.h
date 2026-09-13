@@ -39,10 +39,12 @@ public:
 
     int GetTargetHz() const { return m_targetHz; }
 
-private:
     using Clock = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;
 
+    void HighPrecisionSleepUntil(TimePoint targetTime);
+
+private:
     int m_targetHz = 60;
     uint64_t m_stepDurationNs = 16666666; // 10^9 / 60
     uint64_t m_baseDurationNs = 33333333; // 2 * stepDuration
@@ -59,7 +61,6 @@ private:
 
     void RecalculateDurations();
     TimePoint Schedule(TimePoint now, double baseFps);
-    void HighPrecisionSleepUntil(TimePoint targetTime);
 };
 
 } // namespace skyframe

@@ -996,7 +996,16 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
         interPresent.pSwapchains = &ctx->swapchain;
         interPresent.pImageIndices = &intermediateIdx;
 
+        auto interPresentTime = std::chrono::steady_clock::now();
         VkResult res = g_pfnQueuePresentKHR(queue, &interPresent);
+
+        // Spacing delay: Wait exactly 1 VBlank interval (e.g. 16.67ms for 60Hz, 11.11ms for 90Hz)
+        // This guarantees Gamescope displays the intermediate frame on VBlank 1,
+        // preventing the real frame from overwriting it before scanout!
+        // It also ensures MangoHud / SteamOS overlay sees a perfectly flat frametime graph.
+        uint64_t stepNs = ctx->pacer.GetTargetPacingDelayNs();
+        auto realPresentTarget = interPresentTime + std::chrono::nanoseconds(stepNs);
+        ctx->pacer.HighPrecisionSleepUntil(realPresentTarget);
 
         // B. Present Real Game Frame (F_N) -> queued for VBlank 2
         VkPresentInfoKHR realPresent = *pPresentInfo;
