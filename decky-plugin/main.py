@@ -213,12 +213,24 @@ class Plugin:
             os.makedirs(LOG_DIR, exist_ok=True)
             fix_perms(LOG_DIR, is_exec=True)
 
-            # Clean up any legacy experimental skyframe manifests to avoid collisions
+            # Clean up all legacy experimental skyframe manifests and old libraries
             for old_mf in ["vk_layer_skyframe.json", "vk_layer_skyframe_32.json"]:
-                p = os.path.join(USER_LAYER_DIR, old_mf)
+                for d in [USER_LAYER_DIR, SYSTEM_LAYER_DIR]:
+                    p = os.path.join(d, old_mf)
+                    if os.path.isfile(p):
+                        try: os.remove(p)
+                        except Exception: pass
+
+            for old_lib in ["libVkLayer_skyframe.so", "libVkLayer_skyframe_32.so"]:
+                p = os.path.join(LOCAL_LIB_DIR, old_lib)
                 if os.path.isfile(p):
                     try: os.remove(p)
                     except Exception: pass
+
+            legacy_models = os.path.join(USER_HOME, ".local", "share", "skyframe", "models")
+            if os.path.isdir(legacy_models):
+                try: shutil.rmtree(legacy_models, ignore_errors=True)
+                except Exception: pass
 
             # Copy LSFG engine binaries (64-bit and 32-bit)
             for lib_name in ["liblsfg-vk-layer.so", "liblsfg-vk-layer_32.so"]:
