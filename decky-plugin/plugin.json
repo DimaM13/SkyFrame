@@ -5,7 +5,7 @@
     "root"
   ],
   "api_version": 1,
-  "version": "1.7.0",
-  "description": "Native Frame Generation for Steam Deck (100% Guaranteed Frame Delivery & Enhanced DIS-Flow + TV-L1)",
+  "version": "1.8.0",
+  "description": "Native Frame Generation for Steam Deck (Pure Hardware FIFO Frame Delivery & Maximum Quality DIS-Flow)",
   "icon": "icon.svg"
 }
