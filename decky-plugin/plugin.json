@@ -5,7 +5,7 @@
     "root"
   ],
   "api_version": 1,
-  "version": "1.8.0",
-  "description": "Native Frame Generation for Steam Deck (Pure Hardware FIFO Frame Delivery & Maximum Quality DIS-Flow)",
+  "version": "1.8.1",
+  "description": "Native Frame Generation for Steam Deck (Hardware Presentation Sequencer & DIS-Flow)",
   "icon": "icon.svg"
 }
