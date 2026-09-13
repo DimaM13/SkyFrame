@@ -17,6 +17,8 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <cmath>
+#include <algorithm>
 #include <sys/stat.h>
 #include <unistd.h>
 
