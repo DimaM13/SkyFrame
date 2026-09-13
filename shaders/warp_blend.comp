@@ -4,7 +4,6 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0, rgba8) uniform readonly image2D u_Frame0;
 layout(binding = 1, rgba8) uniform readonly image2D u_Frame1;
 layout(binding = 2, rgba8) uniform writeonly image2D u_OutImage;
-layout(binding = 3, rg16f) uniform readonly image2D u_MotionField;
 
 layout(push_constant) uniform PushConstants {
     float alpha;
@@ -14,6 +13,15 @@ layout(push_constant) uniform PushConstants {
     int   hud_protection;
     int   mode;
 } pc;
+
+shared float s_candSAD[64];
+shared int   s_candIdx[64];
+shared ivec2 s_bestVec;
+shared float s_zeroSAD;
+
+float getLuma(vec3 c) {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
 
 vec4 sampleBilinearFrame0(vec2 pos, ivec2 size) {
     pos = clamp(pos, vec2(0.0), vec2(size - 1));
@@ -39,45 +47,122 @@ vec4 sampleBilinearFrame1(vec2 pos, ivec2 size) {
     return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
 }
 
-// 4-tap continuous bilinear interpolation of the block motion field
-// Evaluates smooth subpixel flow across adjacent block centers, eliminating all macroblocks
-vec2 sampleMotionFieldBilinear(vec2 pixelCoord, ivec2 fieldSize) {
-    // Center of block (bx, by) is at (bx * 8 + 3.5, by * 8 + 3.5)
-    vec2 blockCoord = (pixelCoord - 3.5) / 8.0;
-    vec2 f = clamp(fract(blockCoord), 0.0, 1.0);
-    ivec2 i0 = clamp(ivec2(floor(blockCoord)), ivec2(0), fieldSize - 1);
-    ivec2 i1 = clamp(i0 + ivec2(1, 1), ivec2(0), fieldSize - 1);
+// 64 motion candidates covering uniform 360-degree directions across 7 speed radii (2, 5, 9, 15, 23, 34, 48 px)
+const ivec2 kCandidates[64] = ivec2[64](
+    ivec2(0, 0), ivec2(2, 0), ivec2(2, 1), ivec2(0, 2),
+    ivec2(-1, 2), ivec2(-2, 1), ivec2(-2, -1), ivec2(-1, -2),
+    ivec2(0, -2), ivec2(2, -1), ivec2(5, 0), ivec2(4, 3),
+    ivec2(1, 5), ivec2(-2, 4), ivec2(-5, 2), ivec2(-5, -2),
+    ivec2(-3, -4), ivec2(1, -5), ivec2(4, -3), ivec2(9, 0),
+    ivec2(7, 6), ivec2(2, 9), ivec2(-4, 8), ivec2(-8, 3),
+    ivec2(-8, -3), ivec2(-5, -8), ivec2(2, -9), ivec2(7, -6),
+    ivec2(15, 0), ivec2(11, 10), ivec2(3, 15), ivec2(-7, 13),
+    ivec2(-14, 5), ivec2(-14, -5), ivec2(-8, -13), ivec2(3, -15),
+    ivec2(11, -10), ivec2(23, 0), ivec2(18, 15), ivec2(4, 23),
+    ivec2(-11, 20), ivec2(-22, 8), ivec2(-22, -8), ivec2(-12, -20),
+    ivec2(4, -23), ivec2(18, -15), ivec2(34, 0), ivec2(26, 22),
+    ivec2(6, 33), ivec2(-17, 29), ivec2(-32, 12), ivec2(-32, -12),
+    ivec2(-17, -29), ivec2(6, -33), ivec2(26, -22), ivec2(48, 0),
+    ivec2(37, 31), ivec2(8, 47), ivec2(-24, 42), ivec2(-45, 16),
+    ivec2(-45, -16), ivec2(-24, -42), ivec2(8, -47), ivec2(37, -31)
+);
 
-    vec2 v00 = imageLoad(u_MotionField, ivec2(i0.x, i0.y)).xy;
-    vec2 v10 = imageLoad(u_MotionField, ivec2(i1.x, i0.y)).xy;
-    vec2 v01 = imageLoad(u_MotionField, ivec2(i0.x, i1.y)).xy;
-    vec2 v11 = imageLoad(u_MotionField, ivec2(i1.x, i1.y)).xy;
-
-    return mix(mix(v00, v10, f.x), mix(v01, v11, f.x), f.y);
-}
+// 16 sample points uniformly covering the 8x8 block (4x4 grid)
+const ivec2 kBlockSamples[16] = ivec2[16](
+    ivec2(0, 0), ivec2(2, 0), ivec2(5, 0), ivec2(7, 0),
+    ivec2(0, 2), ivec2(2, 2), ivec2(5, 2), ivec2(7, 2),
+    ivec2(0, 5), ivec2(2, 5), ivec2(5, 5), ivec2(7, 5),
+    ivec2(0, 7), ivec2(2, 7), ivec2(5, 7), ivec2(7, 7)
+);
 
 void main() {
-    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
-    if (pixelCoord.x >= pc.width || pixelCoord.y >= pc.height) {
+    ivec2 baseCoord = ivec2(gl_WorkGroupID.xy) * 8;
+    ivec2 pixelCoord = baseCoord + ivec2(gl_LocalInvocationID.xy);
+    bool inBounds = (pixelCoord.x < pc.width && pixelCoord.y < pc.height);
+    ivec2 maxCoord = ivec2(pc.width - 1, pc.height - 1);
+
+    uint tid = gl_LocalInvocationIndex; // 0..63
+
+    // 1. Parallel evaluation of all 64 motion candidates simultaneously across the 64 workgroup threads
+    ivec2 cand = kCandidates[tid];
+    float diff = 0.0;
+    for (int i = 0; i < 16; ++i) {
+        ivec2 p1 = clamp(baseCoord + kBlockSamples[i], ivec2(0), maxCoord);
+        ivec2 p0 = clamp(p1 - cand, ivec2(0), maxCoord);
+        vec3 c1 = imageLoad(u_Frame1, p1).rgb;
+        vec3 c0 = imageLoad(u_Frame0, p0).rgb;
+        diff += abs(getLuma(c1) - getLuma(c0)) + 0.2 * dot(abs(c1 - c0), vec3(1.0));
+    }
+
+    if (tid == 0) {
+        s_zeroSAD = diff;
+    }
+
+    s_candSAD[tid] = diff;
+    s_candIdx[tid] = int(tid);
+
+    barrier(); // Barrier 1: All 64 candidates evaluated
+
+    // 2. Parallel reduction to find minimum candidate in logarithmic steps
+    if (tid < 32) {
+        if (s_candSAD[tid + 32] < s_candSAD[tid]) {
+            s_candSAD[tid] = s_candSAD[tid + 32];
+            s_candIdx[tid] = s_candIdx[tid + 32];
+        }
+    }
+    barrier();
+    if (tid < 16) {
+        if (s_candSAD[tid + 16] < s_candSAD[tid]) {
+            s_candSAD[tid] = s_candSAD[tid + 16];
+            s_candIdx[tid] = s_candIdx[tid + 16];
+        }
+    }
+    barrier();
+    if (tid < 8) {
+        if (s_candSAD[tid + 8] < s_candSAD[tid]) {
+            s_candSAD[tid] = s_candSAD[tid + 8];
+            s_candIdx[tid] = s_candIdx[tid + 8];
+        }
+    }
+    barrier();
+
+    if (tid == 0) {
+        float minVal = s_candSAD[0];
+        int bestIdx = s_candIdx[0];
+        for (int i = 1; i < 8; ++i) {
+            if (s_candSAD[i] < minVal) {
+                minVal = s_candSAD[i];
+                bestIdx = s_candIdx[i];
+            }
+        }
+
+        // Flat region zero-locking: if difference is small or zero vector is close to best,
+        // lock to (0,0) to prevent random outlier squares on sky, road, walls, and grass!
+        if (s_zeroSAD < 0.10 || s_zeroSAD <= minVal * 1.30) {
+            s_bestVec = ivec2(0, 0);
+        } else {
+            s_bestVec = kCandidates[bestIdx];
+        }
+    }
+
+    barrier(); // Barrier 2: Best vector shared with all 64 threads
+
+    if (!inBounds) {
         return;
     }
 
     ivec2 size = ivec2(pc.width, pc.height);
-    ivec2 fieldSize = (size + 7) / 8;
-    ivec2 maxCoord = size - 1;
+    vec2 flow = vec2(s_bestVec);
 
-    // 1. Bilinear continuous optical flow (eliminates all 8x8 block seams)
-    vec2 flow = sampleMotionFieldBilinear(vec2(pixelCoord), fieldSize);
-
-    // 2. Symmetric dual sampling at phase 0.5
+    // Initial symmetric sampling
     vec2 pos0 = vec2(pixelCoord) - flow * 0.5;
     vec2 pos1 = vec2(pixelCoord) + flow * 0.5;
     vec4 sample0 = sampleBilinearFrame0(pos0, size);
     vec4 sample1 = sampleBilinearFrame1(pos1, size);
     float bestDiff = dot(abs(sample0.rgb - sample1.rgb), vec3(0.299, 0.587, 0.114));
 
-    // 3. Fine subpixel snap on sharp edges
-    if (bestDiff > 0.08) {
+    // 3. Per-pixel fine subpixel snap on sharp edges (eliminates macroblock edges)
+    if (bestDiff > 0.08 && length(flow) > 0.5) {
         const ivec2 kFine[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
         for (int i = 0; i < 4; ++i) {
             vec2 testFlow = flow + vec2(kFine[i]);

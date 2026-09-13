@@ -24,16 +24,6 @@
 #include <immintrin.h>
 #endif
 
-#if __has_include("motion_field_comp_spv.h")
-#include "motion_field_comp_spv.h"
-#define HAVE_MOTION_FIELD 1
-#endif
-
-#if __has_include("flow_filter_comp_spv.h")
-#include "flow_filter_comp_spv.h"
-#define HAVE_FLOW_FILTER 1
-#endif
-
 #if __has_include("warp_blend_comp_spv.h")
 #include "warp_blend_comp_spv.h"
 #define HAVE_WARP_BLEND 1
@@ -234,36 +224,22 @@ PFN_vkCmdBindDescriptorSets     g_pfnCmdBindDescriptorSets = nullptr;
 PFN_vkCmdPushConstants          g_pfnCmdPushConstants = nullptr;
 PFN_vkCmdDispatch               g_pfnCmdDispatch = nullptr;
 
-PFN_vkCreateImage               g_pfnCreateImage = nullptr;
-PFN_vkDestroyImage              g_pfnDestroyImage = nullptr;
-PFN_vkGetImageMemoryRequirements g_pfnGetImageMemoryRequirements = nullptr;
-PFN_vkGetPhysicalDeviceMemoryProperties g_pfnGetPhysicalDeviceMemoryProperties = nullptr;
-PFN_vkAllocateMemory            g_pfnAllocateMemory = nullptr;
-PFN_vkFreeMemory                g_pfnFreeMemory = nullptr;
-PFN_vkBindImageMemory           g_pfnBindImageMemory = nullptr;
-
-static VkPhysicalDevice g_physicalDevice = VK_NULL_HANDLE;
-
-constexpr size_t RING_SIZE = 8;
+constexpr size_t RING_SIZE = 4;
 
 struct FrameSlot {
     VkCommandBuffer cmdBuffer = VK_NULL_HANDLE;
     VkSemaphore acqSemaphore = VK_NULL_HANDLE;
     VkSemaphore interDoneSemaphore = VK_NULL_HANDLE;
     VkSemaphore finalDoneSemaphore = VK_NULL_HANDLE;
-    VkDescriptorSet motionDescSet = VK_NULL_HANDLE;
-    VkDescriptorSet filterDescSet = VK_NULL_HANDLE;
     VkDescriptorSet blendDescSet = VK_NULL_HANDLE;
 };
 
-struct MotionPushConstants {
-    int width;
-    int height;
-};
-
-struct FilterPushConstants {
-    int width;
-    int height;
+struct PendingPresent {
+    VkQueue queue = VK_NULL_HANDLE;
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    uint32_t imageIndex = 0;
+    VkSemaphore waitSemaphore = VK_NULL_HANDLE;
+    std::chrono::steady_clock::time_point targetTime;
 };
 
 struct BlendPushConstants {
@@ -273,14 +249,6 @@ struct BlendPushConstants {
     int   show_hud;
     int   hud_protection;
     int   mode;
-};
-
-struct PendingPresent {
-    VkQueue queue = VK_NULL_HANDLE;
-    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
-    uint32_t imageIndex = 0;
-    VkSemaphore waitSemaphore = VK_NULL_HANDLE;
-    std::chrono::steady_clock::time_point targetTime;
 };
 
 struct SwapchainContext {
@@ -294,41 +262,19 @@ struct SwapchainContext {
     FrameSlot slots[RING_SIZE];
     size_t ringIndex = 0;
 
+    std::unique_ptr<VulkanWarper> warper;
+    std::unique_ptr<FlowEstimator> flowEstimator;
     FramePacer pacer;
-    std::mutex queueMutex;
 
-    // Asynchronous Frame Pacer Worker (Zero CPU overhead, kernel futex sleep)
+    // Asynchronous Frame Pacer Worker
     std::thread presentWorkerThread;
     std::atomic<bool> workerRunning{false};
     std::mutex presentMutex;
     std::condition_variable presentCv;
+    std::mutex queueMutex;
     std::deque<PendingPresent> pendingPresents;
 
-    // Pass 1: 360-Degree Motion Field (R16G16_SFLOAT, 160x100 for 1280x800)
-    VkImage rawMotionImage = VK_NULL_HANDLE;
-    VkDeviceMemory rawMotionMemory = VK_NULL_HANDLE;
-    VkImageView rawMotionImageView = VK_NULL_HANDLE;
-
-    // Pass 2: 3x3 Spatial Vector Median Regularized Field (R16G16_SFLOAT)
-    VkImage filteredMotionImage = VK_NULL_HANDLE;
-    VkDeviceMemory filteredMotionMemory = VK_NULL_HANDLE;
-    VkImageView filteredMotionImageView = VK_NULL_HANDLE;
-
-    // Pass 1 Pipeline: Coarse Motion Estimation
-    VkShaderModule motionModule = VK_NULL_HANDLE;
-    VkDescriptorSetLayout motionDescLayout = VK_NULL_HANDLE;
-    VkPipelineLayout motionPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline motionPipeline = VK_NULL_HANDLE;
-    VkDescriptorPool motionDescPool = VK_NULL_HANDLE;
-
-    // Pass 2 Pipeline: 3x3 Vector Median Regularization
-    VkShaderModule filterModule = VK_NULL_HANDLE;
-    VkDescriptorSetLayout filterDescLayout = VK_NULL_HANDLE;
-    VkPipelineLayout filterPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline filterPipeline = VK_NULL_HANDLE;
-    VkDescriptorPool filterDescPool = VK_NULL_HANDLE;
-
-    // Pass 3 Pipeline: Dense Bilinear Warp & Soft Temporal Blend
+    // Motion Smoothing Compute Pipeline
     uint32_t prevGameIdx = UINT32_MAX;
     VkShaderModule blendModule = VK_NULL_HANDLE;
     VkDescriptorSetLayout blendDescLayout = VK_NULL_HANDLE;
@@ -386,35 +332,36 @@ static void PresentWorkerLoop(std::shared_ptr<SwapchainContext> ctx) {
 
 static void DrainPendingPresents(SwapchainContext* ctx) {
     if (!ctx) return;
-    std::deque<PendingPresent> toDrain;
-    {
-        std::lock_guard<std::mutex> lock(ctx->presentMutex);
-        toDrain = std::move(ctx->pendingPresents);
-        ctx->pendingPresents.clear();
-    }
-    for (auto& job : toDrain) {
+    std::unique_lock<std::mutex> lock(ctx->presentMutex);
+    while (!ctx->pendingPresents.empty()) {
+        auto oldJob = ctx->pendingPresents.front();
+        ctx->pendingPresents.pop_front();
+        lock.unlock();
+
         VkPresentInfoKHR pi{};
         pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-        pi.waitSemaphoreCount = (job.waitSemaphore != VK_NULL_HANDLE) ? 1 : 0;
-        pi.pWaitSemaphores = (job.waitSemaphore != VK_NULL_HANDLE) ? &job.waitSemaphore : nullptr;
+        pi.waitSemaphoreCount = (oldJob.waitSemaphore != VK_NULL_HANDLE) ? 1 : 0;
+        pi.pWaitSemaphores = (oldJob.waitSemaphore != VK_NULL_HANDLE) ? &oldJob.waitSemaphore : nullptr;
         pi.swapchainCount = 1;
-        pi.pSwapchains = &job.swapchain;
-        pi.pImageIndices = &job.imageIndex;
-        std::lock_guard<std::mutex> qlock(ctx->queueMutex);
-        if (g_pfnQueuePresentKHR && job.queue != VK_NULL_HANDLE) {
-            g_pfnQueuePresentKHR(job.queue, &pi);
+        pi.pSwapchains = &oldJob.swapchain;
+        pi.pImageIndices = &oldJob.imageIndex;
+        {
+            std::lock_guard<std::mutex> qlock(ctx->queueMutex);
+            if (g_pfnQueuePresentKHR && oldJob.queue != VK_NULL_HANDLE) {
+                g_pfnQueuePresentKHR(oldJob.queue, &pi);
+            }
         }
+        lock.lock();
     }
+    ctx->presentCv.notify_all();
 }
 
 static bool InitBlendPipeline(SwapchainContext* ctx) {
-#if HAVE_WARP_BLEND && HAVE_MOTION_FIELD
+#if HAVE_WARP_BLEND
     if (!g_pfnCreateShaderModule || !g_pfnCreateDescriptorSetLayout ||
         !g_pfnCreatePipelineLayout || !g_pfnCreateComputePipelines ||
         !g_pfnCreateDescriptorPool || !g_pfnAllocateDescriptorSets ||
-        !g_pfnCreateImageView || !g_pfnCreateImage ||
-        !g_pfnGetImageMemoryRequirements || !g_pfnAllocateMemory ||
-        !g_pfnBindImageMemory) {
+        !g_pfnCreateImageView) {
         Log("Blend pipeline: required Vulkan function pointers missing");
         return false;
     }
@@ -452,352 +399,111 @@ static bool InitBlendPipeline(SwapchainContext* ctx) {
         }
     }
 
-    // 2. Helper to create R16G16_SFLOAT Storage Images
-    uint32_t mfWidth = (ctx->extent.width + 7) / 8;
-    uint32_t mfHeight = (ctx->extent.height + 7) / 8;
-
-    auto createStorageImage = [&](uint32_t width, uint32_t height, VkImage& outImg, VkDeviceMemory& outMem, VkImageView& outView) -> bool {
-        if (outImg != VK_NULL_HANDLE || g_physicalDevice == VK_NULL_HANDLE) return true;
-        VkImageCreateInfo ici{};
-        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        ici.imageType = VK_IMAGE_TYPE_2D;
-        ici.format = VK_FORMAT_R16G16_SFLOAT;
-        ici.extent = { width, height, 1 };
-        ici.mipLevels = 1;
-        ici.arrayLayers = 1;
-        ici.samples = VK_SAMPLE_COUNT_1_BIT;
-        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_STORAGE_BIT;
-        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-        if (g_pfnCreateImage(ctx->device, &ici, nullptr, &outImg) != VK_SUCCESS) return false;
-
-        VkMemoryRequirements memReq{};
-        g_pfnGetImageMemoryRequirements(ctx->device, outImg, &memReq);
-
-        VkPhysicalDeviceMemoryProperties memProps{};
-        if (g_pfnGetPhysicalDeviceMemoryProperties) {
-            g_pfnGetPhysicalDeviceMemoryProperties(g_physicalDevice, &memProps);
-        }
-
-        uint32_t memType = 0;
-        for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
-            if ((memReq.memoryTypeBits & (1 << i)) &&
-                (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-                memType = i;
-                break;
-            }
-        }
-
-        VkMemoryAllocateInfo mai{};
-        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        mai.allocationSize = memReq.size;
-        mai.memoryTypeIndex = memType;
-
-        if (g_pfnAllocateMemory(ctx->device, &mai, nullptr, &outMem) != VK_SUCCESS) return false;
-        g_pfnBindImageMemory(ctx->device, outImg, outMem, 0);
-
-        VkImageViewCreateInfo ivci{};
-        ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        ivci.image = outImg;
-        ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        ivci.format = VK_FORMAT_R16G16_SFLOAT;
-        ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        ivci.subresourceRange.baseMipLevel = 0;
-        ivci.subresourceRange.levelCount = 1;
-        ivci.subresourceRange.baseArrayLayer = 0;
-        ivci.subresourceRange.layerCount = 1;
-
-        return (g_pfnCreateImageView(ctx->device, &ivci, nullptr, &outView) == VK_SUCCESS);
-    };
-
-    createStorageImage(mfWidth, mfHeight, ctx->rawMotionImage, ctx->rawMotionMemory, ctx->rawMotionImageView);
-    createStorageImage(mfWidth, mfHeight, ctx->filteredMotionImage, ctx->filteredMotionMemory, ctx->filteredMotionImageView);
-
-    if (ctx->blendPipeline != VK_NULL_HANDLE && ctx->motionPipeline != VK_NULL_HANDLE && ctx->filterPipeline != VK_NULL_HANDLE) {
+    if (ctx->blendPipeline != VK_NULL_HANDLE) {
         return true;
     }
 
-    // 3. Pass 1: 360-Degree Motion Estimation Pipeline
-    if (ctx->motionPipeline == VK_NULL_HANDLE) {
-        VkShaderModuleCreateInfo smci{};
-        smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        smci.codeSize = motion_field_comp_spv_size;
-        smci.pCode = motion_field_comp_spv;
+    // 2. Create Shader Module
+    VkShaderModuleCreateInfo smci{};
+    smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smci.codeSize = warp_blend_comp_spv_size;
+    smci.pCode = warp_blend_comp_spv;
 
-        if (g_pfnCreateShaderModule(ctx->device, &smci, nullptr, &ctx->motionModule) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to create motion shader module");
-            return false;
-        }
-
-        VkDescriptorSetLayoutBinding bindings[3]{};
-        for (int i = 0; i < 3; ++i) {
-            bindings[i].binding = i;
-            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            bindings[i].descriptorCount = 1;
-            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        }
-
-        VkDescriptorSetLayoutCreateInfo dslci{};
-        dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        dslci.bindingCount = 3;
-        dslci.pBindings = bindings;
-        if (g_pfnCreateDescriptorSetLayout(ctx->device, &dslci, nullptr, &ctx->motionDescLayout) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to create motion descriptor layout");
-            return false;
-        }
-
-        VkPushConstantRange pcr{};
-        pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        pcr.offset = 0;
-        pcr.size = sizeof(MotionPushConstants);
-
-        VkPipelineLayoutCreateInfo plci{};
-        plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        plci.setLayoutCount = 1;
-        plci.pSetLayouts = &ctx->motionDescLayout;
-        plci.pushConstantRangeCount = 1;
-        plci.pPushConstantRanges = &pcr;
-        if (g_pfnCreatePipelineLayout(ctx->device, &plci, nullptr, &ctx->motionPipelineLayout) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to create motion pipeline layout");
-            return false;
-        }
-
-        VkComputePipelineCreateInfo cpci{};
-        cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        cpci.stage.module = ctx->motionModule;
-        cpci.stage.pName = "main";
-        cpci.layout = ctx->motionPipelineLayout;
-        if (g_pfnCreateComputePipelines(ctx->device, VK_NULL_HANDLE, 1, &cpci, nullptr, &ctx->motionPipeline) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to create motion compute pipeline");
-            return false;
-        }
-
-        VkDescriptorPoolSize poolSize{};
-        poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        poolSize.descriptorCount = static_cast<uint32_t>(RING_SIZE * 3);
-
-        VkDescriptorPoolCreateInfo dpci{};
-        dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        dpci.maxSets = static_cast<uint32_t>(RING_SIZE);
-        dpci.poolSizeCount = 1;
-        dpci.pPoolSizes = &poolSize;
-        if (g_pfnCreateDescriptorPool(ctx->device, &dpci, nullptr, &ctx->motionDescPool) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to create motion descriptor pool");
-            return false;
-        }
-
-        VkDescriptorSetLayout layouts[RING_SIZE];
-        for (size_t i = 0; i < RING_SIZE; ++i) layouts[i] = ctx->motionDescLayout;
-
-        VkDescriptorSetAllocateInfo dsai{};
-        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dsai.descriptorPool = ctx->motionDescPool;
-        dsai.descriptorSetCount = static_cast<uint32_t>(RING_SIZE);
-        dsai.pSetLayouts = layouts;
-
-        VkDescriptorSet sets[RING_SIZE];
-        if (g_pfnAllocateDescriptorSets(ctx->device, &dsai, sets) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to allocate motion descriptor sets");
-            return false;
-        }
-
-        for (size_t i = 0; i < RING_SIZE; ++i) {
-            ctx->slots[i].motionDescSet = sets[i];
-        }
+    if (g_pfnCreateShaderModule(ctx->device, &smci, nullptr, &ctx->blendModule) != VK_SUCCESS) {
+        Log("Blend pipeline: failed to create shader module");
+        return false;
     }
 
-    // 4. Pass 2: 3x3 Vector Median Regularization Pipeline
-    if (ctx->filterPipeline == VK_NULL_HANDLE) {
-#if HAVE_FLOW_FILTER
-        VkShaderModuleCreateInfo smci{};
-        smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        smci.codeSize = flow_filter_comp_spv_size;
-        smci.pCode = flow_filter_comp_spv;
-
-        if (g_pfnCreateShaderModule(ctx->device, &smci, nullptr, &ctx->filterModule) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to create filter shader module");
-            return false;
-        }
-
-        VkDescriptorSetLayoutBinding bindings[2]{};
-        for (int i = 0; i < 2; ++i) {
-            bindings[i].binding = i;
-            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            bindings[i].descriptorCount = 1;
-            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        }
-
-        VkDescriptorSetLayoutCreateInfo dslci{};
-        dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        dslci.bindingCount = 2;
-        dslci.pBindings = bindings;
-        if (g_pfnCreateDescriptorSetLayout(ctx->device, &dslci, nullptr, &ctx->filterDescLayout) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to create filter descriptor layout");
-            return false;
-        }
-
-        VkPushConstantRange pcr{};
-        pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        pcr.offset = 0;
-        pcr.size = sizeof(FilterPushConstants);
-
-        VkPipelineLayoutCreateInfo plci{};
-        plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        plci.setLayoutCount = 1;
-        plci.pSetLayouts = &ctx->filterDescLayout;
-        plci.pushConstantRangeCount = 1;
-        plci.pPushConstantRanges = &pcr;
-        if (g_pfnCreatePipelineLayout(ctx->device, &plci, nullptr, &ctx->filterPipelineLayout) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to create filter pipeline layout");
-            return false;
-        }
-
-        VkComputePipelineCreateInfo cpci{};
-        cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        cpci.stage.module = ctx->filterModule;
-        cpci.stage.pName = "main";
-        cpci.layout = ctx->filterPipelineLayout;
-        if (g_pfnCreateComputePipelines(ctx->device, VK_NULL_HANDLE, 1, &cpci, nullptr, &ctx->filterPipeline) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to create filter compute pipeline");
-            return false;
-        }
-
-        VkDescriptorPoolSize poolSize{};
-        poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        poolSize.descriptorCount = static_cast<uint32_t>(RING_SIZE * 2);
-
-        VkDescriptorPoolCreateInfo dpci{};
-        dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        dpci.maxSets = static_cast<uint32_t>(RING_SIZE);
-        dpci.poolSizeCount = 1;
-        dpci.pPoolSizes = &poolSize;
-        if (g_pfnCreateDescriptorPool(ctx->device, &dpci, nullptr, &ctx->filterDescPool) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to create filter descriptor pool");
-            return false;
-        }
-
-        VkDescriptorSetLayout layouts[RING_SIZE];
-        for (size_t i = 0; i < RING_SIZE; ++i) layouts[i] = ctx->filterDescLayout;
-
-        VkDescriptorSetAllocateInfo dsai{};
-        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dsai.descriptorPool = ctx->filterDescPool;
-        dsai.descriptorSetCount = static_cast<uint32_t>(RING_SIZE);
-        dsai.pSetLayouts = layouts;
-
-        VkDescriptorSet sets[RING_SIZE];
-        if (g_pfnAllocateDescriptorSets(ctx->device, &dsai, sets) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to allocate filter descriptor sets");
-            return false;
-        }
-
-        for (size_t i = 0; i < RING_SIZE; ++i) {
-            ctx->slots[i].filterDescSet = sets[i];
-        }
-#endif
+    // 3. Descriptor Set Layout (3 storage images: Frame0, Frame1, OutImage)
+    VkDescriptorSetLayoutBinding bindings[3]{};
+    for (int i = 0; i < 3; ++i) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
 
-    // 5. Pass 3: Dense Bilinear Warp & Soft Temporal Blend Pipeline
-    if (ctx->blendPipeline == VK_NULL_HANDLE) {
-        VkShaderModuleCreateInfo smci{};
-        smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        smci.codeSize = warp_blend_comp_spv_size;
-        smci.pCode = warp_blend_comp_spv;
+    VkDescriptorSetLayoutCreateInfo dslci{};
+    dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dslci.bindingCount = 3;
+    dslci.pBindings = bindings;
 
-        if (g_pfnCreateShaderModule(ctx->device, &smci, nullptr, &ctx->blendModule) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to create blend shader module");
-            return false;
-        }
-
-        VkDescriptorSetLayoutBinding bindings[4]{};
-        for (int i = 0; i < 4; ++i) {
-            bindings[i].binding = i;
-            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            bindings[i].descriptorCount = 1;
-            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        }
-
-        VkDescriptorSetLayoutCreateInfo dslci{};
-        dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        dslci.bindingCount = 4;
-        dslci.pBindings = bindings;
-        if (g_pfnCreateDescriptorSetLayout(ctx->device, &dslci, nullptr, &ctx->blendDescLayout) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to create blend descriptor layout");
-            return false;
-        }
-
-        VkPushConstantRange pcr{};
-        pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        pcr.offset = 0;
-        pcr.size = sizeof(BlendPushConstants);
-
-        VkPipelineLayoutCreateInfo plci{};
-        plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        plci.setLayoutCount = 1;
-        plci.pSetLayouts = &ctx->blendDescLayout;
-        plci.pushConstantRangeCount = 1;
-        plci.pPushConstantRanges = &pcr;
-        if (g_pfnCreatePipelineLayout(ctx->device, &plci, nullptr, &ctx->blendPipelineLayout) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to create blend pipeline layout");
-            return false;
-        }
-
-        VkComputePipelineCreateInfo cpci{};
-        cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        cpci.stage.module = ctx->blendModule;
-        cpci.stage.pName = "main";
-        cpci.layout = ctx->blendPipelineLayout;
-        if (g_pfnCreateComputePipelines(ctx->device, VK_NULL_HANDLE, 1, &cpci, nullptr, &ctx->blendPipeline) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to create blend compute pipeline");
-            return false;
-        }
-
-        VkDescriptorPoolSize poolSize{};
-        poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        poolSize.descriptorCount = static_cast<uint32_t>(RING_SIZE * 4);
-
-        VkDescriptorPoolCreateInfo dpci{};
-        dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        dpci.maxSets = static_cast<uint32_t>(RING_SIZE);
-        dpci.poolSizeCount = 1;
-        dpci.pPoolSizes = &poolSize;
-        if (g_pfnCreateDescriptorPool(ctx->device, &dpci, nullptr, &ctx->blendDescPool) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to create blend descriptor pool");
-            return false;
-        }
-
-        VkDescriptorSetLayout layouts[RING_SIZE];
-        for (size_t i = 0; i < RING_SIZE; ++i) layouts[i] = ctx->blendDescLayout;
-
-        VkDescriptorSetAllocateInfo dsai{};
-        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dsai.descriptorPool = ctx->blendDescPool;
-        dsai.descriptorSetCount = static_cast<uint32_t>(RING_SIZE);
-        dsai.pSetLayouts = layouts;
-
-        VkDescriptorSet sets[RING_SIZE];
-        if (g_pfnAllocateDescriptorSets(ctx->device, &dsai, sets) != VK_SUCCESS) {
-            Log("Blend pipeline: failed to allocate blend descriptor sets");
-            return false;
-        }
-
-        for (size_t i = 0; i < RING_SIZE; ++i) {
-            ctx->slots[i].blendDescSet = sets[i];
-        }
+    if (g_pfnCreateDescriptorSetLayout(ctx->device, &dslci, nullptr, &ctx->blendDescLayout) != VK_SUCCESS) {
+        Log("Blend pipeline: failed to create descriptor set layout");
+        return false;
     }
 
-    Log("Blend pipeline: successfully initialized 3-pass Hierarchical Optical Flow & Regularization pipeline!");
+    // 4. Pipeline Layout with Push Constants
+    VkPushConstantRange pcr{};
+    pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcr.offset = 0;
+    pcr.size = sizeof(BlendPushConstants);
+
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &ctx->blendDescLayout;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &pcr;
+
+    if (g_pfnCreatePipelineLayout(ctx->device, &plci, nullptr, &ctx->blendPipelineLayout) != VK_SUCCESS) {
+        Log("Blend pipeline: failed to create pipeline layout");
+        return false;
+    }
+
+    // 5. Compute Pipeline
+    VkComputePipelineCreateInfo cpci{};
+    cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpci.stage.module = ctx->blendModule;
+    cpci.stage.pName = "main";
+    cpci.layout = ctx->blendPipelineLayout;
+
+    if (g_pfnCreateComputePipelines(ctx->device, VK_NULL_HANDLE, 1, &cpci, nullptr, &ctx->blendPipeline) != VK_SUCCESS) {
+        Log("Blend pipeline: failed to create compute pipeline");
+        return false;
+    }
+
+    // 6. Descriptor Pool & Sets for Ring Buffer
+    VkDescriptorPoolSize poolSize{};
+    poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    poolSize.descriptorCount = static_cast<uint32_t>(RING_SIZE * 3);
+
+    VkDescriptorPoolCreateInfo dpci{};
+    dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpci.maxSets = static_cast<uint32_t>(RING_SIZE);
+    dpci.poolSizeCount = 1;
+    dpci.pPoolSizes = &poolSize;
+
+    if (g_pfnCreateDescriptorPool(ctx->device, &dpci, nullptr, &ctx->blendDescPool) != VK_SUCCESS) {
+        Log("Blend pipeline: failed to create descriptor pool");
+        return false;
+    }
+
+    VkDescriptorSetLayout layouts[RING_SIZE];
+    for (size_t i = 0; i < RING_SIZE; ++i) layouts[i] = ctx->blendDescLayout;
+
+    VkDescriptorSetAllocateInfo dsai{};
+    dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsai.descriptorPool = ctx->blendDescPool;
+    dsai.descriptorSetCount = static_cast<uint32_t>(RING_SIZE);
+    dsai.pSetLayouts = layouts;
+
+    VkDescriptorSet sets[RING_SIZE];
+    if (g_pfnAllocateDescriptorSets(ctx->device, &dsai, sets) != VK_SUCCESS) {
+        Log("Blend pipeline: failed to allocate descriptor sets");
+        return false;
+    }
+
+    for (size_t i = 0; i < RING_SIZE; ++i) {
+        ctx->slots[i].blendDescSet = sets[i];
+    }
+
+    Log("Blend pipeline: successfully initialized compute shader for motion smoothing!");
     return true;
 #else
-    Log("Blend pipeline: shaders not available");
+    Log("Blend pipeline: warp_blend_comp_spv.h not available");
     return false;
 #endif
 }
@@ -845,8 +551,6 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateInstance(
 
     g_nextDestroyInstance = (PFN_vkDestroyInstance)g_nextGetInstanceProcAddr(*pInstance, "vkDestroyInstance");
     g_nextCreateDevice = (PFN_vkCreateDevice)g_nextGetInstanceProcAddr(*pInstance, "vkCreateDevice");
-    g_pfnGetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)g_nextGetInstanceProcAddr(*pInstance, "vkGetPhysicalDeviceMemoryProperties");
-    if (!g_pfnGetPhysicalDeviceMemoryProperties) g_pfnGetPhysicalDeviceMemoryProperties = &vkGetPhysicalDeviceMemoryProperties;
 
     Log("Vulkan Instance created successfully. Layer hooked.");
     return VK_SUCCESS;
@@ -893,8 +597,6 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateDevice(
         return res;
     }
 
-    g_physicalDevice = physicalDevice;
-
     if (pCreateInfo && pCreateInfo->queueCreateInfoCount > 0) {
         g_graphicsQueueFamily = pCreateInfo->pQueueCreateInfos[0].queueFamilyIndex;
     }
@@ -937,13 +639,6 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateDevice(
     g_pfnCmdPushConstants = (PFN_vkCmdPushConstants)g_nextGetDeviceProcAddr(*pDevice, "vkCmdPushConstants");
     g_pfnCmdDispatch = (PFN_vkCmdDispatch)g_nextGetDeviceProcAddr(*pDevice, "vkCmdDispatch");
 
-    g_pfnCreateImage = (PFN_vkCreateImage)g_nextGetDeviceProcAddr(*pDevice, "vkCreateImage");
-    g_pfnDestroyImage = (PFN_vkDestroyImage)g_nextGetDeviceProcAddr(*pDevice, "vkDestroyImage");
-    g_pfnGetImageMemoryRequirements = (PFN_vkGetImageMemoryRequirements)g_nextGetDeviceProcAddr(*pDevice, "vkGetImageMemoryRequirements");
-    g_pfnAllocateMemory = (PFN_vkAllocateMemory)g_nextGetDeviceProcAddr(*pDevice, "vkAllocateMemory");
-    g_pfnFreeMemory = (PFN_vkFreeMemory)g_nextGetDeviceProcAddr(*pDevice, "vkFreeMemory");
-    g_pfnBindImageMemory = (PFN_vkBindImageMemory)g_nextGetDeviceProcAddr(*pDevice, "vkBindImageMemory");
-
     // Fallbacks
     if (!g_pfnCreateCommandPool) g_pfnCreateCommandPool = &vkCreateCommandPool;
     if (!g_pfnDestroyCommandPool) g_pfnDestroyCommandPool = &vkDestroyCommandPool;
@@ -976,13 +671,6 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateDevice(
     if (!g_pfnCmdPushConstants) g_pfnCmdPushConstants = &vkCmdPushConstants;
     if (!g_pfnCmdDispatch) g_pfnCmdDispatch = &vkCmdDispatch;
 
-    if (!g_pfnCreateImage) g_pfnCreateImage = &vkCreateImage;
-    if (!g_pfnDestroyImage) g_pfnDestroyImage = &vkDestroyImage;
-    if (!g_pfnGetImageMemoryRequirements) g_pfnGetImageMemoryRequirements = &vkGetImageMemoryRequirements;
-    if (!g_pfnAllocateMemory) g_pfnAllocateMemory = &vkAllocateMemory;
-    if (!g_pfnFreeMemory) g_pfnFreeMemory = &vkFreeMemory;
-    if (!g_pfnBindImageMemory) g_pfnBindImageMemory = &vkBindImageMemory;
-
     Log("Vulkan Device created successfully. Dispatch table initialized.");
     return VK_SUCCESS;
 }
@@ -1009,19 +697,16 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateSwapchainKHR(
     }
 
     VkSwapchainCreateInfoKHR modifiedCi = *pCreateInfo;
-    // Guarantee at least 8 swapchain images (eliminates image starvation in 3D games)
-    if (modifiedCi.minImageCount < 8) {
-        modifiedCi.minImageCount = 8;
+    if (modifiedCi.minImageCount < 4) {
+        modifiedCi.minImageCount = 4;
     }
-    modifiedCi.presentMode = VK_PRESENT_MODE_FIFO_KHR;
     modifiedCi.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
 
     VkResult res = g_pfnCreateSwapchainKHR(device, &modifiedCi, pAllocator, pSwapchain);
     if (res != VK_SUCCESS) {
         Log("Swapchain creation with STORAGE_BIT failed (%d), retrying without STORAGE_BIT", res);
         modifiedCi.imageUsage = pCreateInfo->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        if (modifiedCi.minImageCount < 8) modifiedCi.minImageCount = 8;
-        modifiedCi.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        if (modifiedCi.minImageCount < 4) modifiedCi.minImageCount = 4;
         res = g_pfnCreateSwapchainKHR(device, &modifiedCi, pAllocator, pSwapchain);
     }
     if (res != VK_SUCCESS || !pSwapchain) return res;
@@ -1067,7 +752,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateSwapchainKHR(
     InitBlendPipeline(ctx.get());
 
     ctx->isInitialized = true;
-    ctx->workerRunning.store(true);
+    ctx->workerRunning = true;
     ctx->presentWorkerThread = std::thread(PresentWorkerLoop, ctx);
 
     {
@@ -1076,7 +761,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateSwapchainKHR(
     }
 
     ReloadConfig();
-    Log("Swapchain created: %ux%u, format=%d, imageCount=%zu, swapchain=%p (FIFO Mode)",
+    Log("Swapchain created: %ux%u, format=%d, imageCount=%zu, swapchain=%p",
         ctx->extent.width, ctx->extent.height, ctx->format, ctx->images.size(), (void*)*pSwapchain);
     return res;
 }
@@ -1092,40 +777,17 @@ VKAPI_ATTR void VKAPI_CALL Hook_vkDestroySwapchainKHR(
         auto it = g_swapchains.find(swapchain);
         if (it != g_swapchains.end()) {
             auto ctx = it->second;
-
-            ctx->workerRunning.store(false);
+            ctx->workerRunning = false;
             ctx->presentCv.notify_all();
             if (ctx->presentWorkerThread.joinable()) {
                 ctx->presentWorkerThread.join();
             }
-            DrainPendingPresents(ctx.get());
-
-            if (ctx->motionPipeline && g_pfnDestroyPipeline) g_pfnDestroyPipeline(device, ctx->motionPipeline, nullptr);
-            if (ctx->motionPipelineLayout && g_pfnDestroyPipelineLayout) g_pfnDestroyPipelineLayout(device, ctx->motionPipelineLayout, nullptr);
-            if (ctx->motionDescPool && g_pfnDestroyDescriptorPool) g_pfnDestroyDescriptorPool(device, ctx->motionDescPool, nullptr);
-            if (ctx->motionDescLayout && g_pfnDestroyDescriptorSetLayout) g_pfnDestroyDescriptorSetLayout(device, ctx->motionDescLayout, nullptr);
-            if (ctx->motionModule && g_pfnDestroyShaderModule) g_pfnDestroyShaderModule(device, ctx->motionModule, nullptr);
-
-            if (ctx->filterPipeline && g_pfnDestroyPipeline) g_pfnDestroyPipeline(device, ctx->filterPipeline, nullptr);
-            if (ctx->filterPipelineLayout && g_pfnDestroyPipelineLayout) g_pfnDestroyPipelineLayout(device, ctx->filterPipelineLayout, nullptr);
-            if (ctx->filterDescPool && g_pfnDestroyDescriptorPool) g_pfnDestroyDescriptorPool(device, ctx->filterDescPool, nullptr);
-            if (ctx->filterDescLayout && g_pfnDestroyDescriptorSetLayout) g_pfnDestroyDescriptorSetLayout(device, ctx->filterDescLayout, nullptr);
-            if (ctx->filterModule && g_pfnDestroyShaderModule) g_pfnDestroyShaderModule(device, ctx->filterModule, nullptr);
 
             if (ctx->blendPipeline && g_pfnDestroyPipeline) g_pfnDestroyPipeline(device, ctx->blendPipeline, nullptr);
             if (ctx->blendPipelineLayout && g_pfnDestroyPipelineLayout) g_pfnDestroyPipelineLayout(device, ctx->blendPipelineLayout, nullptr);
             if (ctx->blendDescPool && g_pfnDestroyDescriptorPool) g_pfnDestroyDescriptorPool(device, ctx->blendDescPool, nullptr);
             if (ctx->blendDescLayout && g_pfnDestroyDescriptorSetLayout) g_pfnDestroyDescriptorSetLayout(device, ctx->blendDescLayout, nullptr);
             if (ctx->blendModule && g_pfnDestroyShaderModule) g_pfnDestroyShaderModule(device, ctx->blendModule, nullptr);
-
-            if (ctx->rawMotionImageView && g_pfnDestroyImageView) g_pfnDestroyImageView(device, ctx->rawMotionImageView, nullptr);
-            if (ctx->rawMotionImage && g_pfnDestroyImage) g_pfnDestroyImage(device, ctx->rawMotionImage, nullptr);
-            if (ctx->rawMotionMemory && g_pfnFreeMemory) g_pfnFreeMemory(device, ctx->rawMotionMemory, nullptr);
-
-            if (ctx->filteredMotionImageView && g_pfnDestroyImageView) g_pfnDestroyImageView(device, ctx->filteredMotionImageView, nullptr);
-            if (ctx->filteredMotionImage && g_pfnDestroyImage) g_pfnDestroyImage(device, ctx->filteredMotionImage, nullptr);
-            if (ctx->filteredMotionMemory && g_pfnFreeMemory) g_pfnFreeMemory(device, ctx->filteredMotionMemory, nullptr);
-
             for (auto iv : ctx->imageViews) {
                 if (iv && g_pfnDestroyImageView) g_pfnDestroyImageView(device, iv, nullptr);
             }
@@ -1210,7 +872,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
         return g_pfnQueuePresentKHR(queue, pPresentInfo);
     }
 
-    // 1. Auto VSync Cadence: Paces base frames to display interval without stalling game rendering
+    // 1. Update frame pacer and timing (Auto VSync Cadence locked to display refresh rate)
     ctx->pacer.SetTargetHz(cfg.target_hz);
     ctx->pacer.PaceBasePresent();
     auto now = std::chrono::steady_clock::now();
@@ -1223,7 +885,12 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
     auto& slot = ctx->slots[ctx->ringIndex % RING_SIZE];
     ctx->ringIndex++;
 
-    // Base frame initialization: if this is the very first frame, establish baseline directly
+    uint64_t halfIntervalNs = ctx->pacer.GetTargetPacingDelayNs();
+
+    // Flush any pending presentation from prior frame if game produced a fast burst
+    DrainPendingPresents(ctx.get());
+
+    // 0. Base frame initialization: if this is the very first frame, establish baseline directly
     if (ctx->prevGameIdx == UINT32_MAX) {
         ctx->prevGameIdx = currentGameIdx;
         std::lock_guard<std::mutex> qlock(ctx->queueMutex);
@@ -1239,17 +906,6 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
         );
     }
 
-    if (acqRes != VK_SUCCESS) {
-        static uint64_t s_acqFailCount = 0;
-        if (s_acqFailCount++ % 60 == 0) {
-            Log("WARN: Acquire intermediate image failed (%d), falling back to native present", acqRes);
-        }
-        DrainPendingPresents(ctx.get());
-        ctx->prevGameIdx = currentGameIdx;
-        std::lock_guard<std::mutex> qlock(ctx->queueMutex);
-        return g_pfnQueuePresentKHR(queue, pPresentInfo);
-    }
-
     if (acqRes == VK_SUCCESS && intermediateIdx != currentGameIdx &&
         intermediateIdx < ctx->images.size() && currentGameIdx < ctx->images.size() &&
         slot.cmdBuffer != VK_NULL_HANDLE && g_pfnBeginCommandBuffer &&
@@ -1261,187 +917,72 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
         g_pfnBeginCommandBuffer(slot.cmdBuffer, &bi);
 
         bool usedBlend = false;
-        if (ctx->blendPipeline != VK_NULL_HANDLE && ctx->motionPipeline != VK_NULL_HANDLE &&
-            ctx->filterPipeline != VK_NULL_HANDLE &&
-            ctx->rawMotionImageView != VK_NULL_HANDLE && ctx->filteredMotionImageView != VK_NULL_HANDLE &&
-            ctx->prevGameIdx != UINT32_MAX &&
+        if (ctx->blendPipeline != VK_NULL_HANDLE && ctx->prevGameIdx != UINT32_MAX &&
             ctx->prevGameIdx < ctx->images.size() && ctx->prevGameIdx != intermediateIdx &&
             ctx->prevGameIdx < ctx->imageViews.size() && currentGameIdx < ctx->imageViews.size() &&
             intermediateIdx < ctx->imageViews.size() &&
             ctx->imageViews[ctx->prevGameIdx] != VK_NULL_HANDLE &&
             ctx->imageViews[currentGameIdx] != VK_NULL_HANDLE &&
             ctx->imageViews[intermediateIdx] != VK_NULL_HANDLE &&
-            slot.motionDescSet != VK_NULL_HANDLE && slot.filterDescSet != VK_NULL_HANDLE &&
-            slot.blendDescSet != VK_NULL_HANDLE &&
-            g_pfnUpdateDescriptorSets && g_pfnCmdBindPipeline &&
-            g_pfnCmdBindDescriptorSets && g_pfnCmdPushConstants && g_pfnCmdDispatch) {
+            slot.blendDescSet != VK_NULL_HANDLE && g_pfnUpdateDescriptorSets &&
+            g_pfnCmdBindPipeline && g_pfnCmdBindDescriptorSets && g_pfnCmdPushConstants && g_pfnCmdDispatch) {
 
-            uint32_t mfWidth = (ctx->extent.width + 7) / 8;
-            uint32_t mfHeight = (ctx->extent.height + 7) / 8;
+            // Motion Smoothing: Blend Frame N-1 and Frame N into intermediateIdx at phase 0.5
+            VkDescriptorImageInfo imageInfos[3]{};
+            imageInfos[0].imageView = ctx->imageViews[ctx->prevGameIdx];
+            imageInfos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            imageInfos[1].imageView = ctx->imageViews[currentGameIdx];
+            imageInfos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            imageInfos[2].imageView = ctx->imageViews[intermediateIdx];
+            imageInfos[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-            // 1. Update Pass 1 Descriptors: u_Frame0, u_Frame1, u_RawMotion
-            VkDescriptorImageInfo motionImages[3]{};
-            motionImages[0].imageView = ctx->imageViews[ctx->prevGameIdx];
-            motionImages[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            motionImages[1].imageView = ctx->imageViews[currentGameIdx];
-            motionImages[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            motionImages[2].imageView = ctx->rawMotionImageView;
-            motionImages[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-            VkWriteDescriptorSet motionWrites[3]{};
+            VkWriteDescriptorSet writes[3]{};
             for (int i = 0; i < 3; ++i) {
-                motionWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                motionWrites[i].dstSet = slot.motionDescSet;
-                motionWrites[i].dstBinding = i;
-                motionWrites[i].descriptorCount = 1;
-                motionWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-                motionWrites[i].pImageInfo = &motionImages[i];
+                writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[i].dstSet = slot.blendDescSet;
+                writes[i].dstBinding = i;
+                writes[i].descriptorCount = 1;
+                writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                writes[i].pImageInfo = &imageInfos[i];
             }
-            g_pfnUpdateDescriptorSets(ctx->device, 3, motionWrites, 0, nullptr);
+            g_pfnUpdateDescriptorSets(ctx->device, 3, writes, 0, nullptr);
 
-            // 2. Update Pass 2 Descriptors: u_RawMotion, u_FilteredMotion
-            VkDescriptorImageInfo filterImages[2]{};
-            filterImages[0].imageView = ctx->rawMotionImageView;
-            filterImages[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            filterImages[1].imageView = ctx->filteredMotionImageView;
-            filterImages[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            VkImageMemoryBarrier barriers[3]{};
+            barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barriers[0].image = ctx->images[ctx->prevGameIdx];
+            barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barriers[0].subresourceRange.levelCount = 1;
+            barriers[0].subresourceRange.layerCount = 1;
 
-            VkWriteDescriptorSet filterWrites[2]{};
-            for (int i = 0; i < 2; ++i) {
-                filterWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                filterWrites[i].dstSet = slot.filterDescSet;
-                filterWrites[i].dstBinding = i;
-                filterWrites[i].descriptorCount = 1;
-                filterWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-                filterWrites[i].pImageInfo = &filterImages[i];
-            }
-            g_pfnUpdateDescriptorSets(ctx->device, 2, filterWrites, 0, nullptr);
+            barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barriers[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            barriers[1].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barriers[1].image = ctx->images[currentGameIdx];
+            barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barriers[1].subresourceRange.levelCount = 1;
+            barriers[1].subresourceRange.layerCount = 1;
 
-            // 3. Update Pass 3 Descriptors: u_Frame0, u_Frame1, u_OutImage, u_FilteredMotion
-            VkDescriptorImageInfo blendImages[4]{};
-            blendImages[0].imageView = ctx->imageViews[ctx->prevGameIdx];
-            blendImages[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            blendImages[1].imageView = ctx->imageViews[currentGameIdx];
-            blendImages[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            blendImages[2].imageView = ctx->imageViews[intermediateIdx];
-            blendImages[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            blendImages[3].imageView = ctx->filteredMotionImageView;
-            blendImages[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barriers[2].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barriers[2].srcAccessMask = 0;
+            barriers[2].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barriers[2].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barriers[2].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barriers[2].image = ctx->images[intermediateIdx];
+            barriers[2].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barriers[2].subresourceRange.levelCount = 1;
+            barriers[2].subresourceRange.layerCount = 1;
 
-            VkWriteDescriptorSet blendWrites[4]{};
-            for (int i = 0; i < 4; ++i) {
-                blendWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                blendWrites[i].dstSet = slot.blendDescSet;
-                blendWrites[i].dstBinding = i;
-                blendWrites[i].descriptorCount = 1;
-                blendWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-                blendWrites[i].pImageInfo = &blendImages[i];
-            }
-            g_pfnUpdateDescriptorSets(ctx->device, 4, blendWrites, 0, nullptr);
+            g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 3, barriers);
 
-            // Initial Barriers for Pass 1:
-            // Frame0 and Frame1 from PRESENT_SRC to GENERAL (Shader Read)
-            // rawMotionImage from UNDEFINED to GENERAL (Shader Write)
-            VkImageMemoryBarrier pass1Barriers[3]{};
-            pass1Barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            pass1Barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-            pass1Barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            pass1Barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            pass1Barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            pass1Barriers[0].image = ctx->images[ctx->prevGameIdx];
-            pass1Barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            pass1Barriers[0].subresourceRange.levelCount = 1;
-            pass1Barriers[0].subresourceRange.layerCount = 1;
+            g_pfnCmdBindPipeline(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->blendPipeline);
+            g_pfnCmdBindDescriptorSets(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->blendPipelineLayout, 0, 1, &slot.blendDescSet, 0, nullptr);
 
-            pass1Barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            pass1Barriers[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-            pass1Barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            pass1Barriers[1].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            pass1Barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            pass1Barriers[1].image = ctx->images[currentGameIdx];
-            pass1Barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            pass1Barriers[1].subresourceRange.levelCount = 1;
-            pass1Barriers[1].subresourceRange.layerCount = 1;
-
-            pass1Barriers[2].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            pass1Barriers[2].srcAccessMask = 0;
-            pass1Barriers[2].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            pass1Barriers[2].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            pass1Barriers[2].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            pass1Barriers[2].image = ctx->rawMotionImage;
-            pass1Barriers[2].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            pass1Barriers[2].subresourceRange.levelCount = 1;
-            pass1Barriers[2].subresourceRange.layerCount = 1;
-
-            g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 3, pass1Barriers);
-
-            // Dispatch Pass 1: 360-Degree Motion Field Estimation
-            MotionPushConstants mpc{ static_cast<int>(ctx->extent.width), static_cast<int>(ctx->extent.height) };
-            g_pfnCmdBindPipeline(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->motionPipeline);
-            g_pfnCmdBindDescriptorSets(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->motionPipelineLayout, 0, 1, &slot.motionDescSet, 0, nullptr);
-            g_pfnCmdPushConstants(slot.cmdBuffer, ctx->motionPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mpc), &mpc);
-            g_pfnCmdDispatch(slot.cmdBuffer, mfWidth, mfHeight, 1);
-
-            // Barrier between Pass 1 and Pass 2:
-            // rawMotionImage: SHADER_WRITE -> SHADER_READ
-            // filteredMotionImage: UNDEFINED -> GENERAL (SHADER_WRITE)
-            VkImageMemoryBarrier pass2Barriers[2]{};
-            pass2Barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            pass2Barriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            pass2Barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            pass2Barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            pass2Barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            pass2Barriers[0].image = ctx->rawMotionImage;
-            pass2Barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            pass2Barriers[0].subresourceRange.levelCount = 1;
-            pass2Barriers[0].subresourceRange.layerCount = 1;
-
-            pass2Barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            pass2Barriers[1].srcAccessMask = 0;
-            pass2Barriers[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            pass2Barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            pass2Barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            pass2Barriers[1].image = ctx->filteredMotionImage;
-            pass2Barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            pass2Barriers[1].subresourceRange.levelCount = 1;
-            pass2Barriers[1].subresourceRange.layerCount = 1;
-
-            g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 2, pass2Barriers);
-
-            // Dispatch Pass 2: 3x3 Vector Median Regularization (Eradicates 100% of outlier blocks)
-            FilterPushConstants fpc{ static_cast<int>(mfWidth), static_cast<int>(mfHeight) };
-            g_pfnCmdBindPipeline(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->filterPipeline);
-            g_pfnCmdBindDescriptorSets(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->filterPipelineLayout, 0, 1, &slot.filterDescSet, 0, nullptr);
-            g_pfnCmdPushConstants(slot.cmdBuffer, ctx->filterPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(fpc), &fpc);
-            g_pfnCmdDispatch(slot.cmdBuffer, (mfWidth + 7) / 8, (mfHeight + 7) / 8, 1);
-
-            // Barrier between Pass 2 and Pass 3:
-            // filteredMotionImage: SHADER_WRITE -> SHADER_READ
-            // intermediateIdx: UNDEFINED -> GENERAL (SHADER_WRITE)
-            VkImageMemoryBarrier pass3Barriers[2]{};
-            pass3Barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            pass3Barriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            pass3Barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            pass3Barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            pass3Barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            pass3Barriers[0].image = ctx->filteredMotionImage;
-            pass3Barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            pass3Barriers[0].subresourceRange.levelCount = 1;
-            pass3Barriers[0].subresourceRange.layerCount = 1;
-
-            pass3Barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            pass3Barriers[1].srcAccessMask = 0;
-            pass3Barriers[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            pass3Barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            pass3Barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            pass3Barriers[1].image = ctx->images[intermediateIdx];
-            pass3Barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            pass3Barriers[1].subresourceRange.levelCount = 1;
-            pass3Barriers[1].subresourceRange.layerCount = 1;
-
-            g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 2, pass3Barriers);
-
-            // Dispatch Pass 3: Dense Bilinear Warp & Soft Temporal Blend
             BlendPushConstants pc{
                 0.5f,
                 static_cast<int>(ctx->extent.width),
@@ -1450,44 +991,28 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                 cfg.hud_protection ? 1 : 0,
                 cfg.mode
             };
-            g_pfnCmdBindPipeline(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->blendPipeline);
-            g_pfnCmdBindDescriptorSets(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->blendPipelineLayout, 0, 1, &slot.blendDescSet, 0, nullptr);
             g_pfnCmdPushConstants(slot.cmdBuffer, ctx->blendPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-            g_pfnCmdDispatch(slot.cmdBuffer, mfWidth, mfHeight, 1);
 
-            // Final Barriers: Return all swapchain images to PRESENT_SRC
-            VkImageMemoryBarrier finalBarriers[3]{};
-            finalBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            finalBarriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            finalBarriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-            finalBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            finalBarriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            finalBarriers[0].image = ctx->images[ctx->prevGameIdx];
-            finalBarriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            finalBarriers[0].subresourceRange.levelCount = 1;
-            finalBarriers[0].subresourceRange.layerCount = 1;
+            uint32_t groupX = (ctx->extent.width + 7) / 8;
+            uint32_t groupY = (ctx->extent.height + 7) / 8;
+            g_pfnCmdDispatch(slot.cmdBuffer, groupX, groupY, 1);
 
-            finalBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            finalBarriers[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            finalBarriers[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-            finalBarriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            finalBarriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            finalBarriers[1].image = ctx->images[currentGameIdx];
-            finalBarriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            finalBarriers[1].subresourceRange.levelCount = 1;
-            finalBarriers[1].subresourceRange.layerCount = 1;
+            barriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            barriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+            barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
-            finalBarriers[2].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            finalBarriers[2].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            finalBarriers[2].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-            finalBarriers[2].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            finalBarriers[2].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            finalBarriers[2].image = ctx->images[intermediateIdx];
-            finalBarriers[2].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            finalBarriers[2].subresourceRange.levelCount = 1;
-            finalBarriers[2].subresourceRange.layerCount = 1;
+            barriers[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            barriers[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+            barriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
-            g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 3, finalBarriers);
+            barriers[2].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barriers[2].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+            barriers[2].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barriers[2].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+            g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 3, barriers);
 
             usedBlend = true;
         } else if (g_pfnCmdCopyImage) {
@@ -1567,7 +1092,6 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
 
         // A. Present Intermediate Frame (F_{N-0.5}) IMMEDIATELY at t
         VkPresentInfoKHR interPresent = *pPresentInfo;
-        interPresent.pNext = nullptr;
         interPresent.waitSemaphoreCount = 1;
         interPresent.pWaitSemaphores = &slot.interDoneSemaphore;
         interPresent.swapchainCount = 1;
@@ -1581,7 +1105,6 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
         }
 
         // B. Queue Real Game Frame (F_N) for presentation at t + halfInterval on worker thread
-        uint64_t halfIntervalNs = ctx->pacer.GetTargetPacingDelayNs();
         PendingPresent gameJob;
         gameJob.queue = queue;
         gameJob.swapchain = ctx->swapchain;
@@ -1591,21 +1114,6 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
 
         {
             std::lock_guard<std::mutex> lock(ctx->presentMutex);
-            if (ctx->pendingPresents.size() >= 2) {
-                auto oldJob = ctx->pendingPresents.front();
-                ctx->pendingPresents.pop_front();
-                VkPresentInfoKHR oldPi{};
-                oldPi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-                oldPi.waitSemaphoreCount = (oldJob.waitSemaphore != VK_NULL_HANDLE) ? 1 : 0;
-                oldPi.pWaitSemaphores = (oldJob.waitSemaphore != VK_NULL_HANDLE) ? &oldJob.waitSemaphore : nullptr;
-                oldPi.swapchainCount = 1;
-                oldPi.pSwapchains = &oldJob.swapchain;
-                oldPi.pImageIndices = &oldJob.imageIndex;
-                std::lock_guard<std::mutex> qlock(ctx->queueMutex);
-                if (g_pfnQueuePresentKHR && oldJob.queue != VK_NULL_HANDLE) {
-                    g_pfnQueuePresentKHR(oldJob.queue, &oldPi);
-                }
-            }
             ctx->pendingPresents.push_back(gameJob);
         }
         ctx->presentCv.notify_one();
@@ -1613,11 +1121,12 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
         ctx->prevGameIdx = currentGameIdx;
 
         if (s_presentCount % 120 == 1) {
-            Log("FrameGen ACTIVE: 2x presents paced! Base: %.1f FPS -> Output: %.1f FPS (Display: %d Hz | %s, step: %.1f ms)",
+            Log("FrameGen ACTIVE: 2x presents paced! Base: %.1f FPS -> Output: %.1f FPS (Display: %d Hz | %s, step: %.1f ms / avg: %.1f ms)",
                 ctx->pacer.GetBaseFps(), ctx->pacer.GetOutputFps(),
                 ctx->pacer.GetTargetHz(),
-                usedBlend ? "3-Pass Hierarchical Flow + Median" : "Fallback Copy",
-                static_cast<float>(halfIntervalNs) / 1e6f);
+                usedBlend ? "Compute Motion Blend" : "Fallback Copy",
+                static_cast<float>(halfIntervalNs) / 1e6f,
+                static_cast<float>(ctx->pacer.GetAverageFrameTimeNs()) / 1e6f);
         }
 
         if (s_presentCount % 60 == 1) {
@@ -1632,7 +1141,6 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
     }
 
     // Fallback: If intermediate frame couldn't be acquired, present original frame cleanly
-    DrainPendingPresents(ctx.get());
     ctx->prevGameIdx = currentGameIdx;
     VkResult res = VK_SUCCESS;
     {
