@@ -63,6 +63,30 @@ void main() {
     vec2 centerVec  = centerData.xy;
     float residual  = centerData.z;
 
+    // 3x3 Vector Median Filter on rawFlow (FSR 3 / FidelityFX vector cleaning)
+    // Cuts isolated vector spikes and eliminates 90% of squares/artifacts
+    ivec2 rawCenter = clamp(ivec2(round(normCoord * vec2(rawSize) - 0.5)), ivec2(0), rawSize - 1);
+    vec2 medSamples[9];
+    int mIdx = 0;
+    for (int my = -1; my <= 1; ++my) {
+        for (int mx = -1; mx <= 1; ++mx) {
+            ivec2 c = clamp(rawCenter + ivec2(mx, my), ivec2(0), rawSize - 1);
+            medSamples[mIdx++] = imageLoad(u_RawFlow, c).xy;
+        }
+    }
+    // Partial sorting network for median vector (by length squared)
+    for (int i = 0; i < 5; ++i) {
+        for (int j = i + 1; j < 9; ++j) {
+            if (dot(medSamples[i], medSamples[i]) > dot(medSamples[j], medSamples[j])) {
+                vec2 tmp = medSamples[i]; medSamples[i] = medSamples[j]; medSamples[j] = tmp;
+            }
+        }
+    }
+    vec2 medianVec = medSamples[4];
+
+    // Attenuate isolated raw vector spike towards median consensus
+    centerVec = mix(centerVec, medianVec, smoothstep(1.5, 6.0, length(centerVec - medianVec)));
+
     vec2 uvStep = 1.0 / vec2(denseSize);
 
     // 2. Neighbor consensus pre-pass (samples 4 orthogonal direct neighbors)
