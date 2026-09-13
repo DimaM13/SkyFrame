@@ -297,20 +297,27 @@ static void PresentWorkerLoop(std::shared_ptr<SwapchainContext> ctx) {
             if (!ctx->workerRunning.load()) break;
 
             job = ctx->pendingPresents.front();
+
+            // High precision pacing until targetTime (system sleep to eliminate 100% CPU usage)
+            if (job.targetTime > std::chrono::steady_clock::now()) {
+                ctx->presentCv.wait_until(lock, job.targetTime, [&]() {
+                    return !ctx->workerRunning.load() || ctx->pendingPresents.empty();
+                });
+                if (!ctx->workerRunning.load() || ctx->pendingPresents.empty()) continue;
+            }
+
+            while (std::chrono::steady_clock::now() < job.targetTime) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(_MSC_VER)
+                _mm_pause();
+#else
+                __builtin_ia32_pause();
+#endif
+#endif
+            }
+
+            job = ctx->pendingPresents.front();
             ctx->pendingPresents.pop_front();
-        }
-
-        // Catchup check: if multiple frames backed up during hitch, do not sleep
-        bool hasBacklog = false;
-        {
-            std::lock_guard<std::mutex> lock(ctx->presentMutex);
-            hasBacklog = (ctx->pendingPresents.size() > 0);
-        }
-
-        // High-precision OS kernel sleep (futex / clock_nanosleep) with 0% CPU consumption
-        // Releases CPU core completely so 100% of APU power budget remains with the game
-        if (!hasBacklog && job.targetTime > std::chrono::steady_clock::now()) {
-            std::this_thread::sleep_until(job.targetTime);
         }
 
         VkPresentInfoKHR pi{};

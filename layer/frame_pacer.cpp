@@ -12,12 +12,12 @@ FramePacer::FramePacer() {
 
 void FramePacer::Reset() {
     m_lastBasePresentTime = Clock::now();
-    m_nextBaseAt.reset();
-    m_activeBaseFps = 0.0;
+    m_nextAllowedBaseTime = m_lastBasePresentTime;
     m_avgFrameTimeNs = 33333333;
     m_baseFps = 30.0f;
     m_outputFps = 60.0f;
     m_frameCount = 0;
+    m_firstFrame = true;
     RecalculateDurations();
 }
 
@@ -25,7 +25,6 @@ void FramePacer::SetTargetHz(int hz) {
     if (hz >= 30 && hz <= 240 && hz != m_targetHz) {
         m_targetHz = hz;
         RecalculateDurations();
-        m_nextBaseAt.reset();
     }
 }
 
@@ -35,39 +34,7 @@ void FramePacer::RecalculateDurations() {
     m_baseDurationNs = m_stepDurationNs * 2ULL;
 }
 
-FramePacer::TimePoint FramePacer::Schedule(TimePoint now, double baseFps) {
-    if (!std::isfinite(baseFps) || baseFps <= 0.0) {
-        m_nextBaseAt.reset();
-        m_activeBaseFps = 0.0;
-        return now;
-    }
-
-    if (m_activeBaseFps != baseFps) {
-        m_nextBaseAt.reset();
-        m_activeBaseFps = baseFps;
-    }
-
-    const auto interval = std::chrono::duration_cast<Clock::duration>(
-        std::chrono::duration<double>(1.0 / baseFps)
-    );
-
-    if (!m_nextBaseAt) {
-        m_nextBaseAt = now + interval;
-        return now;
-    }
-
-    // Late frame rebases immediately so a loading stall or lag spike cannot create a burst of catch-up presents
-    if (now >= *m_nextBaseAt) {
-        m_nextBaseAt = now + interval;
-        return now;
-    }
-
-    const auto deadline = *m_nextBaseAt;
-    *m_nextBaseAt += interval;
-    return deadline;
-}
-
-void FramePacer::HighPrecisionSleepUntil(TimePoint targetTime) {
+void FramePacer::HighPrecisionSleepUntil(Clock::time_point targetTime) {
     auto now = Clock::now();
     if (now >= targetTime) return;
 
@@ -91,17 +58,28 @@ void FramePacer::HighPrecisionSleepUntil(TimePoint targetTime) {
 
 void FramePacer::PaceBasePresent() {
     auto now = Clock::now();
-    double baseFpsCap = static_cast<double>(m_targetHz) / 2.0;
-    if (baseFpsCap < 15.0) baseFpsCap = 30.0;
 
-    auto deadline = Schedule(now, baseFpsCap);
-    if (deadline > now) {
-        HighPrecisionSleepUntil(deadline);
+    if (m_firstFrame) {
+        m_lastBasePresentTime = now;
+        m_nextAllowedBaseTime = now + std::chrono::nanoseconds(m_baseDurationNs);
+        m_firstFrame = false;
+        m_frameCount++;
+        return;
+    }
+
+    // Auto VSync Cadence:
+    // If game renders faster than half the display refresh rate (e.g. 40 FPS on a 60 Hz display),
+    // pace the base presentation to exactly T_base (e.g. 33.3ms = 30 FPS).
+    // This guarantees that intermediate and real frames are spaced by EXACTLY 1 VBlank period (16.67ms),
+    // eliminating 3:2 pulldown judder and stutter!
+    if (now < m_nextAllowedBaseTime) {
+        HighPrecisionSleepUntil(m_nextAllowedBaseTime);
         now = Clock::now();
     }
 
     auto elapsedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_lastBasePresentTime).count();
     m_lastBasePresentTime = now;
+    m_nextAllowedBaseTime = now + std::chrono::nanoseconds(m_baseDurationNs);
 
     // Update EMA frametime and FPS stats
     if (elapsedNs >= 2000000 && elapsedNs <= 250000000) {

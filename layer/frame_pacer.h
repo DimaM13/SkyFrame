@@ -4,8 +4,6 @@
 #include <cstdint>
 #include <algorithm>
 #include <thread>
-#include <optional>
-#include <cmath>
 
 namespace skyframe {
 
@@ -39,28 +37,24 @@ public:
 
     int GetTargetHz() const { return m_targetHz; }
 
-    using Clock = std::chrono::steady_clock;
-    using TimePoint = Clock::time_point;
-
-    void HighPrecisionSleepUntil(TimePoint targetTime);
-
 private:
+    using Clock = std::chrono::steady_clock;
+
     int m_targetHz = 60;
     uint64_t m_stepDurationNs = 16666666; // 10^9 / 60
     uint64_t m_baseDurationNs = 33333333; // 2 * stepDuration
 
-    double m_activeBaseFps = 0.0;
-    std::optional<TimePoint> m_nextBaseAt;
-
-    TimePoint m_lastBasePresentTime;
+    Clock::time_point m_lastBasePresentTime;
+    Clock::time_point m_nextAllowedBaseTime;
 
     uint64_t m_avgFrameTimeNs = 33333333; // Default 30 FPS (~33.3ms)
     float m_baseFps = 30.0f;
     float m_outputFps = 60.0f;
     uint64_t m_frameCount = 0;
+    bool m_firstFrame = true;
 
     void RecalculateDurations();
-    TimePoint Schedule(TimePoint now, double baseFps);
+    void HighPrecisionSleepUntil(Clock::time_point targetTime);
 };
 
 } // namespace skyframe

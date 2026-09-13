@@ -5,7 +5,7 @@
     "root"
   ],
   "api_version": 1,
-  "version": "1.3.2",
+  "version": "1.3.3",
   "description": "Native AI Frame Generation for Steam Deck (Vulkan FastWarp + RIFE)",
   "icon": "icon.svg"
 }
