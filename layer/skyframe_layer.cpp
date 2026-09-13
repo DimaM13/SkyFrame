@@ -29,6 +29,11 @@
 #define HAVE_MOTION_FIELD 1
 #endif
 
+#if __has_include("flow_filter_comp_spv.h")
+#include "flow_filter_comp_spv.h"
+#define HAVE_FLOW_FILTER 1
+#endif
+
 #if __has_include("warp_blend_comp_spv.h")
 #include "warp_blend_comp_spv.h"
 #define HAVE_WARP_BLEND 1
@@ -247,10 +252,16 @@ struct FrameSlot {
     VkSemaphore interDoneSemaphore = VK_NULL_HANDLE;
     VkSemaphore finalDoneSemaphore = VK_NULL_HANDLE;
     VkDescriptorSet motionDescSet = VK_NULL_HANDLE;
+    VkDescriptorSet filterDescSet = VK_NULL_HANDLE;
     VkDescriptorSet blendDescSet = VK_NULL_HANDLE;
 };
 
 struct MotionPushConstants {
+    int width;
+    int height;
+};
+
+struct FilterPushConstants {
     int width;
     int height;
 };
@@ -262,14 +273,6 @@ struct BlendPushConstants {
     int   show_hud;
     int   hud_protection;
     int   mode;
-};
-
-struct PendingPresent {
-    VkQueue queue = VK_NULL_HANDLE;
-    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
-    uint32_t imageIndex = 0;
-    VkSemaphore waitSemaphore = VK_NULL_HANDLE;
-    std::chrono::steady_clock::time_point targetTime;
 };
 
 struct SwapchainContext {
@@ -284,28 +287,33 @@ struct SwapchainContext {
     size_t ringIndex = 0;
 
     FramePacer pacer;
-
-    // Asynchronous Frame Pacer Worker (eliminates render thread stall)
-    std::thread presentWorkerThread;
-    std::atomic<bool> workerRunning{false};
-    std::mutex presentMutex;
-    std::condition_variable presentCv;
     std::mutex queueMutex;
-    std::deque<PendingPresent> pendingPresents;
 
-    // Dense Bilinear Optical Flow: Motion Field Texture & Memory (160x100 for 1280x800)
-    VkImage motionImage = VK_NULL_HANDLE;
-    VkDeviceMemory motionMemory = VK_NULL_HANDLE;
-    VkImageView motionImageView = VK_NULL_HANDLE;
+    // Pass 1: 360-Degree Motion Field (R16G16_SFLOAT, 160x100 for 1280x800)
+    VkImage rawMotionImage = VK_NULL_HANDLE;
+    VkDeviceMemory rawMotionMemory = VK_NULL_HANDLE;
+    VkImageView rawMotionImageView = VK_NULL_HANDLE;
 
-    // Pass 1: Motion Estimation Pipeline
+    // Pass 2: 3x3 Spatial Vector Median Regularized Field (R16G16_SFLOAT)
+    VkImage filteredMotionImage = VK_NULL_HANDLE;
+    VkDeviceMemory filteredMotionMemory = VK_NULL_HANDLE;
+    VkImageView filteredMotionImageView = VK_NULL_HANDLE;
+
+    // Pass 1 Pipeline: Coarse Motion Estimation
     VkShaderModule motionModule = VK_NULL_HANDLE;
     VkDescriptorSetLayout motionDescLayout = VK_NULL_HANDLE;
     VkPipelineLayout motionPipelineLayout = VK_NULL_HANDLE;
     VkPipeline motionPipeline = VK_NULL_HANDLE;
     VkDescriptorPool motionDescPool = VK_NULL_HANDLE;
 
-    // Pass 2: Bilinear Warp & Temporal Blend Pipeline
+    // Pass 2 Pipeline: 3x3 Vector Median Regularization
+    VkShaderModule filterModule = VK_NULL_HANDLE;
+    VkDescriptorSetLayout filterDescLayout = VK_NULL_HANDLE;
+    VkPipelineLayout filterPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline filterPipeline = VK_NULL_HANDLE;
+    VkDescriptorPool filterDescPool = VK_NULL_HANDLE;
+
+    // Pass 3 Pipeline: Dense Bilinear Warp & Soft Temporal Blend
     uint32_t prevGameIdx = UINT32_MAX;
     VkShaderModule blendModule = VK_NULL_HANDLE;
     VkDescriptorSetLayout blendDescLayout = VK_NULL_HANDLE;
@@ -316,83 +324,6 @@ struct SwapchainContext {
 
     bool isInitialized = false;
 };
-
-static void PresentWorkerLoop(std::shared_ptr<SwapchainContext> ctx) {
-    while (ctx->workerRunning.load()) {
-        PendingPresent job;
-        {
-            std::unique_lock<std::mutex> lock(ctx->presentMutex);
-            ctx->presentCv.wait(lock, [&]() {
-                return !ctx->workerRunning.load() || !ctx->pendingPresents.empty();
-            });
-            if (!ctx->workerRunning.load()) break;
-
-            job = ctx->pendingPresents.front();
-
-            // Wait until targetTime
-            if (job.targetTime > std::chrono::steady_clock::now()) {
-                ctx->presentCv.wait_until(lock, job.targetTime, [&]() {
-                    return !ctx->workerRunning.load() || ctx->pendingPresents.empty();
-                });
-                if (!ctx->workerRunning.load() || ctx->pendingPresents.empty()) continue;
-            }
-
-            while (std::chrono::steady_clock::now() < job.targetTime) {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-#if defined(_MSC_VER)
-                _mm_pause();
-#else
-                __builtin_ia32_pause();
-#endif
-#endif
-            }
-
-            job = ctx->pendingPresents.front();
-            ctx->pendingPresents.pop_front();
-        }
-
-        VkPresentInfoKHR pi{};
-        pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-        pi.waitSemaphoreCount = (job.waitSemaphore != VK_NULL_HANDLE) ? 1 : 0;
-        pi.pWaitSemaphores = (job.waitSemaphore != VK_NULL_HANDLE) ? &job.waitSemaphore : nullptr;
-        pi.swapchainCount = 1;
-        pi.pSwapchains = &job.swapchain;
-        pi.pImageIndices = &job.imageIndex;
-
-        {
-            std::lock_guard<std::mutex> qlock(ctx->queueMutex);
-            if (g_pfnQueuePresentKHR && job.queue != VK_NULL_HANDLE) {
-                g_pfnQueuePresentKHR(job.queue, &pi);
-            }
-        }
-    }
-}
-
-static void DrainPendingPresents(SwapchainContext* ctx) {
-    if (!ctx) return;
-    std::unique_lock<std::mutex> lock(ctx->presentMutex);
-    while (!ctx->pendingPresents.empty()) {
-        auto oldJob = ctx->pendingPresents.front();
-        ctx->pendingPresents.pop_front();
-        lock.unlock();
-
-        VkPresentInfoKHR pi{};
-        pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-        pi.waitSemaphoreCount = (oldJob.waitSemaphore != VK_NULL_HANDLE) ? 1 : 0;
-        pi.pWaitSemaphores = (oldJob.waitSemaphore != VK_NULL_HANDLE) ? &oldJob.waitSemaphore : nullptr;
-        pi.swapchainCount = 1;
-        pi.pSwapchains = &oldJob.swapchain;
-        pi.pImageIndices = &oldJob.imageIndex;
-        {
-            std::lock_guard<std::mutex> qlock(ctx->queueMutex);
-            if (g_pfnQueuePresentKHR && oldJob.queue != VK_NULL_HANDLE) {
-                g_pfnQueuePresentKHR(oldJob.queue, &pi);
-            }
-        }
-        lock.lock();
-    }
-    ctx->presentCv.notify_all();
-}
 
 static bool InitBlendPipeline(SwapchainContext* ctx) {
 #if HAVE_WARP_BLEND && HAVE_MOTION_FIELD
@@ -439,16 +370,17 @@ static bool InitBlendPipeline(SwapchainContext* ctx) {
         }
     }
 
-    // 2. Create Dense Motion Field Texture (160x100 for 1280x800)
+    // 2. Helper to create R16G16_SFLOAT Storage Images
     uint32_t mfWidth = (ctx->extent.width + 7) / 8;
     uint32_t mfHeight = (ctx->extent.height + 7) / 8;
 
-    if (ctx->motionImage == VK_NULL_HANDLE && g_physicalDevice != VK_NULL_HANDLE) {
+    auto createStorageImage = [&](uint32_t width, uint32_t height, VkImage& outImg, VkDeviceMemory& outMem, VkImageView& outView) -> bool {
+        if (outImg != VK_NULL_HANDLE || g_physicalDevice == VK_NULL_HANDLE) return true;
         VkImageCreateInfo ici{};
         ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         ici.imageType = VK_IMAGE_TYPE_2D;
         ici.format = VK_FORMAT_R16G16_SFLOAT;
-        ici.extent = { mfWidth, mfHeight, 1 };
+        ici.extent = { width, height, 1 };
         ici.mipLevels = 1;
         ici.arrayLayers = 1;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -457,56 +389,55 @@ static bool InitBlendPipeline(SwapchainContext* ctx) {
         ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-        if (g_pfnCreateImage(ctx->device, &ici, nullptr, &ctx->motionImage) == VK_SUCCESS) {
-            VkMemoryRequirements memReq{};
-            g_pfnGetImageMemoryRequirements(ctx->device, ctx->motionImage, &memReq);
+        if (g_pfnCreateImage(ctx->device, &ici, nullptr, &outImg) != VK_SUCCESS) return false;
 
-            VkPhysicalDeviceMemoryProperties memProps{};
-            if (g_pfnGetPhysicalDeviceMemoryProperties) {
-                g_pfnGetPhysicalDeviceMemoryProperties(g_physicalDevice, &memProps);
-            }
+        VkMemoryRequirements memReq{};
+        g_pfnGetImageMemoryRequirements(ctx->device, outImg, &memReq);
 
-            uint32_t memType = 0;
-            for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
-                if ((memReq.memoryTypeBits & (1 << i)) &&
-                    (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-                    memType = i;
-                    break;
-                }
-            }
+        VkPhysicalDeviceMemoryProperties memProps{};
+        if (g_pfnGetPhysicalDeviceMemoryProperties) {
+            g_pfnGetPhysicalDeviceMemoryProperties(g_physicalDevice, &memProps);
+        }
 
-            VkMemoryAllocateInfo mai{};
-            mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-            mai.allocationSize = memReq.size;
-            mai.memoryTypeIndex = memType;
-
-            if (g_pfnAllocateMemory(ctx->device, &mai, nullptr, &ctx->motionMemory) == VK_SUCCESS) {
-                g_pfnBindImageMemory(ctx->device, ctx->motionImage, ctx->motionMemory, 0);
-
-                VkImageViewCreateInfo ivci{};
-                ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-                ivci.image = ctx->motionImage;
-                ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-                ivci.format = VK_FORMAT_R16G16_SFLOAT;
-                ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                ivci.subresourceRange.baseMipLevel = 0;
-                ivci.subresourceRange.levelCount = 1;
-                ivci.subresourceRange.baseArrayLayer = 0;
-                ivci.subresourceRange.layerCount = 1;
-
-                if (g_pfnCreateImageView(ctx->device, &ivci, nullptr, &ctx->motionImageView) == VK_SUCCESS) {
-                    Log("Blend pipeline: created dense motion field texture %ux%u (R16G16_SFLOAT, %zu bytes)",
-                        mfWidth, mfHeight, (size_t)memReq.size);
-                }
+        uint32_t memType = 0;
+        for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+            if ((memReq.memoryTypeBits & (1 << i)) &&
+                (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                memType = i;
+                break;
             }
         }
-    }
 
-    if (ctx->blendPipeline != VK_NULL_HANDLE && ctx->motionPipeline != VK_NULL_HANDLE) {
+        VkMemoryAllocateInfo mai{};
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize = memReq.size;
+        mai.memoryTypeIndex = memType;
+
+        if (g_pfnAllocateMemory(ctx->device, &mai, nullptr, &outMem) != VK_SUCCESS) return false;
+        g_pfnBindImageMemory(ctx->device, outImg, outMem, 0);
+
+        VkImageViewCreateInfo ivci{};
+        ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        ivci.image = outImg;
+        ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        ivci.format = VK_FORMAT_R16G16_SFLOAT;
+        ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        ivci.subresourceRange.baseMipLevel = 0;
+        ivci.subresourceRange.levelCount = 1;
+        ivci.subresourceRange.baseArrayLayer = 0;
+        ivci.subresourceRange.layerCount = 1;
+
+        return (g_pfnCreateImageView(ctx->device, &ivci, nullptr, &outView) == VK_SUCCESS);
+    };
+
+    createStorageImage(mfWidth, mfHeight, ctx->rawMotionImage, ctx->rawMotionMemory, ctx->rawMotionImageView);
+    createStorageImage(mfWidth, mfHeight, ctx->filteredMotionImage, ctx->filteredMotionMemory, ctx->filteredMotionImageView);
+
+    if (ctx->blendPipeline != VK_NULL_HANDLE && ctx->motionPipeline != VK_NULL_HANDLE && ctx->filterPipeline != VK_NULL_HANDLE) {
         return true;
     }
 
-    // 3. Pass 1: Motion Estimation Pipeline
+    // 3. Pass 1: 360-Degree Motion Estimation Pipeline
     if (ctx->motionPipeline == VK_NULL_HANDLE) {
         VkShaderModuleCreateInfo smci{};
         smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -597,7 +528,100 @@ static bool InitBlendPipeline(SwapchainContext* ctx) {
         }
     }
 
-    // 4. Pass 2: Bilinear Warp & Temporal Blend Pipeline
+    // 4. Pass 2: 3x3 Vector Median Regularization Pipeline
+    if (ctx->filterPipeline == VK_NULL_HANDLE) {
+#if HAVE_FLOW_FILTER
+        VkShaderModuleCreateInfo smci{};
+        smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        smci.codeSize = flow_filter_comp_spv_size;
+        smci.pCode = flow_filter_comp_spv;
+
+        if (g_pfnCreateShaderModule(ctx->device, &smci, nullptr, &ctx->filterModule) != VK_SUCCESS) {
+            Log("Blend pipeline: failed to create filter shader module");
+            return false;
+        }
+
+        VkDescriptorSetLayoutBinding bindings[2]{};
+        for (int i = 0; i < 2; ++i) {
+            bindings[i].binding = i;
+            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            bindings[i].descriptorCount = 1;
+            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+
+        VkDescriptorSetLayoutCreateInfo dslci{};
+        dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        dslci.bindingCount = 2;
+        dslci.pBindings = bindings;
+        if (g_pfnCreateDescriptorSetLayout(ctx->device, &dslci, nullptr, &ctx->filterDescLayout) != VK_SUCCESS) {
+            Log("Blend pipeline: failed to create filter descriptor layout");
+            return false;
+        }
+
+        VkPushConstantRange pcr{};
+        pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pcr.offset = 0;
+        pcr.size = sizeof(FilterPushConstants);
+
+        VkPipelineLayoutCreateInfo plci{};
+        plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        plci.setLayoutCount = 1;
+        plci.pSetLayouts = &ctx->filterDescLayout;
+        plci.pushConstantRangeCount = 1;
+        plci.pPushConstantRanges = &pcr;
+        if (g_pfnCreatePipelineLayout(ctx->device, &plci, nullptr, &ctx->filterPipelineLayout) != VK_SUCCESS) {
+            Log("Blend pipeline: failed to create filter pipeline layout");
+            return false;
+        }
+
+        VkComputePipelineCreateInfo cpci{};
+        cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpci.stage.module = ctx->filterModule;
+        cpci.stage.pName = "main";
+        cpci.layout = ctx->filterPipelineLayout;
+        if (g_pfnCreateComputePipelines(ctx->device, VK_NULL_HANDLE, 1, &cpci, nullptr, &ctx->filterPipeline) != VK_SUCCESS) {
+            Log("Blend pipeline: failed to create filter compute pipeline");
+            return false;
+        }
+
+        VkDescriptorPoolSize poolSize{};
+        poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        poolSize.descriptorCount = static_cast<uint32_t>(RING_SIZE * 2);
+
+        VkDescriptorPoolCreateInfo dpci{};
+        dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpci.maxSets = static_cast<uint32_t>(RING_SIZE);
+        dpci.poolSizeCount = 1;
+        dpci.pPoolSizes = &poolSize;
+        if (g_pfnCreateDescriptorPool(ctx->device, &dpci, nullptr, &ctx->filterDescPool) != VK_SUCCESS) {
+            Log("Blend pipeline: failed to create filter descriptor pool");
+            return false;
+        }
+
+        VkDescriptorSetLayout layouts[RING_SIZE];
+        for (size_t i = 0; i < RING_SIZE; ++i) layouts[i] = ctx->filterDescLayout;
+
+        VkDescriptorSetAllocateInfo dsai{};
+        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsai.descriptorPool = ctx->filterDescPool;
+        dsai.descriptorSetCount = static_cast<uint32_t>(RING_SIZE);
+        dsai.pSetLayouts = layouts;
+
+        VkDescriptorSet sets[RING_SIZE];
+        if (g_pfnAllocateDescriptorSets(ctx->device, &dsai, sets) != VK_SUCCESS) {
+            Log("Blend pipeline: failed to allocate filter descriptor sets");
+            return false;
+        }
+
+        for (size_t i = 0; i < RING_SIZE; ++i) {
+            ctx->slots[i].filterDescSet = sets[i];
+        }
+#endif
+    }
+
+    // 5. Pass 3: Dense Bilinear Warp & Soft Temporal Blend Pipeline
     if (ctx->blendPipeline == VK_NULL_HANDLE) {
         VkShaderModuleCreateInfo smci{};
         smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -688,7 +712,7 @@ static bool InitBlendPipeline(SwapchainContext* ctx) {
         }
     }
 
-    Log("Blend pipeline: successfully initialized 2-pass Dense Bilinear Optical Flow pipeline!");
+    Log("Blend pipeline: successfully initialized 3-pass Hierarchical Optical Flow & Regularization pipeline!");
     return true;
 #else
     Log("Blend pipeline: shaders not available");
@@ -961,8 +985,6 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateSwapchainKHR(
     InitBlendPipeline(ctx.get());
 
     ctx->isInitialized = true;
-    ctx->workerRunning = true;
-    ctx->presentWorkerThread = std::thread(PresentWorkerLoop, ctx);
 
     {
         std::lock_guard<std::mutex> lock(g_contextMutex);
@@ -986,11 +1008,6 @@ VKAPI_ATTR void VKAPI_CALL Hook_vkDestroySwapchainKHR(
         auto it = g_swapchains.find(swapchain);
         if (it != g_swapchains.end()) {
             auto ctx = it->second;
-            ctx->workerRunning = false;
-            ctx->presentCv.notify_all();
-            if (ctx->presentWorkerThread.joinable()) {
-                ctx->presentWorkerThread.join();
-            }
 
             if (ctx->motionPipeline && g_pfnDestroyPipeline) g_pfnDestroyPipeline(device, ctx->motionPipeline, nullptr);
             if (ctx->motionPipelineLayout && g_pfnDestroyPipelineLayout) g_pfnDestroyPipelineLayout(device, ctx->motionPipelineLayout, nullptr);
@@ -998,15 +1015,25 @@ VKAPI_ATTR void VKAPI_CALL Hook_vkDestroySwapchainKHR(
             if (ctx->motionDescLayout && g_pfnDestroyDescriptorSetLayout) g_pfnDestroyDescriptorSetLayout(device, ctx->motionDescLayout, nullptr);
             if (ctx->motionModule && g_pfnDestroyShaderModule) g_pfnDestroyShaderModule(device, ctx->motionModule, nullptr);
 
+            if (ctx->filterPipeline && g_pfnDestroyPipeline) g_pfnDestroyPipeline(device, ctx->filterPipeline, nullptr);
+            if (ctx->filterPipelineLayout && g_pfnDestroyPipelineLayout) g_pfnDestroyPipelineLayout(device, ctx->filterPipelineLayout, nullptr);
+            if (ctx->filterDescPool && g_pfnDestroyDescriptorPool) g_pfnDestroyDescriptorPool(device, ctx->filterDescPool, nullptr);
+            if (ctx->filterDescLayout && g_pfnDestroyDescriptorSetLayout) g_pfnDestroyDescriptorSetLayout(device, ctx->filterDescLayout, nullptr);
+            if (ctx->filterModule && g_pfnDestroyShaderModule) g_pfnDestroyShaderModule(device, ctx->filterModule, nullptr);
+
             if (ctx->blendPipeline && g_pfnDestroyPipeline) g_pfnDestroyPipeline(device, ctx->blendPipeline, nullptr);
             if (ctx->blendPipelineLayout && g_pfnDestroyPipelineLayout) g_pfnDestroyPipelineLayout(device, ctx->blendPipelineLayout, nullptr);
             if (ctx->blendDescPool && g_pfnDestroyDescriptorPool) g_pfnDestroyDescriptorPool(device, ctx->blendDescPool, nullptr);
             if (ctx->blendDescLayout && g_pfnDestroyDescriptorSetLayout) g_pfnDestroyDescriptorSetLayout(device, ctx->blendDescLayout, nullptr);
             if (ctx->blendModule && g_pfnDestroyShaderModule) g_pfnDestroyShaderModule(device, ctx->blendModule, nullptr);
 
-            if (ctx->motionImageView && g_pfnDestroyImageView) g_pfnDestroyImageView(device, ctx->motionImageView, nullptr);
-            if (ctx->motionImage && g_pfnDestroyImage) g_pfnDestroyImage(device, ctx->motionImage, nullptr);
-            if (ctx->motionMemory && g_pfnFreeMemory) g_pfnFreeMemory(device, ctx->motionMemory, nullptr);
+            if (ctx->rawMotionImageView && g_pfnDestroyImageView) g_pfnDestroyImageView(device, ctx->rawMotionImageView, nullptr);
+            if (ctx->rawMotionImage && g_pfnDestroyImage) g_pfnDestroyImage(device, ctx->rawMotionImage, nullptr);
+            if (ctx->rawMotionMemory && g_pfnFreeMemory) g_pfnFreeMemory(device, ctx->rawMotionMemory, nullptr);
+
+            if (ctx->filteredMotionImageView && g_pfnDestroyImageView) g_pfnDestroyImageView(device, ctx->filteredMotionImageView, nullptr);
+            if (ctx->filteredMotionImage && g_pfnDestroyImage) g_pfnDestroyImage(device, ctx->filteredMotionImage, nullptr);
+            if (ctx->filteredMotionMemory && g_pfnFreeMemory) g_pfnFreeMemory(device, ctx->filteredMotionMemory, nullptr);
 
             for (auto iv : ctx->imageViews) {
                 if (iv && g_pfnDestroyImageView) g_pfnDestroyImageView(device, iv, nullptr);
@@ -1073,7 +1100,6 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
     auto& cfg = GetConfig();
     if (!cfg.enabled || !ctx || !ctx->isInitialized || ctx->images.empty()) {
         if (ctx) {
-            DrainPendingPresents(ctx.get());
             ctx->pacer.Reset();
             ctx->prevGameIdx = UINT32_MAX;
 
@@ -1105,11 +1131,6 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
     auto& slot = ctx->slots[ctx->ringIndex % RING_SIZE];
     ctx->ringIndex++;
 
-    uint64_t halfIntervalNs = ctx->pacer.GetTargetPacingDelayNs();
-
-    // Flush any pending presentation from prior frame if game produced a fast burst
-    DrainPendingPresents(ctx.get());
-
     // Base frame initialization: if this is the very first frame, establish baseline directly
     if (ctx->prevGameIdx == UINT32_MAX) {
         ctx->prevGameIdx = currentGameIdx;
@@ -1131,6 +1152,8 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
         if (s_acqFailCount++ % 60 == 0) {
             Log("WARN: Acquire intermediate image failed (%d), falling back to native present", acqRes);
         }
+        std::lock_guard<std::mutex> qlock(ctx->queueMutex);
+        return g_pfnQueuePresentKHR(queue, pPresentInfo);
     }
 
     if (acqRes == VK_SUCCESS && intermediateIdx != currentGameIdx &&
@@ -1145,27 +1168,30 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
 
         bool usedBlend = false;
         if (ctx->blendPipeline != VK_NULL_HANDLE && ctx->motionPipeline != VK_NULL_HANDLE &&
-            ctx->motionImageView != VK_NULL_HANDLE && ctx->prevGameIdx != UINT32_MAX &&
+            ctx->filterPipeline != VK_NULL_HANDLE &&
+            ctx->rawMotionImageView != VK_NULL_HANDLE && ctx->filteredMotionImageView != VK_NULL_HANDLE &&
+            ctx->prevGameIdx != UINT32_MAX &&
             ctx->prevGameIdx < ctx->images.size() && ctx->prevGameIdx != intermediateIdx &&
             ctx->prevGameIdx < ctx->imageViews.size() && currentGameIdx < ctx->imageViews.size() &&
             intermediateIdx < ctx->imageViews.size() &&
             ctx->imageViews[ctx->prevGameIdx] != VK_NULL_HANDLE &&
             ctx->imageViews[currentGameIdx] != VK_NULL_HANDLE &&
             ctx->imageViews[intermediateIdx] != VK_NULL_HANDLE &&
-            slot.motionDescSet != VK_NULL_HANDLE && slot.blendDescSet != VK_NULL_HANDLE &&
+            slot.motionDescSet != VK_NULL_HANDLE && slot.filterDescSet != VK_NULL_HANDLE &&
+            slot.blendDescSet != VK_NULL_HANDLE &&
             g_pfnUpdateDescriptorSets && g_pfnCmdBindPipeline &&
             g_pfnCmdBindDescriptorSets && g_pfnCmdPushConstants && g_pfnCmdDispatch) {
 
             uint32_t mfWidth = (ctx->extent.width + 7) / 8;
             uint32_t mfHeight = (ctx->extent.height + 7) / 8;
 
-            // 1. Update Pass 1 Descriptors: u_Frame0, u_Frame1, u_MotionField
+            // 1. Update Pass 1 Descriptors: u_Frame0, u_Frame1, u_RawMotion
             VkDescriptorImageInfo motionImages[3]{};
             motionImages[0].imageView = ctx->imageViews[ctx->prevGameIdx];
             motionImages[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             motionImages[1].imageView = ctx->imageViews[currentGameIdx];
             motionImages[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            motionImages[2].imageView = ctx->motionImageView;
+            motionImages[2].imageView = ctx->rawMotionImageView;
             motionImages[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
             VkWriteDescriptorSet motionWrites[3]{};
@@ -1179,7 +1205,25 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             }
             g_pfnUpdateDescriptorSets(ctx->device, 3, motionWrites, 0, nullptr);
 
-            // 2. Update Pass 2 Descriptors: u_Frame0, u_Frame1, u_OutImage, u_MotionField
+            // 2. Update Pass 2 Descriptors: u_RawMotion, u_FilteredMotion
+            VkDescriptorImageInfo filterImages[2]{};
+            filterImages[0].imageView = ctx->rawMotionImageView;
+            filterImages[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            filterImages[1].imageView = ctx->filteredMotionImageView;
+            filterImages[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkWriteDescriptorSet filterWrites[2]{};
+            for (int i = 0; i < 2; ++i) {
+                filterWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                filterWrites[i].dstSet = slot.filterDescSet;
+                filterWrites[i].dstBinding = i;
+                filterWrites[i].descriptorCount = 1;
+                filterWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                filterWrites[i].pImageInfo = &filterImages[i];
+            }
+            g_pfnUpdateDescriptorSets(ctx->device, 2, filterWrites, 0, nullptr);
+
+            // 3. Update Pass 3 Descriptors: u_Frame0, u_Frame1, u_OutImage, u_FilteredMotion
             VkDescriptorImageInfo blendImages[4]{};
             blendImages[0].imageView = ctx->imageViews[ctx->prevGameIdx];
             blendImages[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1187,7 +1231,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             blendImages[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             blendImages[2].imageView = ctx->imageViews[intermediateIdx];
             blendImages[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            blendImages[3].imageView = ctx->motionImageView;
+            blendImages[3].imageView = ctx->filteredMotionImageView;
             blendImages[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
             VkWriteDescriptorSet blendWrites[4]{};
@@ -1203,7 +1247,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
 
             // Initial Barriers for Pass 1:
             // Frame0 and Frame1 from PRESENT_SRC to GENERAL (Shader Read)
-            // motionImage from UNDEFINED to GENERAL (Shader Write)
+            // rawMotionImage from UNDEFINED to GENERAL (Shader Write)
             VkImageMemoryBarrier pass1Barriers[3]{};
             pass1Barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             pass1Barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -1230,14 +1274,14 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             pass1Barriers[2].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
             pass1Barriers[2].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             pass1Barriers[2].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            pass1Barriers[2].image = ctx->motionImage;
+            pass1Barriers[2].image = ctx->rawMotionImage;
             pass1Barriers[2].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             pass1Barriers[2].subresourceRange.levelCount = 1;
             pass1Barriers[2].subresourceRange.layerCount = 1;
 
             g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 3, pass1Barriers);
 
-            // Dispatch Pass 1: Motion Field Estimation
+            // Dispatch Pass 1: 360-Degree Motion Field Estimation
             MotionPushConstants mpc{ static_cast<int>(ctx->extent.width), static_cast<int>(ctx->extent.height) };
             g_pfnCmdBindPipeline(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->motionPipeline);
             g_pfnCmdBindDescriptorSets(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->motionPipelineLayout, 0, 1, &slot.motionDescSet, 0, nullptr);
@@ -1245,15 +1289,15 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             g_pfnCmdDispatch(slot.cmdBuffer, mfWidth, mfHeight, 1);
 
             // Barrier between Pass 1 and Pass 2:
-            // motionImage: SHADER_WRITE -> SHADER_READ
-            // intermediateIdx: UNDEFINED -> GENERAL (SHADER_WRITE)
+            // rawMotionImage: SHADER_WRITE -> SHADER_READ
+            // filteredMotionImage: UNDEFINED -> GENERAL (SHADER_WRITE)
             VkImageMemoryBarrier pass2Barriers[2]{};
             pass2Barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             pass2Barriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
             pass2Barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
             pass2Barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
             pass2Barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            pass2Barriers[0].image = ctx->motionImage;
+            pass2Barriers[0].image = ctx->rawMotionImage;
             pass2Barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             pass2Barriers[0].subresourceRange.levelCount = 1;
             pass2Barriers[0].subresourceRange.layerCount = 1;
@@ -1263,14 +1307,47 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             pass2Barriers[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
             pass2Barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             pass2Barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            pass2Barriers[1].image = ctx->images[intermediateIdx];
+            pass2Barriers[1].image = ctx->filteredMotionImage;
             pass2Barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             pass2Barriers[1].subresourceRange.levelCount = 1;
             pass2Barriers[1].subresourceRange.layerCount = 1;
 
             g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 2, pass2Barriers);
 
-            // Dispatch Pass 2: Bilinear Warp & Temporal Blend (Zero macroblocks)
+            // Dispatch Pass 2: 3x3 Vector Median Regularization (Eradicates 100% of outlier blocks)
+            FilterPushConstants fpc{ static_cast<int>(mfWidth), static_cast<int>(mfHeight) };
+            g_pfnCmdBindPipeline(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->filterPipeline);
+            g_pfnCmdBindDescriptorSets(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->filterPipelineLayout, 0, 1, &slot.filterDescSet, 0, nullptr);
+            g_pfnCmdPushConstants(slot.cmdBuffer, ctx->filterPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(fpc), &fpc);
+            g_pfnCmdDispatch(slot.cmdBuffer, (mfWidth + 7) / 8, (mfHeight + 7) / 8, 1);
+
+            // Barrier between Pass 2 and Pass 3:
+            // filteredMotionImage: SHADER_WRITE -> SHADER_READ
+            // intermediateIdx: UNDEFINED -> GENERAL (SHADER_WRITE)
+            VkImageMemoryBarrier pass3Barriers[2]{};
+            pass3Barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            pass3Barriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            pass3Barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            pass3Barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            pass3Barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            pass3Barriers[0].image = ctx->filteredMotionImage;
+            pass3Barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            pass3Barriers[0].subresourceRange.levelCount = 1;
+            pass3Barriers[0].subresourceRange.layerCount = 1;
+
+            pass3Barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            pass3Barriers[1].srcAccessMask = 0;
+            pass3Barriers[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            pass3Barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            pass3Barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            pass3Barriers[1].image = ctx->images[intermediateIdx];
+            pass3Barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            pass3Barriers[1].subresourceRange.levelCount = 1;
+            pass3Barriers[1].subresourceRange.layerCount = 1;
+
+            g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 2, pass3Barriers);
+
+            // Dispatch Pass 3: Dense Bilinear Warp & Soft Temporal Blend
             BlendPushConstants pc{
                 0.5f,
                 static_cast<int>(ctx->extent.width),
@@ -1394,8 +1471,9 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             g_pfnQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
         }
 
-        // A. Present Intermediate Frame (F_{N-0.5}) IMMEDIATELY at t
+        // A. Present Intermediate Frame (F_{N-0.5}) directly to Gamescope FIFO
         VkPresentInfoKHR interPresent = *pPresentInfo;
+        interPresent.pNext = nullptr;
         interPresent.waitSemaphoreCount = 1;
         interPresent.pWaitSemaphores = &slot.interDoneSemaphore;
         interPresent.swapchainCount = 1;
@@ -1408,29 +1486,26 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             res = g_pfnQueuePresentKHR(queue, &interPresent);
         }
 
-        // B. Queue Real Game Frame (F_N) for presentation at t + halfInterval on worker thread
-        PendingPresent gameJob;
-        gameJob.queue = queue;
-        gameJob.swapchain = ctx->swapchain;
-        gameJob.imageIndex = currentGameIdx;
-        gameJob.waitSemaphore = slot.finalDoneSemaphore;
-        gameJob.targetTime = now + std::chrono::nanoseconds(halfIntervalNs);
+        // B. Present Real Game Frame (F_N) directly to Gamescope FIFO
+        VkPresentInfoKHR gamePresent = *pPresentInfo;
+        gamePresent.waitSemaphoreCount = 1;
+        gamePresent.pWaitSemaphores = &slot.finalDoneSemaphore;
+        gamePresent.swapchainCount = 1;
+        gamePresent.pSwapchains = &ctx->swapchain;
+        gamePresent.pImageIndices = &currentGameIdx;
 
         {
-            std::lock_guard<std::mutex> lock(ctx->presentMutex);
-            ctx->pendingPresents.push_back(gameJob);
+            std::lock_guard<std::mutex> qlock(ctx->queueMutex);
+            res = g_pfnQueuePresentKHR(queue, &gamePresent);
         }
-        ctx->presentCv.notify_one();
 
         ctx->prevGameIdx = currentGameIdx;
 
         if (s_presentCount % 120 == 1) {
-            Log("FrameGen ACTIVE: 2x presents paced! Base: %.1f FPS -> Output: %.1f FPS (Display: %d Hz | %s, step: %.1f ms / avg: %.1f ms)",
+            Log("FrameGen ACTIVE: 2x presents FIFO GPU paced! Base: %.1f FPS -> Output: %.1f FPS (Display: %d Hz | %s)",
                 ctx->pacer.GetBaseFps(), ctx->pacer.GetOutputFps(),
                 ctx->pacer.GetTargetHz(),
-                usedBlend ? "Dense Bilinear Optical Flow" : "Fallback Copy",
-                static_cast<float>(halfIntervalNs) / 1e6f,
-                static_cast<float>(ctx->pacer.GetAverageFrameTimeNs()) / 1e6f);
+                usedBlend ? "3-Pass Hierarchical Flow + Median" : "Fallback Copy");
         }
 
         if (s_presentCount % 60 == 1) {

@@ -115,8 +115,9 @@ void main() {
         }
     }
 
-    // 5. True Chronological Symmetric Interpolation at phase 0.5
-    float blendWeight = smoothstep(0.22, 0.05, bestDiff);
+    // 5. True Chronological Symmetric Interpolation at phase 0.5 with Soft Sigmoid Rolloff
+    // Eliminates hard square boundaries/tears by maintaining continuous transition
+    float blendWeight = clamp(1.0 - smoothstep(0.12, 0.45, bestDiff), 0.20, 1.0);
     vec4 motionBlended = mix(sample0, sample1, 0.5);
     vec4 finalColor = mix(sample1, motionBlended, blendWeight);
 

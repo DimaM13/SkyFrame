@@ -18,33 +18,24 @@ float getLuma(vec3 c) {
     return dot(c, vec3(0.299, 0.587, 0.114));
 }
 
-// 64 motion candidates covering radii 0, 1, 2, 4, 8, 14, 24, 36, 48 px
+// 64 motion candidates covering uniform 360-degree directions across 7 speed radii (2, 5, 9, 15, 23, 34, 48 px)
 const ivec2 kCandidates[64] = ivec2[64](
-    ivec2(0, 0),
-    // Radius 1
-    ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1),
-    // Radius 2
-    ivec2(-2, 0), ivec2(2, 0), ivec2(0, -2), ivec2(0, 2),
-    ivec2(-2, -2), ivec2(2, -2), ivec2(-2, 2), ivec2(2, 2),
-    // Radius 4
-    ivec2(-4, 0), ivec2(4, 0), ivec2(0, -4), ivec2(0, 4),
-    ivec2(-4, -4), ivec2(4, -4), ivec2(-4, 4), ivec2(4, 4),
-    // Radius 8
-    ivec2(-8, 0), ivec2(8, 0), ivec2(0, -8), ivec2(0, 8),
-    ivec2(-8, -8), ivec2(8, -8), ivec2(-8, 8), ivec2(8, 8),
-    // Radius 14
-    ivec2(-14, 0), ivec2(14, 0), ivec2(0, -14), ivec2(0, 14),
-    ivec2(-14, -8), ivec2(14, -8), ivec2(-14, 8), ivec2(14, 8),
-    ivec2(-8, -14), ivec2(8, -14), ivec2(-8, 14), ivec2(8, 14),
-    // Radius 24
-    ivec2(-24, 0), ivec2(24, 0), ivec2(0, -24), ivec2(0, 24),
-    ivec2(-24, -14), ivec2(24, -14), ivec2(-24, 14), ivec2(24, 14),
-    // Radius 36
-    ivec2(-36, 0), ivec2(36, 0), ivec2(0, -36), ivec2(0, 36),
-    ivec2(-36, -20), ivec2(36, -20), ivec2(-36, 20), ivec2(36, 20),
-    // Radius 48
-    ivec2(-48, 0), ivec2(48, 0), ivec2(0, -48), ivec2(0, 48),
-    ivec2(-48, -24), ivec2(48, -24), ivec2(-48, 24)
+    ivec2(0, 0), ivec2(2, 0), ivec2(2, 1), ivec2(0, 2),
+    ivec2(-1, 2), ivec2(-2, 1), ivec2(-2, -1), ivec2(-1, -2),
+    ivec2(0, -2), ivec2(2, -1), ivec2(5, 0), ivec2(4, 3),
+    ivec2(1, 5), ivec2(-2, 4), ivec2(-5, 2), ivec2(-5, -2),
+    ivec2(-3, -4), ivec2(1, -5), ivec2(4, -3), ivec2(9, 0),
+    ivec2(7, 6), ivec2(2, 9), ivec2(-4, 8), ivec2(-8, 3),
+    ivec2(-8, -3), ivec2(-5, -8), ivec2(2, -9), ivec2(7, -6),
+    ivec2(15, 0), ivec2(11, 10), ivec2(3, 15), ivec2(-7, 13),
+    ivec2(-14, 5), ivec2(-14, -5), ivec2(-8, -13), ivec2(3, -15),
+    ivec2(11, -10), ivec2(23, 0), ivec2(18, 15), ivec2(4, 23),
+    ivec2(-11, 20), ivec2(-22, 8), ivec2(-22, -8), ivec2(-12, -20),
+    ivec2(4, -23), ivec2(18, -15), ivec2(34, 0), ivec2(26, 22),
+    ivec2(6, 33), ivec2(-17, 29), ivec2(-32, 12), ivec2(-32, -12),
+    ivec2(-17, -29), ivec2(6, -33), ivec2(26, -22), ivec2(48, 0),
+    ivec2(37, 31), ivec2(8, 47), ivec2(-24, 42), ivec2(-45, 16),
+    ivec2(-45, -16), ivec2(-24, -42), ivec2(8, -47), ivec2(37, -31)
 );
 
 // 16 sample points uniformly covering the 8x8 block (4x4 grid)
