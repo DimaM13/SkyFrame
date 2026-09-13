@@ -5,7 +5,7 @@
     "root"
   ],
   "api_version": 1,
-  "version": "1.8.5",
-  "description": "Native Frame Generation for Steam Deck (3x3 Vector Median Cleaning & Symmetric Bidirectional Warping)",
+  "version": "1.9.0",
+  "description": "Native Frame Generation for Steam Deck (LSFG Neural Engine & SkyFrame DIS Native)",
   "icon": "icon.svg"
 }

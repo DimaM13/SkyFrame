@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
-project(SkyFrame VERSION 1.8.5 LANGUAGES CXX C)
+project(SkyFrame VERSION 1.9.0 LANGUAGES CXX C)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
@@ -76,3 +76,10 @@ configure_file(
     ${CMAKE_CURRENT_BINARY_DIR}/vk_layer_skyframe.json
     @ONLY
 )
+
+# LSFG Neural Engine (Lossless Scaling backend and layer)
+option(BUILD_LSFG "Build LSFG Neural Engine" ON)
+if(BUILD_LSFG)
+    add_subdirectory(engine/lsfg)
+endif()
+
