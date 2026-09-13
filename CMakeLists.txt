@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(SkyFrame VERSION 1.2.1 LANGUAGES CXX C)
+project(SkyFrame VERSION 1.2.2 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,6 +12,7 @@ set(SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 set(SHADER_SOURCES
     "${SHADER_DIR}/warp_rgba.comp"
     "${SHADER_DIR}/downsample.comp"
+    "${SHADER_DIR}/motion_field.comp"
     "${SHADER_DIR}/warp_blend.comp"
 )
 
