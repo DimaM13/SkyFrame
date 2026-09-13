@@ -1,0 +1,125 @@
+#version 450
+layout(local_size_x = 4, local_size_y = 4) in;
+
+layout(binding = 0, rgba8) uniform readonly image2D u_Frame0;
+layout(binding = 1, rgba8) uniform readonly image2D u_Frame1;
+layout(binding = 2, rgba16f) uniform writeonly image2D u_MotionField;
+
+layout(push_constant) uniform MotionPushConstants {
+    int width;
+    int height;
+} pc;
+
+shared float s_candSAD[64];
+shared int   s_candIdx[64];
+shared ivec2 s_bestVec;
+shared float s_zeroSAD;
+
+float getLuma(vec3 c) {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+// 64 motion candidates covering uniform 360-degree directions across 7 speed radii (2, 5, 9, 15, 23, 34, 48 px)
+const ivec2 kCandidates[64] = ivec2[64](
+    ivec2(0, 0), ivec2(2, 0), ivec2(2, 1), ivec2(0, 2),
+    ivec2(-1, 2), ivec2(-2, 1), ivec2(-2, -1), ivec2(-1, -2),
+    ivec2(0, -2), ivec2(2, -1), ivec2(5, 0), ivec2(4, 3),
+    ivec2(1, 5), ivec2(-2, 4), ivec2(-5, 2), ivec2(-5, -2),
+    ivec2(-3, -4), ivec2(1, -5), ivec2(4, -3), ivec2(9, 0),
+    ivec2(7, 6), ivec2(2, 9), ivec2(-4, 8), ivec2(-8, 3),
+    ivec2(-8, -3), ivec2(-5, -8), ivec2(2, -9), ivec2(7, -6),
+    ivec2(15, 0), ivec2(11, 10), ivec2(3, 15), ivec2(-7, 13),
+    ivec2(-14, 5), ivec2(-14, -5), ivec2(-8, -13), ivec2(3, -15),
+    ivec2(11, -10), ivec2(23, 0), ivec2(18, 15), ivec2(4, 23),
+    ivec2(-11, 20), ivec2(-22, 8), ivec2(-22, -8), ivec2(-12, -20),
+    ivec2(4, -23), ivec2(18, -15), ivec2(34, 0), ivec2(26, 22),
+    ivec2(6, 33), ivec2(-17, 29), ivec2(-32, 12), ivec2(-32, -12),
+    ivec2(-17, -29), ivec2(6, -33), ivec2(26, -22), ivec2(48, 0),
+    ivec2(37, 31), ivec2(8, 47), ivec2(-24, 42), ivec2(-45, 16),
+    ivec2(-45, -16), ivec2(-24, -42), ivec2(8, -47), ivec2(37, -31)
+);
+
+// 8 sample points covering the 4x4 block
+const ivec2 kBlockSamples[8] = ivec2[8](
+    ivec2(0, 0), ivec2(2, 0),
+    ivec2(1, 1), ivec2(3, 1),
+    ivec2(0, 2), ivec2(2, 2),
+    ivec2(1, 3), ivec2(3, 3)
+);
+
+void main() {
+    ivec2 blockCoord = ivec2(gl_WorkGroupID.xy);
+    ivec2 basePixel = blockCoord * 4;
+    ivec2 maxCoord = ivec2(pc.width - 1, pc.height - 1);
+
+    uint tid = gl_LocalInvocationIndex; // 0..15 (16 threads in 4x4 workgroup)
+
+    // Each thread evaluates 4 candidates (16 * 4 = 64 candidates in parallel)
+    for (int k = 0; k < 4; ++k) {
+        int candIdx = int(tid) + k * 16;
+        ivec2 cand = kCandidates[candIdx];
+
+        float diff = 0.0;
+        for (int s = 0; s < 8; ++s) {
+            ivec2 p1 = clamp(basePixel + kBlockSamples[s], ivec2(0), maxCoord);
+            ivec2 p0 = clamp(p1 - cand, ivec2(0), maxCoord);
+            vec3 c1 = imageLoad(u_Frame1, p1).rgb;
+            vec3 c0 = imageLoad(u_Frame0, p0).rgb;
+            diff += abs(getLuma(c1) - getLuma(c0)) + 0.2 * dot(abs(c1 - c0), vec3(1.0));
+        }
+
+        if (candIdx == 0) {
+            s_zeroSAD = diff;
+        }
+
+        s_candSAD[candIdx] = diff;
+        s_candIdx[candIdx] = candIdx;
+    }
+
+    barrier(); // Wait for all 64 evaluations
+
+    // Parallel reduction across 64 candidates
+    if (tid < 8) {
+        int i1 = int(tid);
+        int i2 = i1 + 8;
+        int i3 = i1 + 16;
+        int i4 = i1 + 24;
+        int i5 = i1 + 32;
+        int i6 = i1 + 40;
+        int i7 = i1 + 48;
+        int i8 = i1 + 56;
+
+        float m = s_candSAD[i1]; int b = s_candIdx[i1];
+        if (s_candSAD[i2] < m) { m = s_candSAD[i2]; b = s_candIdx[i2]; }
+        if (s_candSAD[i3] < m) { m = s_candSAD[i3]; b = s_candIdx[i3]; }
+        if (s_candSAD[i4] < m) { m = s_candSAD[i4]; b = s_candIdx[i4]; }
+        if (s_candSAD[i5] < m) { m = s_candSAD[i5]; b = s_candIdx[i5]; }
+        if (s_candSAD[i6] < m) { m = s_candSAD[i6]; b = s_candIdx[i6]; }
+        if (s_candSAD[i7] < m) { m = s_candSAD[i7]; b = s_candIdx[i7]; }
+        if (s_candSAD[i8] < m) { m = s_candSAD[i8]; b = s_candIdx[i8]; }
+        s_candSAD[i1] = m;
+        s_candIdx[i1] = b;
+    }
+
+    barrier();
+
+    if (tid == 0) {
+        float minVal = s_candSAD[0];
+        int bestIdx = s_candIdx[0];
+        for (int i = 1; i < 8; ++i) {
+            if (s_candSAD[i] < minVal) {
+                minVal = s_candSAD[i];
+                bestIdx = s_candIdx[i];
+            }
+        }
+
+        // Flat surface zero-locking: prevents floating/dancing blocks on sky, grass, walls
+        if (s_zeroSAD < 0.10 || s_zeroSAD <= minVal * 1.30) {
+            s_bestVec = ivec2(0, 0);
+        } else {
+            s_bestVec = kCandidates[bestIdx];
+        }
+
+        imageStore(u_MotionField, blockCoord, vec4(vec2(s_bestVec), 0.0, 0.0));
+    }
+}
