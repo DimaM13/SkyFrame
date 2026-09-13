@@ -103,8 +103,14 @@ void main() {
     }
 
     // 4. True Chronological Symmetric Interpolation with Occlusion-Aware Soft Blending
+    // Photometric consistency check along the motion trajectory:
+    // If sample0 and sample1 differ significantly (occlusion or disocclusion),
+    // smoothly reduce blendWeight towards 0.0 (favoring real Frame 1) to eliminate tearing
+    float photoDiff = dot(abs(sample0.rgb - sample1.rgb), vec3(0.299, 0.587, 0.114));
+    float photoConfidence = clamp(1.0 - smoothstep(0.18, 0.45, photoDiff), 0.0, 1.0);
+
     vec4 motionBlended = mix(sample0, sample1, 0.5);
-    float blendWeight = clamp(occ, 0.35, 1.0);
+    float blendWeight = clamp(occ, 0.35, 1.0) * photoConfidence;
     vec4 finalColor = mix(sample1, motionBlended, blendWeight);
 
     // Visual HUD marker (neon green square in top-left corner)

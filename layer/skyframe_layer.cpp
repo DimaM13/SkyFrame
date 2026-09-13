@@ -394,7 +394,11 @@ struct SwapchainContext {
     std::mutex queueMutex;
     std::deque<PendingPresent> pendingPresents;
 
-    uint32_t prevGameIdx = UINT32_MAX;
+    // Dedicated VRAM History Image (Frame 0)
+    VkImage historyImage = VK_NULL_HANDLE;
+    VkDeviceMemory historyImageMemory = VK_NULL_HANDLE;
+    VkImageView historyImageView = VK_NULL_HANDLE;
+    bool hasHistory = false;
 
     // Pass 0: Pyramid Downsampler
     VkShaderModule downModule = VK_NULL_HANDLE;
@@ -542,7 +546,7 @@ static bool CreateStorageImage2D(
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+    ici.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -822,8 +826,16 @@ static bool InitPipelines(SwapchainContext* ctx) {
         }
     }
 
-    Log("Pipelines: DIS-Flow + TV-L1 Variational Regularization Pipeline initialized! (Grad: %ux%u, DenseMax: %ux%u)",
-        gradW, gradH, ctx->extent.width, ctx->extent.height);
+    // 8. Allocate dedicated VRAM history image for Frame 0 (full extent width x height)
+    if (!CreateStorageImage2D(ctx->device, ctx->physDevice, ctx->extent.width, ctx->extent.height, ctx->format,
+                             ctx->historyImage, ctx->historyImageMemory, ctx->historyImageView)) {
+        Log("Pipelines: failed to create historyImage");
+        return false;
+    }
+    ctx->hasHistory = false;
+
+    Log("Pipelines: DIS-Flow + TV-L1 Variational Regularization Pipeline initialized! (Grad: %ux%u, DenseMax: %ux%u, History: %ux%u)",
+        gradW, gradH, ctx->extent.width, ctx->extent.height, ctx->extent.width, ctx->extent.height);
     return true;
 #else
     Log("Pipelines: Required shader SPV headers not available");
@@ -1037,8 +1049,8 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateSwapchainKHR(
     }
 
     VkSwapchainCreateInfoKHR modifiedCi = *pCreateInfo;
-    if (modifiedCi.minImageCount < 4) {
-        modifiedCi.minImageCount = 4;
+    if (modifiedCi.minImageCount < 8) {
+        modifiedCi.minImageCount = 8;
     }
     modifiedCi.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
 
@@ -1046,7 +1058,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateSwapchainKHR(
     if (res != VK_SUCCESS) {
         Log("Swapchain creation with STORAGE_BIT failed (%d), retrying without STORAGE_BIT", res);
         modifiedCi.imageUsage = pCreateInfo->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        if (modifiedCi.minImageCount < 4) modifiedCi.minImageCount = 4;
+        if (modifiedCi.minImageCount < 8) modifiedCi.minImageCount = 8;
         res = g_pfnCreateSwapchainKHR(device, &modifiedCi, pAllocator, pSwapchain);
     }
     if (res != VK_SUCCESS || !pSwapchain) return res;
@@ -1155,8 +1167,11 @@ VKAPI_ATTR void VKAPI_CALL Hook_vkDestroySwapchainKHR(
                 DestroyStorageImage2D(device, ctx->slots[i].lumaPyr1, ctx->slots[i].lumaPyr1Memory, ctx->slots[i].lumaPyr1View);
                 DestroyStorageImage2D(device, ctx->slots[i].coarseFlow, ctx->slots[i].coarseFlowMemory, ctx->slots[i].coarseFlowView);
                 DestroyStorageImage2D(device, ctx->slots[i].denseFlow, ctx->slots[i].denseFlowMemory, ctx->slots[i].denseFlowView);
+            }
 
-                if (ctx->slots[i].acqSemaphore && g_pfnDestroySemaphore) g_pfnDestroySemaphore(device, ctx->slots[i].acqSemaphore, nullptr);
+            DestroyStorageImage2D(device, ctx->historyImage, ctx->historyImageMemory, ctx->historyImageView);
+
+            for (size_t i = 0; i < RING_SIZE; ++i) {
                 if (ctx->slots[i].interDoneSemaphore && g_pfnDestroySemaphore) g_pfnDestroySemaphore(device, ctx->slots[i].interDoneSemaphore, nullptr);
                 if (ctx->slots[i].finalDoneSemaphore && g_pfnDestroySemaphore) g_pfnDestroySemaphore(device, ctx->slots[i].finalDoneSemaphore, nullptr);
             }
@@ -1218,7 +1233,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
         if (ctx) {
             DrainPendingPresents(ctx.get());
             ctx->pacer.Reset();
-            ctx->prevGameIdx = UINT32_MAX;
+            ctx->hasHistory = false;
 
             static uint64_t s_disabledCount = 0;
             if (s_disabledCount++ % 60 == 1) {
@@ -1253,9 +1268,86 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
     // Flush any pending presentation from prior frame if game produced a fast burst
     DrainPendingPresents(ctx.get());
 
-    // 0. Base frame initialization: if this is the very first frame, establish baseline directly
-    if (ctx->prevGameIdx == UINT32_MAX) {
-        ctx->prevGameIdx = currentGameIdx;
+    // 0. Base frame initialization: if no history frame exists, copy currentGameIdx to history and present cleanly
+    if (!ctx->hasHistory) {
+        if (slot.cmdBuffer != VK_NULL_HANDLE && g_pfnBeginCommandBuffer && g_pfnCmdPipelineBarrier &&
+            g_pfnCmdCopyImage && g_pfnEndCommandBuffer && g_pfnQueueSubmit) {
+            VkCommandBufferBeginInfo bi{};
+            bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            g_pfnBeginCommandBuffer(slot.cmdBuffer, &bi);
+
+            VkImageMemoryBarrier copyBarriers[2]{};
+            copyBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            copyBarriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            copyBarriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            copyBarriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            copyBarriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            copyBarriers[0].image = ctx->images[currentGameIdx];
+            copyBarriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copyBarriers[0].subresourceRange.levelCount = 1;
+            copyBarriers[0].subresourceRange.layerCount = 1;
+
+            copyBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            copyBarriers[1].srcAccessMask = 0;
+            copyBarriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            copyBarriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            copyBarriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            copyBarriers[1].image = ctx->historyImage;
+            copyBarriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copyBarriers[1].subresourceRange.levelCount = 1;
+            copyBarriers[1].subresourceRange.layerCount = 1;
+
+            g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, copyBarriers);
+
+            VkImageCopy copyRegion{};
+            copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copyRegion.srcSubresource.layerCount = 1;
+            copyRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copyRegion.dstSubresource.layerCount = 1;
+            copyRegion.extent.width = ctx->extent.width;
+            copyRegion.extent.height = ctx->extent.height;
+            copyRegion.extent.depth = 1;
+
+            g_pfnCmdCopyImage(slot.cmdBuffer, ctx->images[currentGameIdx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ctx->historyImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+
+            copyBarriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            copyBarriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+            copyBarriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            copyBarriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+            copyBarriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            copyBarriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            copyBarriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            copyBarriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, copyBarriers);
+            g_pfnEndCommandBuffer(slot.cmdBuffer);
+
+            VkSubmitInfo si{};
+            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            si.waitSemaphoreCount = pPresentInfo->waitSemaphoreCount;
+            si.pWaitSemaphores = pPresentInfo->pWaitSemaphores;
+            std::vector<VkPipelineStageFlags> waitStages(pPresentInfo->waitSemaphoreCount, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            si.pWaitDstStageMask = waitStages.data();
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &slot.cmdBuffer;
+            si.signalSemaphoreCount = 1;
+            si.pSignalSemaphores = &slot.interDoneSemaphore;
+
+            {
+                std::lock_guard<std::mutex> qlock(ctx->queueMutex);
+                g_pfnQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+            }
+
+            VkPresentInfoKHR initPresent = *pPresentInfo;
+            initPresent.waitSemaphoreCount = 1;
+            initPresent.pWaitSemaphores = &slot.interDoneSemaphore;
+
+            ctx->hasHistory = true;
+            std::lock_guard<std::mutex> qlock(ctx->queueMutex);
+            return g_pfnQueuePresentKHR(queue, &initPresent);
+        }
         std::lock_guard<std::mutex> qlock(ctx->queueMutex);
         return g_pfnQueuePresentKHR(queue, pPresentInfo);
     }
@@ -1265,11 +1357,11 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
     VkResult acqRes = VK_NOT_READY;
     if (g_pfnAcquireNextImageKHR && slot.acqSemaphore) {
         acqRes = g_pfnAcquireNextImageKHR(
-            ctx->device, ctx->swapchain, 50000000ULL, slot.acqSemaphore, VK_NULL_HANDLE, &intermediateIdx
+            ctx->device, ctx->swapchain, 100000000ULL, slot.acqSemaphore, VK_NULL_HANDLE, &intermediateIdx
         );
     }
 
-    if (acqRes == VK_SUCCESS && intermediateIdx != currentGameIdx &&
+    if ((acqRes == VK_SUCCESS || acqRes == VK_SUBOPTIMAL_KHR) && intermediateIdx != currentGameIdx &&
         intermediateIdx < ctx->images.size() && currentGameIdx < ctx->images.size() &&
         slot.cmdBuffer != VK_NULL_HANDLE && g_pfnBeginCommandBuffer &&
         g_pfnCmdPipelineBarrier && g_pfnEndCommandBuffer && g_pfnQueueSubmit) {
@@ -1284,10 +1376,8 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             ctx->coarsePipeline != VK_NULL_HANDLE &&
             ctx->refinePipeline != VK_NULL_HANDLE &&
             ctx->blendPipeline != VK_NULL_HANDLE &&
-            ctx->prevGameIdx != UINT32_MAX && ctx->prevGameIdx < ctx->images.size() &&
-            ctx->prevGameIdx != intermediateIdx && ctx->prevGameIdx < ctx->imageViews.size() &&
+            ctx->hasHistory && ctx->historyImageView != VK_NULL_HANDLE &&
             currentGameIdx < ctx->imageViews.size() && intermediateIdx < ctx->imageViews.size() &&
-            ctx->imageViews[ctx->prevGameIdx] != VK_NULL_HANDLE &&
             ctx->imageViews[currentGameIdx] != VK_NULL_HANDLE &&
             ctx->imageViews[intermediateIdx] != VK_NULL_HANDLE &&
             slot.downDescSet != VK_NULL_HANDLE && slot.coarseDescSet != VK_NULL_HANDLE &&
@@ -1295,7 +1385,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             slot.lumaPyr0View != VK_NULL_HANDLE && slot.lumaPyr1View != VK_NULL_HANDLE &&
             slot.coarseFlowView != VK_NULL_HANDLE && slot.denseFlowView != VK_NULL_HANDLE &&
             g_pfnUpdateDescriptorSets && g_pfnCmdBindPipeline &&
-            g_pfnCmdBindDescriptorSets && g_pfnCmdPushConstants && g_pfnCmdDispatch) {
+            g_pfnCmdBindDescriptorSets && g_pfnCmdPushConstants && g_pfnCmdDispatch && g_pfnCmdCopyImage) {
 
             uint32_t fullW = ctx->extent.width;
             uint32_t fullH = ctx->extent.height;
@@ -1309,9 +1399,9 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             flowH = std::clamp(flowH, 16u, fullH);
 
             // --- 1. Update Descriptor Sets for All 4 Passes ---
-            // Pass 0 (DIS Gradient): Frame0, Frame1, Grad0, Luma1
+            // Pass 0 (DIS Gradient): Frame0 (history), Frame1 (currentGameIdx), Grad0, Luma1
             VkDescriptorImageInfo downImageInfos[4]{};
-            downImageInfos[0].imageView = ctx->imageViews[ctx->prevGameIdx];
+            downImageInfos[0].imageView = ctx->historyImageView;
             downImageInfos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             downImageInfos[1].imageView = ctx->imageViews[currentGameIdx];
             downImageInfos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1348,11 +1438,11 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                 writes[4 + i].pImageInfo = &coarseImageInfos[i];
             }
 
-            // Pass 2 (Variational TV-L1 Elastic Diffusion): RawFlow, Frame0, DenseFlow
+            // Pass 2 (Variational TV-L1 Elastic Diffusion): RawFlow, Frame0 (history), DenseFlow
             VkDescriptorImageInfo refineImageInfos[3]{};
             refineImageInfos[0].imageView = slot.coarseFlowView;
             refineImageInfos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            refineImageInfos[1].imageView = ctx->imageViews[ctx->prevGameIdx];
+            refineImageInfos[1].imageView = ctx->historyImageView;
             refineImageInfos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             refineImageInfos[2].imageView = slot.denseFlowView;
             refineImageInfos[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1366,9 +1456,9 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                 writes[7 + i].pImageInfo = &refineImageInfos[i];
             }
 
-            // Pass 3 (Warp & Blend): Frame0, Frame1, Intermediate, DenseFlow
+            // Pass 3 (Warp & Blend): Frame0 (history), Frame1 (currentGameIdx), Intermediate, DenseFlow
             VkDescriptorImageInfo blendImageInfos[4]{};
-            blendImageInfos[0].imageView = ctx->imageViews[ctx->prevGameIdx];
+            blendImageInfos[0].imageView = ctx->historyImageView;
             blendImageInfos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             blendImageInfos[1].imageView = ctx->imageViews[currentGameIdx];
             blendImageInfos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1388,14 +1478,14 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
 
             g_pfnUpdateDescriptorSets(ctx->device, 14, writes, 0, nullptr);
 
-            // --- 2. Transition Frame0, Frame1, Luma0, Luma1 for Pass 0 ---
+            // --- 2. Transition Frame0 (history), Frame1, Luma0, Luma1 for Pass 0 ---
             VkImageMemoryBarrier prePass0Barriers[4]{};
             prePass0Barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            prePass0Barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            prePass0Barriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
             prePass0Barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            prePass0Barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            prePass0Barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
             prePass0Barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            prePass0Barriers[0].image = ctx->images[ctx->prevGameIdx];
+            prePass0Barriers[0].image = ctx->historyImage;
             prePass0Barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             prePass0Barriers[0].subresourceRange.levelCount = 1;
             prePass0Barriers[0].subresourceRange.layerCount = 1;
@@ -1578,39 +1668,77 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             g_pfnCmdPushConstants(slot.cmdBuffer, ctx->blendPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(blendPc), &blendPc);
             g_pfnCmdDispatch(slot.cmdBuffer, (fullW + 7) / 8, (fullH + 7) / 8, 1);
 
-            // Final transitions back to PRESENT_SRC_KHR
-            VkImageMemoryBarrier postBarriers[3]{};
-            postBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            postBarriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            postBarriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-            postBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            postBarriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            postBarriers[0].image = ctx->images[ctx->prevGameIdx];
-            postBarriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            postBarriers[0].subresourceRange.levelCount = 1;
-            postBarriers[0].subresourceRange.layerCount = 1;
+            // Post Pass 3:
+            // 1. Transition intermediateIdx to PRESENT_SRC_KHR
+            VkImageMemoryBarrier interDoneBarrier{};
+            interDoneBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            interDoneBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            interDoneBarrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+            interDoneBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            interDoneBarrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            interDoneBarrier.image = ctx->images[intermediateIdx];
+            interDoneBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            interDoneBarrier.subresourceRange.levelCount = 1;
+            interDoneBarrier.subresourceRange.layerCount = 1;
+            g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &interDoneBarrier);
 
-            postBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            postBarriers[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            postBarriers[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-            postBarriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            postBarriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            postBarriers[1].image = ctx->images[currentGameIdx];
-            postBarriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            postBarriers[1].subresourceRange.levelCount = 1;
-            postBarriers[1].subresourceRange.layerCount = 1;
+            // 2. Update dedicated historyImage: copy currentGameIdx -> historyImage
+            VkImageMemoryBarrier preCopyBarriers[2]{};
+            preCopyBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            preCopyBarriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            preCopyBarriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            preCopyBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            preCopyBarriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            preCopyBarriers[0].image = ctx->images[currentGameIdx];
+            preCopyBarriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            preCopyBarriers[0].subresourceRange.levelCount = 1;
+            preCopyBarriers[0].subresourceRange.layerCount = 1;
 
-            postBarriers[2].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            postBarriers[2].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            postBarriers[2].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-            postBarriers[2].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            postBarriers[2].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            postBarriers[2].image = ctx->images[intermediateIdx];
-            postBarriers[2].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            postBarriers[2].subresourceRange.levelCount = 1;
-            postBarriers[2].subresourceRange.layerCount = 1;
+            preCopyBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            preCopyBarriers[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            preCopyBarriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            preCopyBarriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            preCopyBarriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            preCopyBarriers[1].image = ctx->historyImage;
+            preCopyBarriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            preCopyBarriers[1].subresourceRange.levelCount = 1;
+            preCopyBarriers[1].subresourceRange.layerCount = 1;
 
-            g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 3, postBarriers);
+            g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, preCopyBarriers);
+
+            VkImageCopy copyRegion{};
+            copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copyRegion.srcSubresource.layerCount = 1;
+            copyRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copyRegion.dstSubresource.layerCount = 1;
+            copyRegion.extent.width = ctx->extent.width;
+            copyRegion.extent.height = ctx->extent.height;
+            copyRegion.extent.depth = 1;
+
+            g_pfnCmdCopyImage(slot.cmdBuffer, ctx->images[currentGameIdx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ctx->historyImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+
+            VkImageMemoryBarrier postCopyBarriers[2]{};
+            postCopyBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            postCopyBarriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            postCopyBarriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+            postCopyBarriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            postCopyBarriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            postCopyBarriers[0].image = ctx->images[currentGameIdx];
+            postCopyBarriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            postCopyBarriers[0].subresourceRange.levelCount = 1;
+            postCopyBarriers[0].subresourceRange.layerCount = 1;
+
+            postCopyBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            postCopyBarriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            postCopyBarriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            postCopyBarriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            postCopyBarriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            postCopyBarriers[1].image = ctx->historyImage;
+            postCopyBarriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            postCopyBarriers[1].subresourceRange.levelCount = 1;
+            postCopyBarriers[1].subresourceRange.layerCount = 1;
+
+            g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, postCopyBarriers);
 
             usedHierarchical = true;
         } else if (g_pfnCmdCopyImage) {
@@ -1716,13 +1844,11 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
         }
         ctx->presentCv.notify_one();
 
-        ctx->prevGameIdx = currentGameIdx;
-
         if (s_presentCount % 120 == 1) {
             Log("FrameGen ACTIVE: 2x presents paced! Base: %.1f FPS -> Output: %.1f FPS (Display: %d Hz | %s, step: %.1f ms / avg: %.1f ms)",
                 ctx->pacer.GetBaseFps(), ctx->pacer.GetOutputFps(),
                 ctx->pacer.GetTargetHz(),
-                usedHierarchical ? "Pyramidal Coarse-to-Fine Optical Flow" : "Fallback Copy",
+                usedHierarchical ? "DIS-Flow + TV-L1 Variational Regularization" : "Fallback Copy",
                 static_cast<float>(halfIntervalNs) / 1e6f,
                 static_cast<float>(ctx->pacer.GetAverageFrameTimeNs()) / 1e6f);
         }
@@ -1739,7 +1865,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
     }
 
     // Fallback: If intermediate frame couldn't be acquired, present original frame cleanly
-    ctx->prevGameIdx = currentGameIdx;
+    ctx->hasHistory = false;
     VkResult res = VK_SUCCESS;
     {
         std::lock_guard<std::mutex> qlock(ctx->queueMutex);

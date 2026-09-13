@@ -33,10 +33,11 @@ vec4 sampleRawFlowBilinear(vec2 normCoord, ivec2 rawSize) {
     return mix(mix(v00, v10, f.x), mix(v01, v11, f.x), f.y);
 }
 
-// 8 neighbor offsets for Laplacian / Bilateral diffusion
-const ivec2 kNeighbors[8] = ivec2[8](
+// 12 neighbor offsets for Extended 2-Ring Laplacian / Bilateral diffusion
+const ivec2 kNeighbors[12] = ivec2[12](
     ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1),
-    ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1)
+    ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1),
+    ivec2(-2, 0), ivec2(2, 0), ivec2(0, -2), ivec2(0, 2)
 );
 
 void main() {
@@ -62,18 +63,35 @@ void main() {
     vec2 centerVec  = centerData.xy;
     float residual  = centerData.z;
 
-    // 2. Variational TV-L1 Elastic Diffusion Filter across 8 neighbors
-    // Replaces isolated outlier vectors with the consensus of the surrounding motion sheet
-    vec2 sumFlow = centerVec * 0.75; // Data term weight
-    float sumWeight = 0.75;
-
     vec2 uvStep = 1.0 / vec2(denseSize);
 
-    for (int i = 0; i < 8; ++i) {
-        ivec2 offset = kNeighbors[i];
-        vec2 nUV = clamp(normCoord + vec2(offset) * uvStep * 1.5, vec2(0.0), vec2(1.0));
-        vec4 nData = sampleRawFlowBilinear(nUV, rawSize);
+    // 2. Neighbor consensus pre-pass (samples 4 orthogonal direct neighbors)
+    vec2 neighborSum = vec2(0.0);
+    vec4 nData[12];
+    for (int i = 0; i < 4; ++i) {
+        vec2 nUV = clamp(normCoord + vec2(kNeighbors[i]) * uvStep * 1.5, vec2(0.0), vec2(1.0));
+        nData[i] = sampleRawFlowBilinear(nUV, rawSize);
+        neighborSum += nData[i].xy;
+    }
+    vec2 neighborConsensus = neighborSum * 0.25;
 
+    // Outlier attenuation: if centerVec is heavily discordant with neighbors and has high residual,
+    // strongly damp centerVec so surrounding coherent motion sheet seamlessly replaces it
+    float centerDiscrepancy = length(centerVec - neighborConsensus);
+    float centerWeight = (centerDiscrepancy > 2.0 && residual > 0.05) ? 0.05 : 0.75;
+    vec2 refVec = (centerWeight < 0.2) ? neighborConsensus : centerVec;
+
+    // 3. Variational TV-L1 Elastic Diffusion Filter across 12 neighbors (2-Ring)
+    vec2 sumFlow = centerVec * centerWeight;
+    float sumWeight = centerWeight;
+
+    for (int i = 0; i < 12; ++i) {
+        if (i >= 4) {
+            vec2 nUV = clamp(normCoord + vec2(kNeighbors[i]) * uvStep * 1.5, vec2(0.0), vec2(1.0));
+            nData[i] = sampleRawFlowBilinear(nUV, rawSize);
+        }
+
+        ivec2 offset = kNeighbors[i];
         ivec2 nPix = clamp(centerPix + offset * 2, ivec2(0), maxFull);
         vec3 nColor = imageLoad(u_Frame0, nPix).rgb;
         float nLuma = rgbToLuma(nColor);
@@ -81,22 +99,21 @@ void main() {
         // Bilateral affinity: high on same surface, low across object silhouette edges
         float lumaDiff = abs(centerLuma - nLuma);
         float colorDiff = dot(abs(centerColor - nColor), vec3(1.0)) * 0.333;
-        float flowDist  = length(centerVec - nData.xy);
+        float flowDist  = length(refVec - nData[i].xy);
 
         // Edge-preserving weight: preserves sharp motion boundaries, smooths out noise
-        float spatialWeight = (i < 4) ? 1.0 : 0.707; // Manhattan vs diagonal
+        float spatialWeight = (i < 4) ? 1.0 : ((i < 8) ? 0.707 : 0.50);
         float edgeWeight = exp(-colorDiff * 6.0 - lumaDiff * 4.0);
         float coherenceWeight = exp(-flowDist * 0.12);
 
         float w = spatialWeight * edgeWeight * coherenceWeight;
-        sumFlow += nData.xy * w;
+        sumFlow += nData[i].xy * w;
         sumWeight += w;
     }
 
     vec2 smoothedVec = sumFlow / max(sumWeight, 1e-5);
 
-    // 3. Continuous soft occlusion factor
-    // Smooth transition between 0.30 and 1.0 without sharp threshold steps
+    // 4. Continuous soft occlusion factor
     float occ = clamp(1.0 - smoothstep(0.06, 0.32, residual), 0.30, 1.0);
 
     // Store in dense flow texture (RGBA16F)
