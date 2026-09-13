@@ -78,7 +78,7 @@ void main() {
     // Outlier attenuation: if centerVec is heavily discordant with neighbors and has high residual,
     // strongly damp centerVec so surrounding coherent motion sheet seamlessly replaces it
     float centerDiscrepancy = length(centerVec - neighborConsensus);
-    float centerWeight = (centerDiscrepancy > 2.0 && residual > 0.05) ? 0.05 : 0.75;
+    float centerWeight = (centerDiscrepancy > 10.0 && residual > 0.12) ? 0.05 : 0.75;
     vec2 refVec = (centerWeight < 0.2) ? neighborConsensus : centerVec;
 
     // 3. Variational TV-L1 Elastic Diffusion Filter across 12 neighbors (2-Ring)
@@ -104,7 +104,7 @@ void main() {
         // Edge-preserving weight: preserves sharp motion boundaries, smooths out noise
         float spatialWeight = (i < 4) ? 1.0 : ((i < 8) ? 0.707 : 0.50);
         float edgeWeight = exp(-colorDiff * 6.0 - lumaDiff * 4.0);
-        float coherenceWeight = exp(-flowDist * 0.12);
+        float coherenceWeight = exp(-flowDist * 0.08);
 
         float w = spatialWeight * edgeWeight * coherenceWeight;
         sumFlow += nData[i].xy * w;

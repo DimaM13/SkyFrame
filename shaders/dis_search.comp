@@ -24,13 +24,33 @@ float sampleLuma1Bilinear(vec2 pos, ivec2 size) {
     return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
 }
 
-// 17 sparse spatial seed vectors covering radii from 0 to 10 low-res px (0 to 40 full-res px)
-const vec2 kSeeds[17] = vec2[17](
+// 64 multi-speed coarse candidate vectors covering up to 34 low-res px (136 full-res px)
+const vec2 kCoarseCandidates[64] = vec2[64](
+    // 0: Zero motion
     vec2(0.0, 0.0),
-    vec2(-1.5, 0.0), vec2(1.5, 0.0), vec2(0.0, -1.5), vec2(0.0, 1.5),
-    vec2(-3.5, 0.0), vec2(3.5, 0.0), vec2(0.0, -3.5), vec2(0.0, 3.5),
+    // 1-8: Small motions (radius ~2.0..3.5)
+    vec2(-2.0, 0.0), vec2(2.0, 0.0), vec2(0.0, -2.0), vec2(0.0, 2.0),
     vec2(-2.5, -2.5), vec2(2.5, -2.5), vec2(-2.5, 2.5), vec2(2.5, 2.5),
-    vec2(-7.0, 0.0), vec2(7.0, 0.0), vec2(0.0, -7.0), vec2(0.0, 7.0)
+    // 9-16: Medium motions (radius ~5.0..8.0)
+    vec2(-5.0, 0.0), vec2(5.0, 0.0), vec2(0.0, -5.0), vec2(0.0, 5.0),
+    vec2(-6.0, -4.0), vec2(6.0, -4.0), vec2(-6.0, 4.0), vec2(6.0, 4.0),
+    // 17-28: Fast horizontal pans & vertical tilts (radius ~9.0..14.0)
+    vec2(-9.0, 0.0), vec2(9.0, 0.0), vec2(-13.0, 0.0), vec2(13.0, 0.0),
+    vec2(0.0, -9.0), vec2(0.0, 9.0), vec2(0.0, -13.0), vec2(0.0, 13.0),
+    vec2(-10.0, -6.0), vec2(10.0, -6.0), vec2(-10.0, 6.0), vec2(10.0, 6.0),
+    // 29-44: Very fast camera rotations (radius ~17.0..24.0)
+    vec2(-17.0, 0.0), vec2(17.0, 0.0), vec2(-21.0, 0.0), vec2(21.0, 0.0),
+    vec2(0.0, -17.0), vec2(0.0, 17.0), vec2(0.0, -21.0), vec2(0.0, 21.0),
+    vec2(-16.0, -8.0), vec2(16.0, -8.0), vec2(-16.0, 8.0), vec2(16.0, 8.0),
+    vec2(-18.0, -14.0), vec2(18.0, -14.0), vec2(-18.0, 14.0), vec2(18.0, 14.0),
+    // 45-63: Extreme camera spins (radius ~26.0..34.0, up to 136 screen pixels!)
+    vec2(-26.0, 0.0), vec2(26.0, 0.0), vec2(-30.0, 0.0), vec2(30.0, 0.0),
+    vec2(-34.0, 0.0), vec2(34.0, 0.0),
+    vec2(0.0, -26.0), vec2(0.0, 26.0),
+    vec2(-24.0, -12.0), vec2(24.0, -12.0), vec2(-24.0, 12.0), vec2(24.0, 12.0),
+    vec2(-28.0, -10.0), vec2(28.0, -10.0), vec2(-28.0, 10.0), vec2(28.0, 10.0),
+    vec2(-30.0, -16.0), vec2(30.0, -16.0), vec2(-30.0, 16.0), vec2(30.0, 16.0),
+    vec2(0.0, 0.0) // padding to 64
 );
 
 // 9-point cross stencil for patch evaluation (dx, dy in [-2..2])
@@ -40,20 +60,107 @@ const ivec2 kPatchOffsets[9] = ivec2[9](
     ivec2(-2, -2), ivec2(2, -2), ivec2(-2, 2), ivec2(2, 2)
 );
 
+// Shared memory for workgroup-level coarse reduction
+shared float s_candSAD[64];
+shared int   s_candIdx[64];
+shared vec2  s_bestCoarseVector;
+
 void main() {
-    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size  = ivec2(pc.grad_width, pc.grad_height);
+    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * 8;
+    uint  tid = gl_LocalInvocationIndex; // 0..63
+
+    // 1. Workgroup-wide collaborative coarse motion search
+    // Thread `tid` evaluates candidate `kCoarseCandidates[tid]` over the 8x8 tile
+    vec2 cand = kCoarseCandidates[tid];
+    float sad = 0.0;
+
+    // 5 anchor samples across the 8x8 tile
+    ivec2 anchors[5] = ivec2[5](
+        tileOrigin + ivec2(4, 4),
+        tileOrigin + ivec2(1, 1),
+        tileOrigin + ivec2(6, 1),
+        tileOrigin + ivec2(1, 6),
+        tileOrigin + ivec2(6, 6)
+    );
+
+    for (int a = 0; a < 5; ++a) {
+        ivec2 p = clamp(anchors[a], ivec2(0), size - 1);
+        float l0 = imageLoad(u_Grad0, p).z; // luma0
+        vec2 samplePos = vec2(p) + cand;
+        float l1 = sampleLuma1Bilinear(samplePos, size);
+        sad += abs(l1 - l0);
+    }
+
+    // Bias towards zero motion to prevent drifting on uniform/flat textures
+    if (tid == 0u) sad *= 0.90;
+
+    s_candSAD[tid] = sad;
+    s_candIdx[tid] = int(tid);
+
+    barrier();
+
+    // Parallel reduction across 64 candidates (in shared memory)
+    if (tid < 32u) {
+        if (s_candSAD[tid + 32u] < s_candSAD[tid]) {
+            s_candSAD[tid] = s_candSAD[tid + 32u];
+            s_candIdx[tid] = s_candIdx[tid + 32u];
+        }
+    }
+    barrier();
+
+    if (tid < 16u) {
+        if (s_candSAD[tid + 16u] < s_candSAD[tid]) {
+            s_candSAD[tid] = s_candSAD[tid + 16u];
+            s_candIdx[tid] = s_candIdx[tid + 16u];
+        }
+    }
+    barrier();
+
+    if (tid < 8u) {
+        if (s_candSAD[tid + 8u] < s_candSAD[tid]) {
+            s_candSAD[tid] = s_candSAD[tid + 8u];
+            s_candIdx[tid] = s_candIdx[tid + 8u];
+        }
+    }
+    barrier();
+
+    if (tid < 4u) {
+        if (s_candSAD[tid + 4u] < s_candSAD[tid]) {
+            s_candSAD[tid] = s_candSAD[tid + 4u];
+            s_candIdx[tid] = s_candIdx[tid + 4u];
+        }
+    }
+    barrier();
+
+    if (tid < 2u) {
+        if (s_candSAD[tid + 2u] < s_candSAD[tid]) {
+            s_candSAD[tid] = s_candSAD[tid + 2u];
+            s_candIdx[tid] = s_candIdx[tid + 2u];
+        }
+    }
+    barrier();
+
+    if (tid == 0u) {
+        if (s_candSAD[1] < s_candSAD[0]) {
+            s_candSAD[0] = s_candSAD[1];
+            s_candIdx[0] = s_candIdx[1];
+        }
+        s_bestCoarseVector = kCoarseCandidates[s_candIdx[0]];
+    }
+    barrier();
+
+    // All threads now have the dominant coarse motion vector for this tile!
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     if (coord.x >= size.x || coord.y >= size.y) {
         return;
     }
 
-    // 1. Accumulate 2x2 Structure Tensor / Hessian H on the reference template I0
-    // H = sum [Ix^2, Ix*Iy; Ix*Iy, Iy^2] + lambda * I
+    // 2. Accumulate 2x2 Structure Tensor / Hessian H on reference template I0
     float H00 = 0.0;
     float H11 = 0.0;
     float H01 = 0.0;
 
-    // Cache patch samples in local registers
     float patch_Ix[9];
     float patch_Iy[9];
     float patch_T[9];
@@ -72,39 +179,47 @@ void main() {
         H01 += g.x * g.y;
     }
 
-    // Regularization parameter lambda (guarantees invertibility and prevents flat-area drift)
     float lambda = 0.008;
     H00 += lambda;
     H11 += lambda;
 
-    // Invert 2x2 Hessian
     float detH = H00 * H11 - H01 * H01;
     float invDet = 1.0 / max(detH, 1e-7);
     mat2 invH = mat2(H11 * invDet, -H01 * invDet,
                     -H01 * invDet,  H00 * invDet);
 
-    // 2. Select the best initial seed motion vector from multi-speed candidates
-    vec2 bestSeed = vec2(0.0, 0.0);
-    float minSAD = 1e9;
+    // 3. Select the best local seed around the coarse motion vector & static UI
+    vec2 coarse = s_bestCoarseVector;
+    vec2 localSeeds[10] = vec2[10](
+        coarse,
+        coarse + vec2(-1.5, 0.0), coarse + vec2(1.5, 0.0),
+        coarse + vec2(0.0, -1.5), coarse + vec2(0.0, 1.5),
+        vec2(0.0, 0.0),
+        vec2(-1.5, 0.0), vec2(1.5, 0.0),
+        vec2(0.0, -1.5), vec2(0.0, 1.5)
+    );
 
-    for (int s = 0; s < 17; ++s) {
-        vec2 cand = kSeeds[s];
-        float sad = 0.0;
+    vec2 bestSeed = coarse;
+    float minPatchSAD = 1e9;
+
+    for (int s = 0; s < 10; ++s) {
+        vec2 candSeed = localSeeds[s];
+        float patchSAD = 0.0;
         for (int k = 0; k < 9; ++k) {
-            vec2 samplePos = vec2(patch_pos[k]) + cand;
+            vec2 samplePos = vec2(patch_pos[k]) + candSeed;
             float l1 = sampleLuma1Bilinear(samplePos, size);
-            sad += abs(l1 - patch_T[k]);
+            patchSAD += abs(l1 - patch_T[k]);
         }
-        // Small bias towards zero motion to avoid drifting on flat textures
-        if (s == 0) sad *= 0.92;
+        // Bias towards zero motion to protect static HUD / UI
+        if (s == 5) patchSAD *= 0.90;
 
-        if (sad < minSAD) {
-            minSAD = sad;
-            bestSeed = cand;
+        if (patchSAD < minPatchSAD) {
+            minPatchSAD = patchSAD;
+            bestSeed = candSeed;
         }
     }
 
-    // 3. Dense Inverse Compositional Gradient Descent Refinement (2 subpixel iterations)
+    // 4. Dense Inverse Compositional Gradient Descent Refinement (2 subpixel iterations)
     vec2 curFlow = bestSeed;
     for (int iter = 0; iter < 2; ++iter) {
         vec2 b = vec2(0.0, 0.0);
@@ -117,12 +232,11 @@ void main() {
         }
 
         vec2 delta = -(invH * b);
-        // Clamp step size to maintain numerical stability
         delta = clamp(delta, vec2(-1.5), vec2(1.5));
         curFlow += delta;
     }
 
-    // 4. Compute final confidence & residual
+    // 5. Compute final confidence & residual
     float finalDiff = 0.0;
     for (int k = 0; k < 9; ++k) {
         vec2 samplePos = vec2(patch_pos[k]) + curFlow;
