@@ -194,7 +194,10 @@ class Plugin:
                 pacing = "smooth"
             # lsfg-vk 2.0 pacing enum currently only knows vsync/none;
             # map our "smooth" (Balanced) to vsync for the upstream engine.
-            upstream_pacing = "none" if pacing == "none" else "vsync"
+            # NOTE: bundled engine tree only parses pacing="none" — anything
+            # else throws and the layer goes dormant. Always write "none"
+            # until the forked libskyframe.so lands.
+            upstream_pacing = "none"
             # --- SkyFrame delivery scheduler (see engine/skyframe/PACING.md) ---
             # vsync = Smooth like 2.0.0 (deep queue, max smoothness, +lag)
             # smooth = Balanced default (queue 1 + deadline + fresh-first)
@@ -214,8 +217,10 @@ class Plugin:
 
             toml_lines = [
                 "# Automatically managed by SkyFrame Decky Plugin (SkyFrame v2)",
-                "# SkyFrame keys (adaptive/frame_generation_enabled/smooth) are",
+                "# SkyFrame keys (adaptive/frame_generation_enabled/skyframe_*) are",
                 "# ignored by upstream lsfg-vk 2.0 and honoured by VK_LAYER_SKYFRAME.",
+                "version = 2",
+                "",
                 "[global]",
                 f'dll = "{dll_path}"',
                 "allow_fp16 = true",
