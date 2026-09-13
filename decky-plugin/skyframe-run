@@ -27,9 +27,19 @@ fi
 
 LOG="$HOME/skyframe_game.log"
 if [ "$DEBUG" = "1" ]; then
-  echo "[skyframe-run] SKYFRAME isolated launch: $*" >> "$LOG"
-  echo "[skyframe-run] ENABLE_SKYFRAME=1 LSFG_CONFIG=${LSFG_CONFIG:-<default>}" >> "$LOG"
-  exec "$@" > "$LOG" 2>&1
+  {
+    echo "=== [skyframe-run] $(date -u +%FT%TZ) ==="
+    echo "[skyframe-run] cmd: $*"
+    echo "[skyframe-run] env: ENABLE_SKYFRAME=${ENABLE_SKYFRAME:-<unset>} DISABLE_SKYFRAME=${DISABLE_SKYFRAME:-<unset>} LSFG_CONFIG=${LSFG_CONFIG:-<default>}"
+    echo "[skyframe-run] manifests:"
+    ls -la "$HOME/.local/share/vulkan/implicit_layer.d/" 2>&1
+    echo "[skyframe-run] conf head:"
+    head -12 "${LSFG_CONFIG:-$HOME/.config/lsfg-vk/conf.toml}" 2>&1
+    echo "[skyframe-run] libs:"
+    ls -la "$HOME/.local/lib/liblsfg-vk-layer.so" "$HOME/.local/lib/liblsfg-vk-layer_32.so" "$HOME/.local/bin/lsfg-vk-cli" 2>&1
+  } >> "$LOG" 2>&1
+  # NOTE: append (>>) — truncate (>) стирал бы диагностику выше.
+  exec "$@" >> "$LOG" 2>&1
 else
   exec "$@"
 fi
