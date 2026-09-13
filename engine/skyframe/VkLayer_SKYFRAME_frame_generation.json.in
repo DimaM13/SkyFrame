@@ -1,0 +1,14 @@
+{
+  "file_format_version": "1.0.0",
+  "layer": {
+    "name": "VK_LAYER_SKYFRAME_frame_generation",
+    "type": "GLOBAL",
+    "library_path": "@SKYFRAME_LAYER_LIBRARY_PATH@",
+    "api_version": "1.3.0",
+    "implementation_version": "1",
+    "description": "SkyFrame Frame Generation Layer (lsfg-vk 2.0 core)",
+    "disable_environment": {
+      "DISABLE_SKYFRAME": "1"
+    }
+  }
+}

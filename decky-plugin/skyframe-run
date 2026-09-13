@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# SkyFrame launcher - isolated wrapper for one game (MAKO-style).
+# Usage in Steam launch options:
+#   /home/deck/.local/bin/skyframe-run %command%
+#   /home/deck/.local/bin/skyframe-run --debug %command%
+set -u
+
+DEBUG=0
+if [ "${1:-}" = "--debug" ]; then
+  DEBUG=1
+  shift
+fi
+
+# Isolate from competing FG layers for THIS game only (no global uninstall).
+unset ENABLE_LSFGVK
+unset ENABLE_MAKO
+export DISABLE_LSFGVK=1
+export DISABLE_MAKO=1
+export DISABLE_LSFGVK_FRAME_GENERATION=1
+export ENABLE_SKYFRAME=1
+unset DISABLE_SKYFRAME
+
+# Keep SkyFrame config discovery stable under Steam runtime.
+if [ -z "${LSFG_CONFIG:-}" ] && [ -f "$HOME/.config/lsfg-vk/conf.toml" ]; then
+  export LSFG_CONFIG="$HOME/.config/lsfg-vk/conf.toml"
+fi
+
+LOG="$HOME/skyframe_game.log"
+if [ "$DEBUG" = "1" ]; then
+  echo "[skyframe-run] SKYFRAME isolated launch: $*" >> "$LOG"
+  echo "[skyframe-run] ENABLE_SKYFRAME=1 LSFG_CONFIG=${LSFG_CONFIG:-<default>}" >> "$LOG"
+  exec "$@" > "$LOG" 2>&1
+else
+  exec "$@"
+fi

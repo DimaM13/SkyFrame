@@ -27,24 +27,32 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+          cache-dependency-path: decky-plugin/package-lock.json
+
+      - name: Verify backend syntax
+        run: |
+          python3 -m py_compile decky-plugin/main.py scripts/package_decky_zip.py
+          echo "PY_OK"
 
       - name: Build Decky Frontend
         run: |
           cd decky-plugin
-          npm install
+          npm ci
           npm run build
+          test -f dist/index.js || (echo "dist/index.js missing after build!" && exit 1)
           cd ..
 
-      - name: Compile 64-bit and 32-bit Vulkan Layers (.so)
+      - name: Compile 64-bit Vulkan Layer + CLI
         run: |
-          # 1. 64-bit build
           mkdir -p build64
           cd build64
           cmake .. -DCMAKE_BUILD_TYPE=Release
           cmake --build . --config Release -j$(nproc)
           cd ..
 
-          # 2. 32-bit build
+      - name: Compile 32-bit Vulkan Layer (multilib, no CLI)
+        run: |
           mkdir -p build32
           cd build32
           cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="-m32" -DCMAKE_CXX_FLAGS="-m32" -DCMAKE_SHARED_LINKER_FLAGS="-m32" -DLSFGVK_BUILD_CLI=OFF
@@ -55,16 +63,25 @@ jobs:
         run: |
           mkdir -p decky-plugin/bin
 
-          # Copy LSFG engine binaries
+          # 64-bit + 32-bit layer libraries (32-bit stored as _32, picked by main.py)
           find build64 -name "liblsfg-vk-layer.so" -exec cp {} decky-plugin/bin/liblsfg-vk-layer.so \;
           find build32 -name "liblsfg-vk-layer.so" -exec cp {} decky-plugin/bin/liblsfg-vk-layer_32.so \;
-          find build64 -name "VkLayer_LSFGVK_frame_generation.json" -exec cp {} decky-plugin/bin/VkLayer_LSFGVK_frame_generation.json \;
           find build64 -name "lsfg-vk-cli" -type f -exec cp {} decky-plugin/bin/lsfg-vk-cli \;
           chmod +x decky-plugin/bin/lsfg-vk-cli || true
+          # Isolated per-game launcher (installed to ~/.local/bin by main.py)
+          chmod +x decky-plugin/skyframe-run || true
+
+          echo "=== decky-plugin/bin ==="
+          ls -la decky-plugin/bin
+          test -f decky-plugin/bin/liblsfg-vk-layer.so || (echo "64-bit layer missing!" && exit 1)
+          test -f decky-plugin/bin/liblsfg-vk-layer_32.so || (echo "32-bit layer missing!" && exit 1)
+          test -f decky-plugin/bin/lsfg-vk-cli || (echo "CLI missing!" && exit 1)
 
       - name: Package Decky Plugin Zip
         run: |
           python3 scripts/package_decky_zip.py
+          echo "=== SkyFrame.zip contents ==="
+          python3 -c "import zipfile; print('\n'.join(sorted(zipfile.ZipFile('SkyFrame.zip').namelist())))"
 
       - name: Upload SkyFrame.zip Artifact
         uses: actions/upload-artifact@v4
@@ -74,33 +91,23 @@ jobs:
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
-        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
-          tag_name: v1.9.2
-          name: "SkyFrame v1.9.2 — Native Lossless Scaling (LSFG) for Steam Deck"
-          body: |
-            ## ⚡ SkyFrame v1.9.1 — Нативный Lossless Scaling (LSFG) для Steam Deck & Linux
-
-            В этом обновлении весь устаревший экспериментальный код шейдеров был полностью удален. SkyFrame теперь работает исключительно на проверенном нейросетевом движке **Lossless Scaling (LSFG)**!
-
-            ---
-
-            ### 🚀 Главные возможности
-            - **Нативный Vulkan-слой LSFG**: Генерация промежуточных кадров выполняется напрямую через Vulkan Compute шейдеры нейросети LSFG при перехвате `vkQueuePresentKHR`.
-            - **Аппаратный FP16 Rapid Packed Math**: Аппаратное ускорение половинной точности на RDNA2 GPU Steam Deck — инференс занимает всего ~4–6 мс на кадр.
-            - **Множители 2x, 3x, 4x**: Плавный выбор между удвоением, утроением и учетверением кадров (30 → 60 FPS, 30 → 90 FPS на OLED, 45 → 90 FPS).
-            - **Автоматический поиск Lossless.dll**: Плагин самостоятельно находит вашу купленную лицензионную копию Lossless Scaling в Steam (на внутреннем накопителе и MicroSD).
-            - **Полная поддержка 64-bit и 32-bit**: Скомпилированы слои под обе разрядности (`liblsfg-vk-layer.so` и `liblsfg-vk-layer_32.so`).
-            - **Встроенная утилита диагностики**: Добавлена CLI-утилита `lsfg-vk-cli` для быстрой проверки конфигурации и целостности.
-
-            ### 📋 Как использовать
-            1. В клиенте Steam откройте свойства купленного **Lossless Scaling**:
-               `Свойства -> Бета-версии -> Выберите ветку "lsfg-vk"`.
-            2. Установите `SkyFrame.zip` через Decky Loader.
-            3. В меню SkyFrame включите генерацию кадров, выберите множитель (2x / 3x / 4x) и режим FP16.
-            4. В свойствах игры укажите параметр запуска:
-               `ENABLE_LSFGVK=1 %command%`
-               (Либо включите **«Глобальный режим»** в плагине, чтобы LSFG инжектировался во все игры автоматически).
           files: SkyFrame.zip
+          generate_release_notes: true
+          body: |
+            ## 🚀 SkyFrame ${{ github.ref_name }} — готовый пакет для Steam Deck
+
+            **Установка в 1 шаг:** скачай `SkyFrame.zip` → Decky Loader → Настройки → Developer → `Install Plugin from Zip` → выбери файл → перезапусти Deck.
+
+            ### Что внутри (все готовое, собирать ничего не нужно)
+            - `liblsfg-vk-layer.so` + `liblsfg-vk-layer_32.so` — 64/32-bit Vulkan-слой (ядро lsfg-vk 2.0: bindless pipeline, FP16, ~30% VRAM)
+            - `lsfg-vk-cli` — диагностика (`healthcheck`, `validate`, `benchmark`)
+            - `skyframe-run` — изолированный лаунчер: `~/.local/bin/skyframe-run %command%`
+            - Свой слой `VK_LAYER_SKYFRAME_frame_generation` (манифесты ставит плагин)
+            - Decky UI v2: HUD `base→output`, live-toggle, Adaptive, доставка Smooth/Balanced/Low-lag
+
+            ### Требования
+            Lossless Scaling в Steam → Свойства → Бета-версии → ветка **`lsfg-vk`**.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
