@@ -1,6 +1,6 @@
 {
   "name": "SkyFrame",
-  "version": "1.9.0",
+  "version": "1.9.1",
   "description": "Native AI Frame Generation for Steam Deck",
   "type": "module",
   "scripts": {

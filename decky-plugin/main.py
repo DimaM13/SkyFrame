@@ -24,22 +24,16 @@ LOCAL_LIB_DIR = os.path.join(USER_HOME, ".local", "lib")
 LOCAL_BIN_DIR = os.path.join(USER_HOME, ".local", "bin")
 USER_LAYER_DIR = os.path.join(USER_HOME, ".local", "share", "vulkan", "implicit_layer.d")
 SYSTEM_LAYER_DIR = "/etc/vulkan/implicit_layer.d"
-MODELS_DIR = os.path.join(USER_HOME, ".local", "share", "skyframe", "models")
 LOG_DIR = os.path.join(USER_HOME, ".local", "share", "skyframe")
 LSFG_CONFIG_DIR = os.path.join(USER_HOME, ".config", "lsfg-vk")
 LSFG_CONFIG_PATH = os.path.join(LSFG_CONFIG_DIR, "conf.toml")
 
 DEFAULT_CONFIG = {
     "enabled": False,
-    "engine": "lsfg",          # "lsfg" = LSFG Neural Engine (Lossless Scaling), "skyframe" = DIS Native
     "global_injection": False, # If true, inject into all games without requiring launch options
-    "mode": 1,                 # DIS: 0 = Lite (180p), 1 = Balanced (240p), 2 = Quality (360p)
     "multiplier": 2,           # 2x, 3x, 4x frame generation
     "performance_mode": True,  # LSFG FP16 Rapid Packed Math on AMD RDNA2 GPU (~4ms latency)
-    "hud_protection": True,
-    "hud_threshold": 0.08,
     "target_hz": 60,           # Target display refresh rate (synced with Deck QAM)
-    "show_hud": False,
     "flow_scale": 0.90,        # Flow scale (0.50 to 1.00, default 0.90)
     "custom_dll_path": ""      # Custom path to Lossless.dll if not in standard Steam library
 }
@@ -216,29 +210,15 @@ class Plugin:
             os.makedirs(USER_LAYER_DIR, exist_ok=True)
             fix_perms(USER_LAYER_DIR, is_exec=True)
 
-            os.makedirs(MODELS_DIR, exist_ok=True)
-            fix_perms(MODELS_DIR, is_exec=True)
-
             os.makedirs(LOG_DIR, exist_ok=True)
             fix_perms(LOG_DIR, is_exec=True)
 
-            # Copy models
-            models_src = os.path.join(bin_dir, "models")
-            if os.path.isdir(models_src):
-                for mf in os.listdir(models_src):
-                    src_f = os.path.join(models_src, mf)
-                    dst_f = os.path.join(MODELS_DIR, mf)
-                    if os.path.isfile(src_f) and not os.path.isfile(dst_f):
-                        shutil.copy2(src_f, dst_f)
-                        fix_perms(dst_f)
-
-            # Copy SkyFrame DIS binaries (64-bit and 32-bit)
-            for lib_name in ["libVkLayer_skyframe.so", "libVkLayer_skyframe_32.so"]:
-                src = os.path.join(bin_dir, lib_name)
-                dst = os.path.join(LOCAL_LIB_DIR, lib_name)
-                if os.path.isfile(src):
-                    shutil.copy2(src, dst)
-                    fix_perms(dst, is_exec=True)
+            # Clean up any legacy experimental skyframe manifests to avoid collisions
+            for old_mf in ["vk_layer_skyframe.json", "vk_layer_skyframe_32.json"]:
+                p = os.path.join(USER_LAYER_DIR, old_mf)
+                if os.path.isfile(p):
+                    try: os.remove(p)
+                    except Exception: pass
 
             # Copy LSFG engine binaries (64-bit and 32-bit)
             for lib_name in ["liblsfg-vk-layer.so", "liblsfg-vk-layer_32.so"]:
@@ -255,46 +235,19 @@ class Plugin:
                 shutil.copy2(cli_src, cli_dst)
                 fix_perms(cli_dst, is_exec=True)
 
-            # Check Lossless.dll location
+            # Check Lossless.dll location and sync conf.toml
             custom_dll = self.config.get("custom_dll_path", "")
             ls_info = find_lossless_dll(custom_dll)
             if ls_info["found"]:
                 self.sync_lsfg_config(ls_info["path"])
 
             is_enabled = self.config.get("enabled", False)
-            engine = self.config.get("engine", "lsfg")
             global_mode = self.config.get("global_injection", False)
 
-            skyframe_lib64 = os.path.join(LOCAL_LIB_DIR, "libVkLayer_skyframe.so")
-            skyframe_lib32 = os.path.join(LOCAL_LIB_DIR, "libVkLayer_skyframe_32.so")
             lsfg_lib64 = os.path.join(LOCAL_LIB_DIR, "liblsfg-vk-layer.so")
             lsfg_lib32 = os.path.join(LOCAL_LIB_DIR, "liblsfg-vk-layer_32.so")
 
-            # --- SkyFrame Layer Manifest ---
-            sky_active = is_enabled and (engine == "skyframe")
-            sky_layer_64 = {
-                "name": "VK_LAYER_SKYFRAME_framegen",
-                "type": "GLOBAL",
-                "library_path": skyframe_lib64,
-                "api_version": "1.3.0",
-                "implementation_version": "1",
-                "description": "SkyFrame Native AI Frame Generation Layer (64-bit)",
-                "functions": {
-                    "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion",
-                    "vkGetInstanceProcAddr": "skyframe_GetInstanceProcAddr",
-                    "vkGetDeviceProcAddr": "skyframe_GetDeviceProcAddr"
-                },
-                "disable_environment": { "DISABLE_SKYFRAME": "0" if not sky_active else "1" }
-            }
-            if sky_active and not global_mode:
-                sky_layer_64["enable_environment"] = { "ENABLE_SKYFRAME": "1" }
-
-            sky_layer_32 = dict(sky_layer_64)
-            sky_layer_32["library_path"] = skyframe_lib32
-            sky_layer_32["description"] = "SkyFrame Native AI Frame Generation Layer (32-bit)"
-
             # --- LSFG Layer Manifest ---
-            lsfg_active = is_enabled and (engine == "lsfg")
             lsfg_layer_64 = {
                 "name": "VK_LAYER_LSFGVK_frame_generation",
                 "type": "GLOBAL",
@@ -302,9 +255,9 @@ class Plugin:
                 "api_version": "1.3.0",
                 "implementation_version": "2",
                 "description": "Lossless Scaling Frame Generation Layer (64-bit)",
-                "disable_environment": { "DISABLE_LSFGVK": "0" if not lsfg_active else "1" }
+                "disable_environment": { "DISABLE_LSFGVK": "0" if not is_enabled else "1" }
             }
-            if lsfg_active and not global_mode:
+            if is_enabled and not global_mode:
                 lsfg_layer_64["enable_environment"] = { "ENABLE_LSFGVK": "1" }
 
             lsfg_layer_32 = dict(lsfg_layer_64)
@@ -313,8 +266,6 @@ class Plugin:
 
             # Write user layer manifests
             manifest_files = [
-                (os.path.join(USER_LAYER_DIR, "vk_layer_skyframe.json"), sky_layer_64),
-                (os.path.join(USER_LAYER_DIR, "vk_layer_skyframe_32.json"), sky_layer_32),
                 (os.path.join(USER_LAYER_DIR, "VkLayer_LSFGVK_frame_generation.json"), lsfg_layer_64),
                 (os.path.join(USER_LAYER_DIR, "VkLayer_LSFGVK_frame_generation_32.json"), lsfg_layer_32),
             ]
@@ -336,7 +287,7 @@ class Plugin:
                 except Exception as e:
                     logging.warning(f"[SkyFrame] Could not write system manifest: {e}")
 
-            logging.info(f"[SkyFrame] Layer sync complete. Active engine: {engine}, Enabled: {is_enabled}, Global: {global_mode}")
+            logging.info(f"[SkyFrame] LSFG layer sync complete. Enabled: {is_enabled}, Global: {global_mode}")
         except Exception as e:
             logging.error(f"[SkyFrame] Error updating Vulkan layer: {e}")
 
@@ -356,13 +307,6 @@ class Plugin:
         self.sync_vulkan_layer()
         return self.config
 
-    async def set_engine(self, engine: str):
-        if engine in ["lsfg", "skyframe"]:
-            self.config["engine"] = engine
-            self.save_config()
-            self.sync_vulkan_layer()
-        return self.config
-
     async def set_multiplier(self, multiplier: int):
         if multiplier in [2, 3, 4]:
             self.config["multiplier"] = int(multiplier)
@@ -380,21 +324,6 @@ class Plugin:
         self.config["global_injection"] = bool(global_injection)
         self.save_config()
         self.sync_vulkan_layer()
-        return self.config
-
-    async def set_mode(self, mode: int):
-        self.config["mode"] = int(mode)
-        self.save_config()
-        return self.config
-
-    async def set_hud_protection(self, hud_protection: bool):
-        self.config["hud_protection"] = bool(hud_protection)
-        self.save_config()
-        return self.config
-
-    async def set_show_hud(self, show_hud: bool):
-        self.config["show_hud"] = bool(show_hud)
-        self.save_config()
         return self.config
 
     async def set_target_hz(self, hz: int):
@@ -437,21 +366,19 @@ class Plugin:
                         }
         except Exception:
             pass
+        mult = self.config.get("multiplier", 2)
         return {
             "base_fps": 0.0 if not self.config.get("enabled", False) else 30.0,
-            "output_fps": 0.0 if not self.config.get("enabled", False) else 60.0,
+            "output_fps": 0.0 if not self.config.get("enabled", False) else (30.0 * mult),
             "target_hz": int(self.config.get("target_hz", 60))
         }
 
     async def get_status_info(self):
         return {
             "user_home": USER_HOME,
-            "lib64_sky": os.path.isfile(os.path.join(LOCAL_LIB_DIR, "libVkLayer_skyframe.so")),
-            "lib32_sky": os.path.isfile(os.path.join(LOCAL_LIB_DIR, "libVkLayer_skyframe_32.so")),
-            "lib64_lsfg": os.path.isfile(os.path.join(LOCAL_LIB_DIR, "liblsfg-vk-layer.so")),
-            "lib32_lsfg": os.path.isfile(os.path.join(LOCAL_LIB_DIR, "liblsfg-vk-layer_32.so")),
+            "lib64": os.path.isfile(os.path.join(LOCAL_LIB_DIR, "liblsfg-vk-layer.so")),
+            "lib32": os.path.isfile(os.path.join(LOCAL_LIB_DIR, "liblsfg-vk-layer_32.so")),
             "enabled": self.config.get("enabled", False),
-            "engine": self.config.get("engine", "lsfg"),
             "global_mode": self.config.get("global_injection", False),
             "ls_info": find_lossless_dll(self.config.get("custom_dll_path", ""))
         }

@@ -3,6 +3,7 @@ name: Build SkyFrame for Steam Deck
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
   workflow_dispatch:
 
 permissions:
@@ -20,7 +21,7 @@ jobs:
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y cmake g++ g++-multilib gcc-multilib libvulkan-dev libvulkan-dev:i386 glslang-tools python3 zip
+          sudo apt-get install -y cmake g++ g++-multilib gcc-multilib libvulkan-dev libvulkan-dev:i386 python3 zip
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -52,10 +53,7 @@ jobs:
 
       - name: Prepare Decky Plugin binaries
         run: |
-          mkdir -p decky-plugin/bin/models
-          cp build64/libVkLayer_skyframe.so decky-plugin/bin/libVkLayer_skyframe.so
-          cp build32/libVkLayer_skyframe.so decky-plugin/bin/libVkLayer_skyframe_32.so
-          cp build64/vk_layer_skyframe.json decky-plugin/bin/vk_layer_skyframe.json
+          mkdir -p decky-plugin/bin
 
           # Copy LSFG engine binaries
           find build64 -name "liblsfg-vk-layer.so" -exec cp {} decky-plugin/bin/liblsfg-vk-layer.so \;
@@ -63,8 +61,6 @@ jobs:
           find build64 -name "VkLayer_LSFGVK_frame_generation.json" -exec cp {} decky-plugin/bin/VkLayer_LSFGVK_frame_generation.json \;
           find build64 -name "lsfg-vk-cli" -type f -exec cp {} decky-plugin/bin/lsfg-vk-cli \;
           chmod +x decky-plugin/bin/lsfg-vk-cli || true
-
-          cp -r models/* decky-plugin/bin/models/
 
       - name: Package Decky Plugin Zip
         run: |
@@ -78,35 +74,33 @@ jobs:
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         with:
-          tag_name: v1.9.0
-          name: "SkyFrame v1.9.0 — LSFG Neural Engine (Lossless Scaling) & Dual-Engine Architecture"
+          tag_name: v1.9.1
+          name: "SkyFrame v1.9.1 — Native Lossless Scaling (LSFG) for Steam Deck"
           body: |
-            ## 🚀 SkyFrame v1.9.0 — Интеграция нейросетевого движка LSFG (Lossless Scaling) и двухдвижковая архитектура
+            ## ⚡ SkyFrame v1.9.1 — Нативный Lossless Scaling (LSFG) для Steam Deck & Linux
 
-            В этом крупном релизе SkyFrame получил возможность запускать полноценный нейросетевой конвейер **Lossless Scaling (LSFG)** прямо на Steam Deck и Linux, используя вашу купленную лицензионную копию из Steam!
+            В этом обновлении весь устаревший экспериментальный код шейдеров был полностью удален. SkyFrame теперь работает исключительно на проверенном нейросетевом движке **Lossless Scaling (LSFG)**!
 
             ---
 
-            ### 🌟 1. Интеграция нейросети LSFG (Lossless Scaling)
-            - **Прямое выполнение SPIR-V нейросети**: Движок извлекает 24 скомпилированных шейдерных прохода нейросети из вашего лицензионного файла `Lossless.dll` и исполняет их нативно через Vulkan Compute.
-            - **FP16 Rapid Packed Math**: Аппаратное ускорение половинной точности на архитектуре AMD RDNA2 (Steam Deck) сокращает время инференса до ~4–6 мс на кадр при разрешении 720p/800p без потери визуального качества.
-            - **Множители 2x, 3x, 4x**: Поддержка удвоения, утроения и учетверения кадровой частоты (например, 30 → 60 FPS, 30 → 90 FPS на OLED, 45 → 90 FPS).
-            - **Автоопределение Lossless.dll**: Плагин автоматически находит установленный Lossless Scaling во всех библиотеках Steam и на microSD-картах.
-            - **Совместимость с веткой `lsfg-vk`**: Для гарантированной стабильности и FP16 используется проверенная официальная бета-ветка Lossless Scaling в Steam (`Свойства -> Бета-версии -> lsfg-vk`).
+            ### 🚀 Главные возможности
+            - **Нативный Vulkan-слой LSFG**: Генерация промежуточных кадров выполняется напрямую через Vulkan Compute шейдеры нейросети LSFG при перехвате `vkQueuePresentKHR`.
+            - **Аппаратный FP16 Rapid Packed Math**: Аппаратное ускорение половинной точности на RDNA2 GPU Steam Deck — инференс занимает всего ~4–6 мс на кадр.
+            - **Множители 2x, 3x, 4x**: Плавный выбор между удвоением, утроением и учетверением кадров (30 → 60 FPS, 30 → 90 FPS на OLED, 45 → 90 FPS).
+            - **Автоматический поиск Lossless.dll**: Плагин самостоятельно находит вашу купленную лицензионную копию Lossless Scaling в Steam (на внутреннем накопителе и MicroSD).
+            - **Полная поддержка 64-bit и 32-bit**: Скомпилированы слои под обе разрядности (`liblsfg-vk-layer.so` и `liblsfg-vk-layer_32.so`).
+            - **Встроенная утилита диагностики**: Добавлена CLI-утилита `lsfg-vk-cli` для быстрой проверки конфигурации и целостности.
 
-            ### ⚡ 2. Двухдвижковая архитектура (Dual-Engine)
-            В меню плагина Decky теперь доступен селектор движка генерации:
-            1. **⭐ LSFG Нейросеть (Lossless Scaling)**: максимальное нейросетевое качество интерполяции с поддержкой FP16 и 2x/3x/4x.
-            2. **SkyFrame DIS (Нативный оптический поток)**: полностью автономный встроенный алгоритм DIS-Flow + TV-L1 с 3x3 векторной медианной очисткой (работает без сторонних файлов).
-
-            ### 🎮 3. Полная поддержка 64-bit и 32-bit (Multilib)
-            - Скомпилированы и упакованы 64-битные и 32-битные версии обоих Vulkan-слоев (`libVkLayer_skyframe.so`, `liblsfg-vk-layer.so`).
-            - Поддержка классических 32-битных игр и современных 64-битных блокбастеров.
-
-            ### 🛠️ 4. Встроенная диагностика (lsfg-vk-cli)
-            - В плагин интегрирована утилита `lsfg-vk-cli healthcheck` для мгновенной проверки корректности установки и валидации файлов.
+            ### 📋 Как использовать
+            1. В клиенте Steam откройте свойства купленного **Lossless Scaling**:
+               `Свойства -> Бета-версии -> Выберите ветку "lsfg-vk"`.
+            2. Установите `SkyFrame.zip` через Decky Loader.
+            3. В меню SkyFrame включите генерацию кадров, выберите множитель (2x / 3x / 4x) и режим FP16.
+            4. В свойствах игры укажите параметр запуска:
+               `ENABLE_LSFGVK=1 %command%`
+               (Либо включите **«Глобальный режим»** в плагине, чтобы LSFG инжектировался во все игры автоматически).
           files: SkyFrame.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

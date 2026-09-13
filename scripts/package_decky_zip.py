@@ -14,27 +14,9 @@ def package_decky():
     if not os.path.isfile(index_js):
         raise RuntimeError("dist/index.js is missing! Run 'npm run build' inside decky-plugin first.")
 
-    # 2. Ensure bin/ directory has layer manifest and models
+    # 2. Ensure bin/ directory exists
     bin_dir = os.path.join(plugin_dir, "bin")
     os.makedirs(bin_dir, exist_ok=True)
-    models_dst = os.path.join(bin_dir, "models")
-    os.makedirs(models_dst, exist_ok=True)
-
-    models_src = os.path.join(project_dir, "models")
-    if os.path.isdir(models_src):
-        for f in os.listdir(models_src):
-            s = os.path.join(models_src, f)
-            d = os.path.join(models_dst, f)
-            if os.path.isfile(s):
-                shutil.copy2(s, d)
-
-    manifest_src = os.path.join(project_dir, "layer", "vk_layer_skyframe.json.in")
-    manifest_dst = os.path.join(bin_dir, "vk_layer_skyframe.json")
-    if os.path.isfile(manifest_src):
-        with open(manifest_src, "r", encoding="utf-8") as f:
-            content = f.read()
-        with open(manifest_dst, "w", encoding="utf-8") as f:
-            f.write(content)
 
     # 3. Create zip archive with "SkyFrame/" root directory
     print(f"Creating Decky Plugin archive: {output_zip}...")
