@@ -13,6 +13,8 @@ layout(push_constant) uniform PushConstants {
     int   show_hud;
     int   hud_protection;
     int   mode;
+    int   flow_width;
+    int   flow_height;
 } pc;
 
 float getLuma(vec3 c) {
@@ -43,14 +45,12 @@ vec4 sampleBilinearFrame1(vec2 pos, ivec2 size) {
     return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
 }
 
-vec4 sampleDenseFlowBilinear(vec2 pixelCoord, ivec2 fieldSize) {
-    // 4x4 block centers are located at (4*bx + 1.5, 4*by + 1.5).
-    // Continuous block coordinate is therefore (pixelCoord - 1.5) / 4.0.
-    vec2 blockCoord = (pixelCoord - vec2(1.5)) * 0.25;
-    blockCoord = clamp(blockCoord, vec2(0.0), vec2(fieldSize - 1));
-    ivec2 i0 = ivec2(floor(blockCoord));
-    ivec2 i1 = min(i0 + ivec2(1, 1), fieldSize - 1);
-    vec2 f = fract(blockCoord);
+vec4 sampleDenseFlowBilinear(vec2 normPos, ivec2 flowSize) {
+    vec2 flowPos = normPos * vec2(flowSize) - 0.5;
+    flowPos = clamp(flowPos, vec2(0.0), vec2(flowSize - 1));
+    ivec2 i0 = ivec2(floor(flowPos));
+    ivec2 i1 = min(i0 + ivec2(1, 1), flowSize - 1);
+    vec2 f = fract(flowPos);
 
     vec4 v00 = imageLoad(u_DenseFlow, ivec2(i0.x, i0.y));
     vec4 v10 = imageLoad(u_DenseFlow, ivec2(i1.x, i0.y));
@@ -68,10 +68,11 @@ void main() {
 
     ivec2 size = ivec2(pc.width, pc.height);
     ivec2 maxCoord = size - ivec2(1, 1);
-    ivec2 fieldSize = ivec2((pc.width + 3) / 4, (pc.height + 3) / 4);
+    ivec2 flowSize = ivec2(pc.flow_width, pc.flow_height);
+    vec2 normPos = (vec2(pixelCoord) + 0.5) / vec2(size);
 
     // 1. Bilinearly interpolated continuous motion vector and occlusion factor
-    vec4 flowData = sampleDenseFlowBilinear(vec2(pixelCoord), fieldSize);
+    vec4 flowData = sampleDenseFlowBilinear(normPos, flowSize);
     vec2 flow = flowData.xy;
     float occ = flowData.w;
 

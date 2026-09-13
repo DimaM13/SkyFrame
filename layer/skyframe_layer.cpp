@@ -129,6 +129,12 @@ void ReloadConfig() {
                     int hz = std::atoi(line.c_str() + colon + 1);
                     if (hz >= 30 && hz <= 240) g_config.target_hz = hz;
                 }
+            } else if (line.find("\"flow_scale\"") != std::string::npos) {
+                size_t colon = line.find(':');
+                if (colon != std::string::npos) {
+                    float s = std::strtof(line.c_str() + colon + 1, nullptr);
+                    if (s >= 0.25f && s <= 1.0f) g_config.flow_scale = s;
+                }
             }
         }
     }
@@ -149,6 +155,11 @@ void ReloadConfig() {
     const char* envHud = getenv("SKYFRAME_HUD");
     if (envHud && (strcmp(envHud, "1") == 0 || strcmp(envHud, "true") == 0)) {
         g_config.show_hud = true;
+    }
+    const char* envFlowScale = getenv("SKYFRAME_FLOW_SCALE");
+    if (envFlowScale && strlen(envFlowScale) > 0) {
+        float s = std::strtof(envFlowScale, nullptr);
+        if (s >= 0.25f && s <= 1.0f) g_config.flow_scale = s;
     }
 }
 
@@ -185,8 +196,8 @@ static void CheckHotReload() {
     if (changed) {
         ReloadConfig();
         auto& cfg = GetConfig();
-        Log("Hot-reload applied: enabled=%d, mode=%d, show_hud=%d, hud_protection=%d, target_hz=%d",
-            cfg.enabled, cfg.mode, cfg.show_hud, cfg.hud_protection, cfg.target_hz);
+        Log("Hot-reload applied: enabled=%d, mode=%d, show_hud=%d, hud_protection=%d, target_hz=%d, flow_scale=%.2f",
+            cfg.enabled, cfg.mode, cfg.show_hud, cfg.hud_protection, cfg.target_hz, cfg.flow_scale);
     }
 }
 
@@ -318,6 +329,8 @@ struct BlendPushConstants {
     int   show_hud;
     int   hud_protection;
     int   mode;
+    int   flow_width;
+    int   flow_height;
 };
 
 struct SwapchainContext {
@@ -762,15 +775,15 @@ static bool InitPipelines(SwapchainContext* ctx) {
             Log("Pipelines: failed to create coarseFlow for slot %zu", i);
             return false;
         }
-        if (!CreateStorageImage2D(ctx->device, ctx->physDevice, pyrW, pyrH, VK_FORMAT_R16G16B16A16_SFLOAT,
+        if (!CreateStorageImage2D(ctx->device, ctx->physDevice, ctx->extent.width, ctx->extent.height, VK_FORMAT_R16G16B16A16_SFLOAT,
                                  ctx->slots[i].denseFlow, ctx->slots[i].denseFlowMemory, ctx->slots[i].denseFlowView)) {
             Log("Pipelines: failed to create denseFlow for slot %zu", i);
             return false;
         }
     }
 
-    Log("Pipelines: Option 2 Hierarchical Pyramidal Coarse-to-Fine Pipeline initialized! (Pyr: %ux%u, Coarse: %ux%u, Dense: %ux%u)",
-        pyrW, pyrH, coarseW, coarseH, pyrW, pyrH);
+    Log("Pipelines: Option 2 Hierarchical Pyramidal Coarse-to-Fine Pipeline initialized! (Pyr: %ux%u, Coarse: %ux%u, DenseMax: %ux%u)",
+        pyrW, pyrH, coarseW, coarseH, ctx->extent.width, ctx->extent.height);
     return true;
 #else
     Log("Pipelines: Required shader SPV headers not available");
@@ -1251,6 +1264,12 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             uint32_t coarseW = (pyrW + 3) / 4;
             uint32_t coarseH = (pyrH + 3) / 4;
 
+            float flowScale = std::clamp(cfg.flow_scale, 0.50f, 1.00f);
+            uint32_t flowW = static_cast<uint32_t>(std::round(fullW * flowScale));
+            uint32_t flowH = static_cast<uint32_t>(std::round(fullH * flowScale));
+            flowW = std::clamp(flowW, 16u, fullW);
+            flowH = std::clamp(flowH, 16u, fullH);
+
             // --- 1. Update Descriptor Sets for All 4 Passes ---
             // Pass 0 (Downsample): Frame0, Frame1, Luma0, Luma1
             VkDescriptorImageInfo downImageInfos[4]{};
@@ -1465,20 +1484,20 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
 
             g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 2, pass1To2Barriers);
 
-            // Dispatch Pass 2 (Dense Flow Refinement: 320x200 grid)
+            // Dispatch Pass 2 (Dense Flow Refinement: flowW x flowH grid)
             g_pfnCmdBindPipeline(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->refinePipeline);
             g_pfnCmdBindDescriptorSets(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->refinePipelineLayout, 0, 1, &slot.refineDescSet, 0, nullptr);
 
             RefinePushConstants refinePc{
                 static_cast<int>(fullW),
                 static_cast<int>(fullH),
-                static_cast<int>(pyrW),
-                static_cast<int>(pyrH),
+                static_cast<int>(flowW),
+                static_cast<int>(flowH),
                 static_cast<int>(coarseW),
                 static_cast<int>(coarseH)
             };
             g_pfnCmdPushConstants(slot.cmdBuffer, ctx->refinePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(refinePc), &refinePc);
-            g_pfnCmdDispatch(slot.cmdBuffer, (pyrW + 7) / 8, (pyrH + 7) / 8, 1);
+            g_pfnCmdDispatch(slot.cmdBuffer, (flowW + 7) / 8, (flowH + 7) / 8, 1);
 
             // Barrier Pass 2 -> Pass 3:
             // denseFlow: write -> read
@@ -1516,7 +1535,9 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                 static_cast<int>(fullH),
                 cfg.show_hud ? 1 : 0,
                 cfg.hud_protection ? 1 : 0,
-                cfg.mode
+                cfg.mode,
+                static_cast<int>(flowW),
+                static_cast<int>(flowH)
             };
             g_pfnCmdPushConstants(slot.cmdBuffer, ctx->blendPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(blendPc), &blendPc);
             g_pfnCmdDispatch(slot.cmdBuffer, (fullW + 7) / 8, (fullH + 7) / 8, 1);

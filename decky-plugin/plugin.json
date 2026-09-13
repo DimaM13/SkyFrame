@@ -5,7 +5,7 @@
     "root"
   ],
   "api_version": 1,
-  "version": "1.5.0",
-  "description": "Native Frame Generation for Steam Deck (Pyramidal Coarse-to-Fine Optical Flow)",
+  "version": "1.5.1",
+  "description": "Native Frame Generation for Steam Deck (90% High-Density Optical Flow & In-Game Resolution Slider)",
   "icon": "icon.svg"
 }

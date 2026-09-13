@@ -101,8 +101,8 @@ void main() {
             }
         }
 
-        // Flat surface lock
-        if (s_zeroSAD < 0.04 || s_zeroSAD <= minVal * 1.25) {
+        // Zero-bias: if there's no meaningful motion (zero SAD is very low or matches minimum within noise floor)
+        if (bestIdx == 0 || s_zeroSAD < 0.012 || (s_zeroSAD - minVal < 0.015 && s_zeroSAD < 0.035)) {
             s_bestVec = ivec2(0, 0);
         } else {
             s_bestVec = kCoarseCandidates[bestIdx];

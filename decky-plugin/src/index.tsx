@@ -4,6 +4,7 @@ import {
   PanelSectionRow,
   ToggleField,
   DropdownItem,
+  SliderField,
   staticClasses
 } from "@decky/ui";
 import {
@@ -22,6 +23,7 @@ interface SkyFrameConfig {
   multiplier: number;
   target_hz?: number;
   show_hud?: boolean;
+  flow_scale?: number;
 }
 
 interface StatusInfo {
@@ -41,6 +43,7 @@ const setModeCall = callable<[mode: number], SkyFrameConfig>("set_mode");
 const setHudProtectionCall = callable<[hud_protection: boolean], SkyFrameConfig>("set_hud_protection");
 const setShowHudCall = callable<[show_hud: boolean], SkyFrameConfig>("set_show_hud");
 const setTargetHzCall = callable<[target_hz: number], SkyFrameConfig>("set_target_hz");
+const setFlowScaleCall = callable<[flow_scale: number], SkyFrameConfig>("set_flow_scale");
 const getStatsCall = callable<[], { base_fps: number; output_fps: number; target_hz?: number }>("get_stats");
 const getStatusInfoCall = callable<[], StatusInfo>("get_status_info");
 
@@ -51,6 +54,7 @@ function Content() {
   const [hudProtection, setHudProtection] = useState<boolean>(true);
   const [showHud, setShowHud] = useState<boolean>(false);
   const [targetHz, setTargetHz] = useState<number>(60);
+  const [flowScale, setFlowScale] = useState<number>(90);
   const [baseFps, setBaseFps] = useState<number>(30);
   const [outputFps, setOutputFps] = useState<number>(60);
   const [status, setStatus] = useState<StatusInfo | null>(null);
@@ -64,6 +68,7 @@ function Content() {
         setHudProtection(Boolean(res.hud_protection ?? true));
         setShowHud(Boolean(res.show_hud ?? false));
         if (res.target_hz) setTargetHz(Number(res.target_hz));
+        if (res.flow_scale !== undefined) setFlowScale(Math.round(Number(res.flow_scale) * 100));
       }
     }).catch((e) => console.error("[SkyFrame] Error loading config:", e));
 
@@ -140,6 +145,11 @@ function Content() {
     setShowHudCall(val).catch(console.error);
   };
 
+  const handleFlowScaleChange = (val: number) => {
+    setFlowScale(val);
+    setFlowScaleCall(val / 100.0).catch(console.error);
+  };
+
   const copyToClipboard = (cmd: string, desc: string) => {
     try {
       if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -194,6 +204,20 @@ function Content() {
             rgOptions={modeOptions}
             selectedOption={mode}
             onChange={(opt) => handleModeChange(Number(opt.data))}
+          />
+        </PanelSectionRow>
+
+        <PanelSectionRow>
+          <SliderField
+            label="Разрешение потока движения"
+            description="Плотность оптического потока (90% по умолчанию)"
+            value={flowScale}
+            min={50}
+            max={100}
+            step={5}
+            showValue={true}
+            valueSuffix="%"
+            onChange={handleFlowScaleChange}
           />
         </PanelSectionRow>
 

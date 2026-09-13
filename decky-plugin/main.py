@@ -34,7 +34,8 @@ DEFAULT_CONFIG = {
     "hud_protection": True,
     "hud_threshold": 0.08,
     "target_hz": 60,           # Target display refresh rate (auto-synced with Steam Deck QAM)
-    "show_hud": False
+    "show_hud": False,
+    "flow_scale": 0.90         # Optical flow resolution scale (0.50 to 1.00, default 0.90)
 }
 
 def detect_system_refresh_rate() -> int:
@@ -276,6 +277,16 @@ class Plugin:
         if hz >= 30 and hz <= 240:
             self.config["target_hz"] = int(hz)
             self.save_config()
+        return self.config
+
+    async def set_flow_scale(self, flow_scale: float):
+        try:
+            val = float(flow_scale)
+            if 0.50 <= val <= 1.00:
+                self.config["flow_scale"] = round(val, 2)
+                self.save_config()
+        except Exception as e:
+            logging.error(f"[SkyFrame] Failed to set flow_scale: {e}")
         return self.config
 
     async def get_stats(self):

@@ -25,6 +25,7 @@ struct LayerConfig {
     int target_fps = 0;         // 0 = unconstrained / match refresh rate
     int target_hz = 60;         // Target display refresh rate (e.g. 60, 90, 40, 45, 50, 72, 80, 120)
     bool show_hud = false;      // Visual debug indicator on generated frames
+    float flow_scale = 0.90f;   // Optical flow resolution scale (0.50f - 1.00f, default 0.90f)
 };
 
 // Global config singleton loaded from /home/deck/.config/skyframe/config.json
