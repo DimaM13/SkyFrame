@@ -25,12 +25,18 @@ if [ -z "${LSFG_CONFIG:-}" ] && [ -f "$HOME/.config/lsfg-vk/conf.toml" ]; then
   export LSFG_CONFIG="$HOME/.config/lsfg-vk/conf.toml"
 fi
 
+# Pin the Default profile via override: this engine matches active_in by
+# exact/ends_with comparison only, so a "*" wildcard NEVER matches any
+# process (see lsfg-vk-common/src/configuration/detection.cpp:findProfile).
+# LSFGVK_PROFILE=Default hits matchByName first and works for every game.
+export LSFGVK_PROFILE=Default
+
 LOG="$HOME/skyframe_game.log"
 if [ "$DEBUG" = "1" ]; then
   {
     echo "=== [skyframe-run] $(date -u +%FT%TZ) ==="
     echo "[skyframe-run] cmd: $*"
-    echo "[skyframe-run] env: ENABLE_SKYFRAME=${ENABLE_SKYFRAME:-<unset>} DISABLE_SKYFRAME=${DISABLE_SKYFRAME:-<unset>} LSFG_CONFIG=${LSFG_CONFIG:-<default>}"
+    echo "[skyframe-run] env: ENABLE_SKYFRAME=${ENABLE_SKYFRAME:-<unset>} DISABLE_SKYFRAME=${DISABLE_SKYFRAME:-<unset>} LSFGVK_PROFILE=${LSFGVK_PROFILE:-<unset>} LSFG_CONFIG=${LSFG_CONFIG:-<default>}"
     echo "[skyframe-run] manifests:"
     ls -la "$HOME/.local/share/vulkan/implicit_layer.d/" 2>&1
     echo "[skyframe-run] conf head:"
