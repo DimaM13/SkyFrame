@@ -21,6 +21,16 @@
 
 #include <vulkan/vulkan_core.h>
 
+#ifndef VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT
+#define VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT static_cast<VkStructureType>(1000275001)
+typedef struct VkSwapchainPresentModeInfoEXT {
+    VkStructureType sType;
+    const void* pNext;
+    uint32_t swapchainCount;
+    const VkPresentModeKHR* pPresentModes;
+} VkSwapchainPresentModeInfoEXT;
+#endif
+
 using namespace lsfgvk;
 using namespace lsfgvk::layer;
 
