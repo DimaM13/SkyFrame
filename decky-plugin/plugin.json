@@ -5,7 +5,7 @@
     "root"
   ],
   "api_version": 1,
-  "version": "1.5.1",
-  "description": "Native Frame Generation for Steam Deck (90% High-Density Optical Flow & In-Game Resolution Slider)",
+  "version": "1.6.0",
+  "description": "Native Frame Generation for Steam Deck (DIS-Flow & TV-L1 Variational Regularization, Zero Blocks)",
   "icon": "icon.svg"
 }

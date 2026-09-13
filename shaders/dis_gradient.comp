@@ -1,0 +1,96 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0, rgba8) uniform readonly image2D u_Frame0;
+layout(binding = 1, rgba8) uniform readonly image2D u_Frame1;
+layout(binding = 2, rgba16f) uniform writeonly image2D u_Grad0;
+layout(binding = 3, r32f)  uniform writeonly image2D u_Luma1;
+
+layout(push_constant) uniform GradientPushConstants {
+    int in_width;   // fullW (e.g. 1280)
+    int in_height;  // fullH (e.g. 800)
+    int out_width;  // gradW (e.g. 320)
+    int out_height; // gradH (e.g. 200)
+} pc;
+
+shared float s_luma0[10][10];
+
+float rgbToLuma(vec3 c) {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+float sampleBoxLuma0(ivec2 lowCoord) {
+    lowCoord = clamp(lowCoord, ivec2(0), ivec2(pc.out_width - 1, pc.out_height - 1));
+    ivec2 baseIn = lowCoord * 4;
+    ivec2 maxIn = ivec2(pc.in_width - 1, pc.in_height - 1);
+    float sum = 0.0;
+    for (int dy = 0; dy < 4; ++dy) {
+        for (int dx = 0; dx < 4; ++dx) {
+            ivec2 p = min(baseIn + ivec2(dx, dy), maxIn);
+            sum += rgbToLuma(imageLoad(u_Frame0, p).rgb);
+        }
+    }
+    return sum * (1.0 / 16.0);
+}
+
+float sampleBoxLuma1(ivec2 lowCoord) {
+    lowCoord = clamp(lowCoord, ivec2(0), ivec2(pc.out_width - 1, pc.out_height - 1));
+    ivec2 baseIn = lowCoord * 4;
+    ivec2 maxIn = ivec2(pc.in_width - 1, pc.in_height - 1);
+    float sum = 0.0;
+    for (int dy = 0; dy < 4; ++dy) {
+        for (int dx = 0; dx < 4; ++dx) {
+            ivec2 p = min(baseIn + ivec2(dx, dy), maxIn);
+            sum += rgbToLuma(imageLoad(u_Frame1, p).rgb);
+        }
+    }
+    return sum * (1.0 / 16.0);
+}
+
+void main() {
+    ivec2 outCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 localId  = ivec2(gl_LocalInvocationID.xy);
+    ivec2 groupOrigin = ivec2(gl_WorkGroupID.xy) * 8;
+
+    // 1. Cooperative load of 10x10 tile into shared memory (8x8 threads loading 100 elements)
+    uint tid = gl_LocalInvocationIndex; // 0..63
+    for (uint i = tid; i < 100u; i += 64u) {
+        int ly = int(i / 10u);
+        int lx = int(i % 10u);
+        ivec2 c = groupOrigin + ivec2(lx - 1, ly - 1);
+        s_luma0[ly][lx] = sampleBoxLuma0(c);
+    }
+
+    barrier();
+
+    if (outCoord.x >= pc.out_width || outCoord.y >= pc.out_height) {
+        return;
+    }
+
+    // 2. Compute 3x3 Sobel spatial gradients from shared memory
+    int sx = localId.x + 1;
+    int sy = localId.y + 1;
+
+    float tl = s_luma0[sy - 1][sx - 1];
+    float tc = s_luma0[sy - 1][sx];
+    float tr = s_luma0[sy - 1][sx + 1];
+    float ml = s_luma0[sy][sx - 1];
+    float mc = s_luma0[sy][sx];
+    float mr = s_luma0[sy][sx + 1];
+    float bl = s_luma0[sy + 1][sx - 1];
+    float bc = s_luma0[sy + 1][sx];
+    float br = s_luma0[sy + 1][sx + 1];
+
+    // Standard normalized Sobel kernel
+    float Ix = ((tr + 2.0 * mr + br) - (tl + 2.0 * ml + bl)) * (1.0 / 8.0);
+    float Iy = ((bl + 2.0 * bc + br) - (tl + 2.0 * tc + tr)) * (1.0 / 8.0);
+
+    // Also sample Frame 1 Luma for this coordinate
+    float luma1 = sampleBoxLuma1(outCoord);
+
+    // Store in output storage images:
+    // u_Grad0: (Ix, Iy, luma0, gradientMagnitude)
+    float gradMag = sqrt(Ix * Ix + Iy * Iy);
+    imageStore(u_Grad0, outCoord, vec4(Ix, Iy, mc, gradMag));
+    imageStore(u_Luma1, outCoord, vec4(luma1, 0.0, 0.0, 0.0));
+}

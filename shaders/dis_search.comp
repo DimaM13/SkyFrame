@@ -1,0 +1,141 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0, rgba16f) uniform readonly image2D u_Grad0;
+layout(binding = 1, r32f)    uniform readonly image2D u_Luma1;
+layout(binding = 2, rgba16f) uniform writeonly image2D u_RawFlow;
+
+layout(push_constant) uniform SearchPushConstants {
+    int grad_width;   // e.g. 320
+    int grad_height;  // e.g. 200
+    int full_width;   // e.g. 1280
+    int full_height;  // e.g. 800
+} pc;
+
+float sampleLuma1Bilinear(vec2 pos, ivec2 size) {
+    pos = clamp(pos, vec2(0.0), vec2(size - 1));
+    ivec2 i0 = ivec2(floor(pos));
+    ivec2 i1 = min(i0 + ivec2(1, 1), size - 1);
+    vec2 f = fract(pos);
+    float c00 = imageLoad(u_Luma1, ivec2(i0.x, i0.y)).r;
+    float c10 = imageLoad(u_Luma1, ivec2(i1.x, i0.y)).r;
+    float c01 = imageLoad(u_Luma1, ivec2(i0.x, i1.y)).r;
+    float c11 = imageLoad(u_Luma1, ivec2(i1.x, i1.y)).r;
+    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
+
+// 17 sparse spatial seed vectors covering radii from 0 to 10 low-res px (0 to 40 full-res px)
+const vec2 kSeeds[17] = vec2[17](
+    vec2(0.0, 0.0),
+    vec2(-1.5, 0.0), vec2(1.5, 0.0), vec2(0.0, -1.5), vec2(0.0, 1.5),
+    vec2(-3.5, 0.0), vec2(3.5, 0.0), vec2(0.0, -3.5), vec2(0.0, 3.5),
+    vec2(-2.5, -2.5), vec2(2.5, -2.5), vec2(-2.5, 2.5), vec2(2.5, 2.5),
+    vec2(-7.0, 0.0), vec2(7.0, 0.0), vec2(0.0, -7.0), vec2(0.0, 7.0)
+);
+
+// 9-point cross stencil for patch evaluation (dx, dy in [-2..2])
+const ivec2 kPatchOffsets[9] = ivec2[9](
+    ivec2(0, 0),
+    ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1),
+    ivec2(-2, -2), ivec2(2, -2), ivec2(-2, 2), ivec2(2, 2)
+);
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size  = ivec2(pc.grad_width, pc.grad_height);
+    if (coord.x >= size.x || coord.y >= size.y) {
+        return;
+    }
+
+    // 1. Accumulate 2x2 Structure Tensor / Hessian H on the reference template I0
+    // H = sum [Ix^2, Ix*Iy; Ix*Iy, Iy^2] + lambda * I
+    float H00 = 0.0;
+    float H11 = 0.0;
+    float H01 = 0.0;
+
+    // Cache patch samples in local registers
+    float patch_Ix[9];
+    float patch_Iy[9];
+    float patch_T[9];
+    ivec2 patch_pos[9];
+
+    for (int k = 0; k < 9; ++k) {
+        ivec2 p = clamp(coord + kPatchOffsets[k], ivec2(0), size - 1);
+        vec4 g = imageLoad(u_Grad0, p);
+        patch_pos[k] = p;
+        patch_Ix[k]  = g.x;
+        patch_Iy[k]  = g.y;
+        patch_T[k]   = g.z; // luma0
+
+        H00 += g.x * g.x;
+        H11 += g.y * g.y;
+        H01 += g.x * g.y;
+    }
+
+    // Regularization parameter lambda (guarantees invertibility and prevents flat-area drift)
+    float lambda = 0.008;
+    H00 += lambda;
+    H11 += lambda;
+
+    // Invert 2x2 Hessian
+    float detH = H00 * H11 - H01 * H01;
+    float invDet = 1.0 / max(detH, 1e-7);
+    mat2 invH = mat2(H11 * invDet, -H01 * invDet,
+                    -H01 * invDet,  H00 * invDet);
+
+    // 2. Select the best initial seed motion vector from multi-speed candidates
+    vec2 bestSeed = vec2(0.0, 0.0);
+    float minSAD = 1e9;
+
+    for (int s = 0; s < 17; ++s) {
+        vec2 cand = kSeeds[s];
+        float sad = 0.0;
+        for (int k = 0; k < 9; ++k) {
+            vec2 samplePos = vec2(patch_pos[k]) + cand;
+            float l1 = sampleLuma1Bilinear(samplePos, size);
+            sad += abs(l1 - patch_T[k]);
+        }
+        // Small bias towards zero motion to avoid drifting on flat textures
+        if (s == 0) sad *= 0.92;
+
+        if (sad < minSAD) {
+            minSAD = sad;
+            bestSeed = cand;
+        }
+    }
+
+    // 3. Dense Inverse Compositional Gradient Descent Refinement (2 subpixel iterations)
+    vec2 curFlow = bestSeed;
+    for (int iter = 0; iter < 2; ++iter) {
+        vec2 b = vec2(0.0, 0.0);
+        for (int k = 0; k < 9; ++k) {
+            vec2 samplePos = vec2(patch_pos[k]) + curFlow;
+            float l1 = sampleLuma1Bilinear(samplePos, size);
+            float residual = l1 - patch_T[k];
+            b.x += patch_Ix[k] * residual;
+            b.y += patch_Iy[k] * residual;
+        }
+
+        vec2 delta = -(invH * b);
+        // Clamp step size to maintain numerical stability
+        delta = clamp(delta, vec2(-1.5), vec2(1.5));
+        curFlow += delta;
+    }
+
+    // 4. Compute final confidence & residual
+    float finalDiff = 0.0;
+    for (int k = 0; k < 9; ++k) {
+        vec2 samplePos = vec2(patch_pos[k]) + curFlow;
+        float l1 = sampleLuma1Bilinear(samplePos, size);
+        finalDiff += abs(l1 - patch_T[k]);
+    }
+    finalDiff *= (1.0 / 9.0);
+
+    // Scale to full-resolution screen pixel coordinates (1 low-res px = 4 full-res px)
+    float scaleFactor = float(pc.full_width) / float(pc.grad_width);
+    vec2 fullResVec = curFlow * scaleFactor;
+
+    // Output: (flowX, flowY, residual, confidence)
+    float confidence = clamp(1.0 - finalDiff * 3.0, 0.1, 1.0);
+    imageStore(u_RawFlow, coord, vec4(fullResVec, finalDiff, confidence));
+}

@@ -318,3 +318,32 @@ class Plugin:
             "enabled": self.config.get("enabled", False),
             "global_mode": self.config.get("global_injection", False)
         }
+
+    async def copy_to_clipboard(self, text: str) -> bool:
+        logging.info(f"[SkyFrame] Copying to system clipboard: {text}")
+        uid, _ = get_target_uid_gid()
+        # 1. Try wl-copy (Wayland on SteamOS)
+        for wdisp in ["wayland-0", "wayland-1"]:
+            for rdir in [f"/run/user/{uid}", "/run/user/1000", "/tmp"]:
+                env = os.environ.copy()
+                env["XDG_RUNTIME_DIR"] = rdir
+                env["WAYLAND_DISPLAY"] = wdisp
+                try:
+                    import subprocess
+                    res = subprocess.run(["wl-copy"], input=text.encode("utf-8"), env=env, timeout=1)
+                    if res.returncode == 0:
+                        return True
+                except Exception:
+                    pass
+        # 2. Try xclip (X11 / Xwayland fallback)
+        for xdisp in [":0", ":1"]:
+            env = os.environ.copy()
+            env["DISPLAY"] = xdisp
+            try:
+                import subprocess
+                res = subprocess.run(["xclip", "-selection", "clipboard"], input=text.encode("utf-8"), env=env, timeout=1)
+                if res.returncode == 0:
+                    return True
+            except Exception:
+                pass
+        return False

@@ -44,6 +44,7 @@ const setHudProtectionCall = callable<[hud_protection: boolean], SkyFrameConfig>
 const setShowHudCall = callable<[show_hud: boolean], SkyFrameConfig>("set_show_hud");
 const setTargetHzCall = callable<[target_hz: number], SkyFrameConfig>("set_target_hz");
 const setFlowScaleCall = callable<[flow_scale: number], SkyFrameConfig>("set_flow_scale");
+const copyToClipboardCall = callable<[text: string], boolean>("copy_to_clipboard");
 const getStatsCall = callable<[], { base_fps: number; output_fps: number; target_hz?: number }>("get_stats");
 const getStatusInfoCall = callable<[], StatusInfo>("get_status_info");
 
@@ -152,16 +153,25 @@ function Content() {
 
   const copyToClipboard = (cmd: string, desc: string) => {
     try {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(cmd);
-      } else {
-        const textArea = document.createElement("textarea");
-        textArea.value = cmd;
-        document.body.appendChild(textArea);
-        textArea.select();
-        document.execCommand("copy");
-        document.body.removeChild(textArea);
+      // 1. Steam Client native clipboard API (SteamOS Gaming Mode)
+      if ((window as any).SteamClient?.System?.SetClipboardText) {
+        (window as any).SteamClient.System.SetClipboardText(cmd);
       }
+      // 2. Navigator clipboard API
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(cmd).catch(() => {});
+      }
+      // 3. Fallback textarea element execCommand
+      const textArea = document.createElement("textarea");
+      textArea.value = cmd;
+      document.body.appendChild(textArea);
+      textArea.select();
+      document.execCommand("copy");
+      document.body.removeChild(textArea);
+
+      // 4. Backend Python system clipboard (wl-copy / xclip directly on SteamOS host)
+      copyToClipboardCall(cmd).catch(console.error);
+
       toaster.toast({
         title: "SkyFrame",
         body: `Скопировано: ${desc}`
@@ -171,19 +181,13 @@ function Content() {
     }
   };
 
-  const modeOptions = [
-    { data: 0, label: "🚀 Лёгкий (180p) — для тяжелых AAA" },
-    { data: 1, label: "⚖️ Баланс (240p) — рекомендуемый" },
-    { data: 2, label: "💎 Качество (360p) — макс. резкость" }
-  ];
-
   return (
     <>
       <PanelSection title="SkyFrame: Нативная генерация">
         <PanelSectionRow>
           <ToggleField
             label="Генерация кадров (2x)"
-            description="Аппаратный сдвиг пикселей Vulkan FastWarp"
+            description="Аппаратный оптический поток DIS-Flow + TV-L1 (Vulkan Compute)"
             checked={enabled}
             onChange={handleToggle}
           />
@@ -195,15 +199,6 @@ function Content() {
             description="Слой активен во ВСЕХ играх без указания параметров в Steam"
             checked={globalMode}
             onChange={handleGlobalToggle}
-          />
-        </PanelSectionRow>
-
-        <PanelSectionRow>
-          <DropdownItem
-            label="Профиль вычислений"
-            rgOptions={modeOptions}
-            selectedOption={mode}
-            onChange={(opt) => handleModeChange(Number(opt.data))}
           />
         </PanelSectionRow>
 
@@ -252,7 +247,7 @@ function Content() {
             }}>
               <div style={{ display: "flex", justifyContent: "space-between" }}>
                 <span style={{ color: "#aaa" }}>Статус:</span>
-                <span style={{ color: "#4ade80", fontWeight: "bold" }}>● Активно (Vulkan FastWarp)</span>
+                <span style={{ color: "#4ade80", fontWeight: "bold" }}>● Активно (DIS-Flow + TV-L1)</span>
               </div>
               <div style={{ display: "flex", justifyContent: "space-between" }}>
                 <span style={{ color: "#aaa" }}>Частота кадров:</span>
@@ -262,7 +257,7 @@ function Content() {
               </div>
               <div style={{ display: "flex", justifyContent: "space-between" }}>
                 <span style={{ color: "#aaa" }}>Движок:</span>
-                <span style={{ color: "#fff" }}>RIFE 4.6 + RDNA2 FP16</span>
+                <span style={{ color: "#4ade80", fontWeight: "bold" }}>DIS-Flow + TV-L1 (Vulkan Compute)</span>
               </div>
               {status && (
                 <div style={{ display: "flex", justifyContent: "space-between", borderTop: "1px solid rgba(255,255,255,0.1)", paddingTop: "4px" }}>

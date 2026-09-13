@@ -104,7 +104,7 @@ void main() {
 
     // 4. True Chronological Symmetric Interpolation with Occlusion-Aware Soft Blending
     vec4 motionBlended = mix(sample0, sample1, 0.5);
-    float blendWeight = clamp(occ, 0.20, 1.0);
+    float blendWeight = clamp(occ, 0.35, 1.0);
     vec4 finalColor = mix(sample1, motionBlended, blendWeight);
 
     // Visual HUD marker (neon green square in top-left corner)

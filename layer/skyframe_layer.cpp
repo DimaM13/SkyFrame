@@ -42,6 +42,18 @@
 #include "flow_refine_comp_spv.h"
 #define HAVE_FLOW_REFINE 1
 #endif
+#if __has_include("dis_gradient_comp_spv.h")
+#include "dis_gradient_comp_spv.h"
+#define HAVE_DIS_GRADIENT 1
+#endif
+#if __has_include("dis_search_comp_spv.h")
+#include "dis_search_comp_spv.h"
+#define HAVE_DIS_SEARCH 1
+#endif
+#if __has_include("dis_smooth_comp_spv.h")
+#include "dis_smooth_comp_spv.h"
+#define HAVE_DIS_SMOOTH 1
+#endif
 
 namespace skyframe {
 
@@ -299,6 +311,29 @@ struct PendingPresent {
     uint32_t imageIndex = 0;
     VkSemaphore waitSemaphore = VK_NULL_HANDLE;
     std::chrono::steady_clock::time_point targetTime;
+};
+
+struct GradientPushConstants {
+    int in_width;
+    int in_height;
+    int out_width;
+    int out_height;
+};
+
+struct SearchPushConstants {
+    int grad_width;
+    int grad_height;
+    int full_width;
+    int full_height;
+};
+
+struct SmoothPushConstants {
+    int full_width;
+    int full_height;
+    int dense_width;
+    int dense_height;
+    int raw_width;
+    int raw_height;
 };
 
 struct DownPushConstants {
@@ -569,7 +604,7 @@ static void DestroyStorageImage2D(
 }
 
 static bool InitPipelines(SwapchainContext* ctx) {
-#if HAVE_WARP_BLEND && HAVE_PYRAMID_DOWN && HAVE_FLOW_COARSE && HAVE_FLOW_REFINE
+#if HAVE_WARP_BLEND && HAVE_DIS_GRADIENT && HAVE_DIS_SEARCH && HAVE_DIS_SMOOTH
     if (!g_pfnCreateShaderModule || !g_pfnCreateDescriptorSetLayout ||
         !g_pfnCreatePipelineLayout || !g_pfnCreateComputePipelines ||
         !g_pfnCreateDescriptorPool || !g_pfnAllocateDescriptorSets ||
@@ -620,6 +655,7 @@ static bool InitPipelines(SwapchainContext* ctx) {
         return true;
     }
 
+    // Helper lambda to create a compute pipeline
     auto createComputePipeline = [&](const uint32_t* spvCode, size_t spvSize,
                                      uint32_t bindingCount, uint32_t pushConstantSize,
                                      VkShaderModule& outModule, VkDescriptorSetLayout& outDescLayout,
@@ -676,27 +712,27 @@ static bool InitPipelines(SwapchainContext* ctx) {
         return true;
     };
 
-    // 2. Pass 0: Pyramid Downsampler (4 bindings: Frame0, Frame1, Luma0, Luma1)
-    if (!createComputePipeline(pyramid_down_comp_spv, pyramid_down_comp_spv_size,
-                               4, sizeof(DownPushConstants),
+    // 2. Pass 0: DIS Gradient & Structure Tensor (4 bindings: Frame0, Frame1, Grad0, Luma1)
+    if (!createComputePipeline(dis_gradient_comp_spv, dis_gradient_comp_spv_size,
+                               4, sizeof(GradientPushConstants),
                                ctx->downModule, ctx->downDescLayout, ctx->downPipelineLayout, ctx->downPipeline)) {
-        Log("Pipelines: failed to create pyramid_down compute pipeline");
+        Log("Pipelines: failed to create dis_gradient compute pipeline");
         return false;
     }
 
-    // 3. Pass 1: Coarse Motion Search (3 bindings: Luma0, Luma1, CoarseFlow)
-    if (!createComputePipeline(flow_coarse_comp_spv, flow_coarse_comp_spv_size,
-                               3, sizeof(CoarsePushConstants),
+    // 3. Pass 1: DIS Dense Inverse Search (3 bindings: Grad0, Luma1, RawFlow)
+    if (!createComputePipeline(dis_search_comp_spv, dis_search_comp_spv_size,
+                               3, sizeof(SearchPushConstants),
                                ctx->coarseModule, ctx->coarseDescLayout, ctx->coarsePipelineLayout, ctx->coarsePipeline)) {
-        Log("Pipelines: failed to create flow_coarse compute pipeline");
+        Log("Pipelines: failed to create dis_search compute pipeline");
         return false;
     }
 
-    // 4. Pass 2: Dense Flow Refinement (4 bindings: Frame0, Frame1, CoarseFlow, DenseFlow)
-    if (!createComputePipeline(flow_refine_comp_spv, flow_refine_comp_spv_size,
-                               4, sizeof(RefinePushConstants),
+    // 4. Pass 2: Variational TV-L1 Elastic Diffusion (3 bindings: RawFlow, Frame0, DenseFlow)
+    if (!createComputePipeline(dis_smooth_comp_spv, dis_smooth_comp_spv_size,
+                               3, sizeof(SmoothPushConstants),
                                ctx->refineModule, ctx->refineDescLayout, ctx->refinePipelineLayout, ctx->refinePipeline)) {
-        Log("Pipelines: failed to create flow_refine compute pipeline");
+        Log("Pipelines: failed to create dis_smooth compute pipeline");
         return false;
     }
 
@@ -755,28 +791,30 @@ static bool InitPipelines(SwapchainContext* ctx) {
         }
     }
 
-    // 7. Allocate intermediate pyramidal storage images for each ring slot
-    uint32_t pyrW = (ctx->extent.width + 3) / 4;
-    uint32_t pyrH = (ctx->extent.height + 3) / 4;
-    uint32_t coarseW = (pyrW + 3) / 4;
-    uint32_t coarseH = (pyrH + 3) / 4;
+    // 7. Allocate intermediate storage images for each ring slot
+    uint32_t gradW = (ctx->extent.width + 3) / 4;
+    uint32_t gradH = (ctx->extent.height + 3) / 4;
 
     for (size_t i = 0; i < RING_SIZE; ++i) {
-        if (!CreateStorageImage2D(ctx->device, ctx->physDevice, pyrW, pyrH, VK_FORMAT_R32_SFLOAT,
+        // lumaPyr0 = Grad0 (RGBA16F: Ix, Iy, luma0, gradMag)
+        if (!CreateStorageImage2D(ctx->device, ctx->physDevice, gradW, gradH, VK_FORMAT_R16G16B16A16_SFLOAT,
                                  ctx->slots[i].lumaPyr0, ctx->slots[i].lumaPyr0Memory, ctx->slots[i].lumaPyr0View)) {
             Log("Pipelines: failed to create lumaPyr0 for slot %zu", i);
             return false;
         }
-        if (!CreateStorageImage2D(ctx->device, ctx->physDevice, pyrW, pyrH, VK_FORMAT_R32_SFLOAT,
+        // lumaPyr1 = Luma1 (R32F: luma1)
+        if (!CreateStorageImage2D(ctx->device, ctx->physDevice, gradW, gradH, VK_FORMAT_R32_SFLOAT,
                                  ctx->slots[i].lumaPyr1, ctx->slots[i].lumaPyr1Memory, ctx->slots[i].lumaPyr1View)) {
             Log("Pipelines: failed to create lumaPyr1 for slot %zu", i);
             return false;
         }
-        if (!CreateStorageImage2D(ctx->device, ctx->physDevice, coarseW, coarseH, VK_FORMAT_R16G16B16A16_SFLOAT,
+        // coarseFlow = RawFlow (RGBA16F at gradW x gradH)
+        if (!CreateStorageImage2D(ctx->device, ctx->physDevice, gradW, gradH, VK_FORMAT_R16G16B16A16_SFLOAT,
                                  ctx->slots[i].coarseFlow, ctx->slots[i].coarseFlowMemory, ctx->slots[i].coarseFlowView)) {
             Log("Pipelines: failed to create coarseFlow for slot %zu", i);
             return false;
         }
+        // denseFlow = Smoothed Dense Flow (RGBA16F at full extent width x height)
         if (!CreateStorageImage2D(ctx->device, ctx->physDevice, ctx->extent.width, ctx->extent.height, VK_FORMAT_R16G16B16A16_SFLOAT,
                                  ctx->slots[i].denseFlow, ctx->slots[i].denseFlowMemory, ctx->slots[i].denseFlowView)) {
             Log("Pipelines: failed to create denseFlow for slot %zu", i);
@@ -784,8 +822,8 @@ static bool InitPipelines(SwapchainContext* ctx) {
         }
     }
 
-    Log("Pipelines: Option 2 Hierarchical Pyramidal Coarse-to-Fine Pipeline initialized! (Pyr: %ux%u, Coarse: %ux%u, DenseMax: %ux%u)",
-        pyrW, pyrH, coarseW, coarseH, ctx->extent.width, ctx->extent.height);
+    Log("Pipelines: DIS-Flow + TV-L1 Variational Regularization Pipeline initialized! (Grad: %ux%u, DenseMax: %ux%u)",
+        gradW, gradH, ctx->extent.width, ctx->extent.height);
     return true;
 #else
     Log("Pipelines: Required shader SPV headers not available");
@@ -1261,10 +1299,8 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
 
             uint32_t fullW = ctx->extent.width;
             uint32_t fullH = ctx->extent.height;
-            uint32_t pyrW = (fullW + 3) / 4;
-            uint32_t pyrH = (fullH + 3) / 4;
-            uint32_t coarseW = (pyrW + 3) / 4;
-            uint32_t coarseH = (pyrH + 3) / 4;
+            uint32_t gradW = (fullW + 3) / 4;
+            uint32_t gradH = (fullH + 3) / 4;
 
             float flowScale = std::clamp(cfg.flow_scale, 0.50f, 1.00f);
             uint32_t flowW = static_cast<uint32_t>(std::round(fullW * flowScale));
@@ -1273,7 +1309,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             flowH = std::clamp(flowH, 16u, fullH);
 
             // --- 1. Update Descriptor Sets for All 4 Passes ---
-            // Pass 0 (Downsample): Frame0, Frame1, Luma0, Luma1
+            // Pass 0 (DIS Gradient): Frame0, Frame1, Grad0, Luma1
             VkDescriptorImageInfo downImageInfos[4]{};
             downImageInfos[0].imageView = ctx->imageViews[ctx->prevGameIdx];
             downImageInfos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1284,7 +1320,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             downImageInfos[3].imageView = slot.lumaPyr1View;
             downImageInfos[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-            VkWriteDescriptorSet writes[15]{};
+            VkWriteDescriptorSet writes[14]{};
             for (int i = 0; i < 4; ++i) {
                 writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 writes[i].dstSet = slot.downDescSet;
@@ -1294,7 +1330,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                 writes[i].pImageInfo = &downImageInfos[i];
             }
 
-            // Pass 1 (Coarse Search): Luma0, Luma1, CoarseFlow
+            // Pass 1 (DIS Inverse Search): Grad0, Luma1, RawFlow
             VkDescriptorImageInfo coarseImageInfos[3]{};
             coarseImageInfos[0].imageView = slot.lumaPyr0View;
             coarseImageInfos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1312,18 +1348,16 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
                 writes[4 + i].pImageInfo = &coarseImageInfos[i];
             }
 
-            // Pass 2 (Refine): Frame0, Frame1, CoarseFlow, DenseFlow
-            VkDescriptorImageInfo refineImageInfos[4]{};
-            refineImageInfos[0].imageView = ctx->imageViews[ctx->prevGameIdx];
+            // Pass 2 (Variational TV-L1 Elastic Diffusion): RawFlow, Frame0, DenseFlow
+            VkDescriptorImageInfo refineImageInfos[3]{};
+            refineImageInfos[0].imageView = slot.coarseFlowView;
             refineImageInfos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            refineImageInfos[1].imageView = ctx->imageViews[currentGameIdx];
+            refineImageInfos[1].imageView = ctx->imageViews[ctx->prevGameIdx];
             refineImageInfos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            refineImageInfos[2].imageView = slot.coarseFlowView;
+            refineImageInfos[2].imageView = slot.denseFlowView;
             refineImageInfos[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            refineImageInfos[3].imageView = slot.denseFlowView;
-            refineImageInfos[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < 3; ++i) {
                 writes[7 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 writes[7 + i].dstSet = slot.refineDescSet;
                 writes[7 + i].dstBinding = i;
@@ -1344,15 +1378,15 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
             blendImageInfos[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
             for (int i = 0; i < 4; ++i) {
-                writes[11 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                writes[11 + i].dstSet = slot.blendDescSet;
-                writes[11 + i].dstBinding = i;
-                writes[11 + i].descriptorCount = 1;
-                writes[11 + i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-                writes[11 + i].pImageInfo = &blendImageInfos[i];
+                writes[10 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[10 + i].dstSet = slot.blendDescSet;
+                writes[10 + i].dstBinding = i;
+                writes[10 + i].descriptorCount = 1;
+                writes[10 + i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                writes[10 + i].pImageInfo = &blendImageInfos[i];
             }
 
-            g_pfnUpdateDescriptorSets(ctx->device, 15, writes, 0, nullptr);
+            g_pfnUpdateDescriptorSets(ctx->device, 14, writes, 0, nullptr);
 
             // --- 2. Transition Frame0, Frame1, Luma0, Luma1 for Pass 0 ---
             VkImageMemoryBarrier prePass0Barriers[4]{};
@@ -1398,18 +1432,18 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
 
             g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 4, prePass0Barriers);
 
-            // Dispatch Pass 0 (Pyramid Downsampler: 1280x800 -> 320x200)
+            // Dispatch Pass 0 (DIS Gradient & Tensor: 1280x800 -> 320x200)
             g_pfnCmdBindPipeline(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->downPipeline);
             g_pfnCmdBindDescriptorSets(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->downPipelineLayout, 0, 1, &slot.downDescSet, 0, nullptr);
 
-            DownPushConstants downPc{
+            GradientPushConstants gradPc{
                 static_cast<int>(fullW),
                 static_cast<int>(fullH),
-                static_cast<int>(pyrW),
-                static_cast<int>(pyrH)
+                static_cast<int>(gradW),
+                static_cast<int>(gradH)
             };
-            g_pfnCmdPushConstants(slot.cmdBuffer, ctx->downPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(downPc), &downPc);
-            g_pfnCmdDispatch(slot.cmdBuffer, (pyrW + 7) / 8, (pyrH + 7) / 8, 1);
+            g_pfnCmdPushConstants(slot.cmdBuffer, ctx->downPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(gradPc), &gradPc);
+            g_pfnCmdDispatch(slot.cmdBuffer, (gradW + 7) / 8, (gradH + 7) / 8, 1);
 
             // Barrier Pass 0 -> Pass 1:
             // lumaPyr0 & lumaPyr1: write -> read
@@ -1447,18 +1481,18 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
 
             g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 3, pass0To1Barriers);
 
-            // Dispatch Pass 1 (Coarse Motion Search: 80x50 blocks)
+            // Dispatch Pass 1 (DIS Dense Inverse Search: 320x200)
             g_pfnCmdBindPipeline(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->coarsePipeline);
             g_pfnCmdBindDescriptorSets(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->coarsePipelineLayout, 0, 1, &slot.coarseDescSet, 0, nullptr);
 
-            CoarsePushConstants coarsePc{
-                static_cast<int>(pyrW),
-                static_cast<int>(pyrH),
-                static_cast<int>(coarseW),
-                static_cast<int>(coarseH)
+            SearchPushConstants searchPc{
+                static_cast<int>(gradW),
+                static_cast<int>(gradH),
+                static_cast<int>(fullW),
+                static_cast<int>(fullH)
             };
-            g_pfnCmdPushConstants(slot.cmdBuffer, ctx->coarsePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(coarsePc), &coarsePc);
-            g_pfnCmdDispatch(slot.cmdBuffer, coarseW, coarseH, 1);
+            g_pfnCmdPushConstants(slot.cmdBuffer, ctx->coarsePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(searchPc), &searchPc);
+            g_pfnCmdDispatch(slot.cmdBuffer, (gradW + 7) / 8, (gradH + 7) / 8, 1);
 
             // Barrier Pass 1 -> Pass 2:
             // coarseFlow: write -> read
@@ -1486,19 +1520,19 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(
 
             g_pfnCmdPipelineBarrier(slot.cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 2, pass1To2Barriers);
 
-            // Dispatch Pass 2 (Dense Flow Refinement: flowW x flowH grid)
+            // Dispatch Pass 2 (Variational TV-L1 Elastic Diffusion: flowW x flowH grid)
             g_pfnCmdBindPipeline(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->refinePipeline);
             g_pfnCmdBindDescriptorSets(slot.cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->refinePipelineLayout, 0, 1, &slot.refineDescSet, 0, nullptr);
 
-            RefinePushConstants refinePc{
+            SmoothPushConstants smoothPc{
                 static_cast<int>(fullW),
                 static_cast<int>(fullH),
                 static_cast<int>(flowW),
                 static_cast<int>(flowH),
-                static_cast<int>(coarseW),
-                static_cast<int>(coarseH)
+                static_cast<int>(gradW),
+                static_cast<int>(gradH)
             };
-            g_pfnCmdPushConstants(slot.cmdBuffer, ctx->refinePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(refinePc), &refinePc);
+            g_pfnCmdPushConstants(slot.cmdBuffer, ctx->refinePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(smoothPc), &smoothPc);
             g_pfnCmdDispatch(slot.cmdBuffer, (flowW + 7) / 8, (flowH + 7) / 8, 1);
 
             // Barrier Pass 2 -> Pass 3:
