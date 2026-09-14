@@ -30,18 +30,54 @@ if [ -z "${LSFG_CONFIG:-}" ] && [ -f "$HOME/.config/lsfg-vk/conf.toml" ]; then
   export LSFG_CONFIG="$HOME/.config/lsfg-vk/conf.toml"
 fi
 
-# Pin the Default profile via override: this engine matches active_in by
-# exact/ends_with comparison only, so a "*" wildcard NEVER matches any
-# process (see lsfg-vk-common/src/configuration/detection.cpp:findProfile).
-# LSFGVK_PROFILE=Default hits matchByName first and works for every game.
+# Pin the Default profile via override (LSFGVK_PROFILE is documented in
+# official 2.0.0 env docs and beats exe-name matching for every game).
 export LSFGVK_PROFILE=Default
+
+# SkyFrame tap pacing from the UI config (decky-plugin/main.py wrote
+# ~/.config/skyframe/{config.json,skyframe.toml}).
+#   Balanced/Smooth (anything but "none"): cap the BASE to the exact
+#     divisor (target_hz / multiplier, e.g. 60/2=30) + output grid at hz.
+#   Low-lag ("none"): tap measures only, no holds.
+# The tap autodetects its chain position (base vs FG output), so these
+# are safe from either side of the official FG layer.
+if command -v python3 >/dev/null 2>&1; then
+  SKY_TAP_ENV="$(python3 - "$HOME/.config/skyframe/config.json" <<'PYEOF'
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+except Exception:
+    cfg = {}
+mode, hz, mult = "smooth", 60, 2
+try:
+    mult = int(cfg.get("multiplier", 2))
+    hz = int(cfg.get("target_hz", 60))
+    pacing = str(cfg.get("pacing", "smooth"))
+    if pacing in ("vsync", "smooth", "none"):
+        mode = pacing
+except Exception:
+    pass
+if mult not in (2, 3, 4):
+    mult = 2
+hz = max(30, min(240, hz))
+if mode != "none":
+    print(f"SKYFRAME_LIMIT_FPS={hz / mult:.2f}")
+    print(f"SKYFRAME_OUT_HZ={hz}")
+PYEOF
+)"
+  if [ -n "$SKY_TAP_ENV" ]; then
+    while IFS= read -r line; do
+      case "$line" in SKYFRAME_*=*) export "$line" ;; esac
+    done <<< "$SKY_TAP_ENV"
+  fi
+fi
 
 LOG="$HOME/skyframe_game.log"
 if [ "$DEBUG" = "1" ]; then
   {
     echo "=== [skyframe-run] $(date -u +%FT%TZ) ==="
     echo "[skyframe-run] cmd: $*"
-    echo "[skyframe-run] env: ENABLE_SKYFRAME=${ENABLE_SKYFRAME:-<unset>} ENABLE_LSFGVK=${ENABLE_LSFGVK:-<unset>} DISABLE_SKYFRAME=${DISABLE_SKYFRAME:-<unset>} LSFGVK_PROFILE=${LSFGVK_PROFILE:-<unset>} LSFG_CONFIG=${LSFG_CONFIG:-<default>}"
+    echo "[skyframe-run] env: ENABLE_SKYFRAME=${ENABLE_SKYFRAME:-<unset>} ENABLE_LSFGVK=${ENABLE_LSFGVK:-<unset>} LSFGVK_PROFILE=${LSFGVK_PROFILE:-<unset>} LIMIT=${SKYFRAME_LIMIT_FPS:-off} OUT=${SKYFRAME_OUT_HZ:-off} LSFG_CONFIG=${LSFG_CONFIG:-<default>}"
     echo "[skyframe-run] manifests:"
     ls -la "$HOME/.local/share/vulkan/implicit_layer.d/" 2>&1
     echo "[skyframe-run] conf head:"

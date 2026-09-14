@@ -15,9 +15,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -40,6 +42,10 @@ struct SwapStats {
     double maxInterval = 0.0;
     uint64_t measured = 0; // intervals accumulated since last flush
     double lastFlushMs = 0.0;
+    // pacer state (process cadence observation per swapchain)
+    double obsEma = 0.0;   // EMA of present intervals, ms
+    double obsLast = 0.0;
+    double nextSlot = 0.0;
 };
 
 struct Globals {
@@ -96,6 +102,68 @@ void flushStatsLocked() {
         s.maxInterval = 0.0;
         s.measured = 0;
     }
+}
+
+/* Tap pacer: enforces steady cadence from OUTSIDE the FG core.
+ * Works from either chain position:
+ *  - above the FG layer: SKYFRAME_LIMIT_FPS stabilizes the BASE the FG sees
+ *    (exact divisor of the display rate -> clean fixed-ratio generation);
+ *  - below it: SKYFRAME_OUT_HZ re-phases final presents onto a steady grid.
+ * Env is set by skyframe-run from the UI config. Absent env = measure only.
+ * Holds are bounded; any failure degrades to plain forwarding. */
+struct TapCtl {
+    bool init = false;
+    double inInterval = 0.0;   // ms between forwarded presents, 0 = off
+    double outInterval = 0.0;  // ms output grid, 0 = off
+};
+
+TapCtl& Ctl() {
+    static TapCtl c;
+    return c;
+}
+
+void initCtl() {
+    TapCtl& c = Ctl();
+    if (c.init) return;
+    c.init = true;
+    const char* lim = std::getenv("SKYFRAME_LIMIT_FPS");
+    const char* out = std::getenv("SKYFRAME_OUT_HZ");
+    const double lf = lim ? std::atof(lim) : 0.0;
+    const double of = out ? std::atof(out) : 0.0;
+    if (lf > 0.5 && lf < 500.0) c.inInterval = 1000.0 / lf;
+    if (of > 0.5 && of < 500.0) c.outInterval = 1000.0 / of;
+}
+
+void holdSlot(double& slot, double interval) {
+    const double t = nowMs();
+    if (slot <= 0.0) slot = t;
+    if (slot < t - interval) slot = t; // spiral guard
+    const double wait = slot - t;
+    if (wait > 0.0) {
+        if (wait > 75.0) { slot = t; return; } // safety: never stall long
+        if (wait > 2.0)
+            std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(wait - 1.0));
+        while (nowMs() < slot) {} // spin final ~1ms for precision
+    }
+    slot += interval;
+    if (slot < nowMs()) slot = nowMs();
+}
+
+/* Pick pacing grid from observed cadence (chain-position autodetect):
+ * presents near/below the input rate => we see the BASE, pace it;
+ * presents much faster => we see FG OUTPUT, re-phase it instead. */
+double pickGrid(SwapStats& s, const TapCtl& ctl, double now) {
+    if (s.obsLast > 0.0) {
+        const double dt = now - s.obsLast;
+        if (dt > 0.0 && dt < 5000.0)
+            s.obsEma = s.obsEma > 0.0 ? s.obsEma * 0.7 + dt * 0.3 : dt;
+    }
+    s.obsLast = now;
+    if (ctl.inInterval > 0.0 && (s.obsEma <= 0.0 || s.obsEma >= 0.75 * ctl.inInterval))
+        return ctl.inInterval;
+    if (ctl.outInterval > 0.0)
+        return ctl.outInterval;
+    return 0.0;
 }
 
 void recordPresent(VkSwapchainKHR swapchain) {
@@ -232,6 +300,29 @@ void myvkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
 }
 
 VkResult myvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* info) {
+    // Tap pacing BEFORE forwarding (per-swapchain grid, autodetected).
+    // Slot is copied out / stored back under lock; the sleep itself is
+    // lock-free so a concurrent swapchain destroy can't dangle us.
+    initCtl();
+    TapCtl& ctl = Ctl();
+    if (info->swapchainCount > 0) {
+        try {
+            const VkSwapchainKHR sc0 = info->pSwapchains[0];
+            double grid = 0.0, slot = 0.0;
+            {
+                std::lock_guard<std::mutex> lock(G().mtx);
+                SwapStats& s = G().stats[sc0];
+                grid = pickGrid(s, ctl, nowMs());
+                slot = s.nextSlot;
+            }
+            if (grid > 0.0) {
+                holdSlot(slot, grid);
+                std::lock_guard<std::mutex> lock(G().mtx);
+                auto it = G().stats.find(sc0);
+                if (it != G().stats.end()) it->second.nextSlot = slot;
+            }
+        } catch (...) {}
+    }
     // Present is queue-level; resolve device funcs via tracked swapchains.
     // Fallback to any cached device (untracked handles must still present).
     DevFuncs df{};
