@@ -42,6 +42,8 @@ interface StatusInfo {
   user_home: string;
   lib64: boolean;
   lib32: boolean;
+  shim64?: boolean;
+  shim32?: boolean;
   runner: boolean;
   enabled: boolean;
   global_mode: boolean;
@@ -52,6 +54,8 @@ interface Stats {
   base_fps: number;
   output_fps: number;
   gen_ms?: number;
+  jitter_ms?: number;
+  avg_interval_ms?: number;
   drops?: number;
   queued?: number;
   present_mode?: string;
@@ -185,6 +189,7 @@ function Content() {
               <span>Режим: <b style={{ color: "#fff" }}>{effMult}{performanceMode ? " [FP16]" : ""}</b></span>
               <span>Экран: <b style={{ color: "#fff" }}>{targetHz} Hz</b></span>
               {(stats.gen_ms ?? 0) > 0 && <span>Gen: <b style={{ color: "#fff" }}>{stats.gen_ms!.toFixed(1)} ms</b></span>}
+            {(stats.jitter_ms ?? 0) > 0 && <span>Jitter: <b style={{ color: "#fff" }}>{stats.jitter_ms!.toFixed(1)} ms</b></span>}
             </div>
             {(stats.live) && (
               <div style={{ display: "flex", gap: 12, color: "#aaa", fontSize: 11 }}>
@@ -203,7 +208,8 @@ function Content() {
             </div>
             {status && (
               <div style={{ display: "flex", gap: 8, fontSize: 11, color: "#aaa" }}>
-                <span>Слой: <b style={{ color: status.lib64 ? "#4ade80" : "#f87171" }}>64{status.lib64 ? "✓" : "✗"}</b> / <b style={{ color: status.lib32 ? "#4ade80" : "#f87171" }}>32{status.lib32 ? "✓" : "✗"}</b></span>
+                <span>Ядро: <b style={{ color: status.lib64 ? "#4ade80" : "#f87171" }}>64{status.lib64 ? "✓" : "✗"}</b> / <b style={{ color: status.lib32 ? "#4ade80" : "#f87171" }}>32{status.lib32 ? "✓" : "✗"}</b></span>
+                <span>Шим: <b style={{ color: status.shim64 ? "#4ade80" : "#f87171" }}>64{status.shim64 ? "✓" : "✗"}</b> / <b style={{ color: status.shim32 ? "#4ade80" : "#f87171" }}>32{status.shim32 ? "✓" : "✗"}</b></span>
                 <span>Раннер: <b style={{ color: status.runner ? "#4ade80" : "#f87171" }}>{status.runner ? "skyframe-run ✓" : "нет ✗"}</b></span>
               </div>
             )}

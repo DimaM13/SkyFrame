@@ -20,7 +20,8 @@ def package_decky():
     # Missing libs = installable UI-only zip: plugin will show 64/32 ✗.)
     bin_dir = os.path.join(plugin_dir, "bin")
     os.makedirs(bin_dir, exist_ok=True)
-    expected = ["liblsfg-vk-layer.so", "liblsfg-vk-layer_32.so", "lsfg-vk-cli"]
+    expected = ["liblsfg-vk-layer.so", "liblsfg-vk-layer_32.so", "lsfg-vk-cli",
+                "libskyframe-shim.so", "libskyframe-shim_32.so"]
     missing = [n for n in expected if not os.path.isfile(os.path.join(bin_dir, n))]
     staged = sorted(os.listdir(bin_dir))
     print(f"bin/ contents: {staged if staged else '<empty>'}")

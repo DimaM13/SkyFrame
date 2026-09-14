@@ -337,8 +337,10 @@ class Plugin:
                 try: shutil.rmtree(legacy_models, ignore_errors=True)
                 except Exception: pass
 
-            # Copy LSFG engine binaries (64-bit and 32-bit)
-            for lib_name in ["liblsfg-vk-layer.so", "liblsfg-vk-layer_32.so"]:
+            # Copy LSFG engine binaries (64-bit and 32-bit, official 2.0.0 core)
+            # + own SkyFrame present-tap shim (forward-only measuring layer)
+            for lib_name in ["liblsfg-vk-layer.so", "liblsfg-vk-layer_32.so",
+                             "libskyframe-shim.so", "libskyframe-shim_32.so"]:
                 src = os.path.join(bin_dir, lib_name)
                 dst = os.path.join(LOCAL_LIB_DIR, lib_name)
                 if os.path.isfile(src):
@@ -374,6 +376,8 @@ class Plugin:
 
             lsfg_lib64 = os.path.join(LOCAL_LIB_DIR, "liblsfg-vk-layer.so")
             lsfg_lib32 = os.path.join(LOCAL_LIB_DIR, "liblsfg-vk-layer_32.so")
+            sky_lib64 = os.path.join(LOCAL_LIB_DIR, "libskyframe-shim.so")
+            sky_lib32 = os.path.join(LOCAL_LIB_DIR, "libskyframe-shim_32.so")
 
             # --- LSFG Layer Manifest (upstream identity, kept for compat) ---
             lsfg_layer_64 = {
@@ -392,25 +396,26 @@ class Plugin:
             lsfg_layer_32["library_path"] = lsfg_lib32
             lsfg_layer_32["description"] = "Lossless Scaling Frame Generation Layer (32-bit)"
 
-            # --- SkyFrame Layer Manifest (own identity, phase-1 alias) ---
-            # Points at the same vetted lsfg-vk 2.0 binary today; once the
-            # forked libskyframe.so lands, only library_path changes.
+            # --- SkyFrame Layer Manifest (OWN shim binary, built from engine/skyframe) ---
+            # Present-tap: forwards every call unchanged, measures present rate
+            # into /tmp/skyframe_stats.json for the HUD. FG itself is done by
+            # the official LSFGVK layer chained alongside (both gated per-game).
             # Activation: ENABLE_SKYFRAME=1 (set by skyframe-run), off by default.
             sky_layer_64 = {
                 "name": "VK_LAYER_SKYFRAME_frame_generation",
                 "type": "GLOBAL",
-                "library_path": lsfg_lib64,
+                "library_path": sky_lib64,
                 "api_version": "1.3.0",
                 "implementation_version": "1",
-                "description": "SkyFrame Frame Generation Layer (64-bit, lsfg-vk 2.0 core)",
+                "description": "SkyFrame present-tap: live FPS/jitter HUD stats (forward-only)",
                 "disable_environment": { "DISABLE_SKYFRAME": "1" }
             }
             if is_enabled and not global_mode:
                 sky_layer_64["enable_environment"] = { "ENABLE_SKYFRAME": "1" }
 
             sky_layer_32 = dict(sky_layer_64)
-            sky_layer_32["library_path"] = lsfg_lib32
-            sky_layer_32["description"] = "SkyFrame Frame Generation Layer (32-bit, lsfg-vk 2.0 core)"
+            sky_layer_32["library_path"] = sky_lib32
+            sky_layer_32["description"] = "SkyFrame present-tap: live FPS/jitter HUD stats (forward-only, 32-bit)"
 
             # Write user layer manifests.
             # OFF = manifests removed (layer truly dormant, no global injection).
@@ -561,18 +566,23 @@ class Plugin:
         return find_lossless_dll(custom_dll)
 
     async def get_stats(self):
-        # 1) Prefer real layer HUD stats if the SkyFrame layer wrote them.
-        #    Layer writes /tmp/skyframe_stats.json: {base_fps, output_fps, gen_ms, ...}
+        # 1) Live data from our own VK_LAYER_SKYFRAME present-tap.
+        #    Shim writes /tmp/skyframe_stats.json:
+        #    {output_fps, avg_interval_ms, jitter_ms, presents, live, source}
         for stats_path in ["/tmp/skyframe_stats.json", "/tmp/lsfgvk_stats.json"]:
             try:
                 if os.path.isfile(stats_path):
                     with open(stats_path, "r", encoding="utf-8") as f:
                         data = json.load(f)
-                        if isinstance(data, dict) and float(data.get("base_fps", 0.0)) > 0:
+                        if isinstance(data, dict) and float(data.get("output_fps", 0.0)) > 0:
+                            mult = self.config.get("multiplier", 2)
+                            out = float(data.get("output_fps", 0.0))
                             return {
-                                "base_fps": float(data.get("base_fps", 0.0)),
-                                "output_fps": float(data.get("output_fps", 0.0)),
+                                "base_fps": round(out / mult, 1) if mult else out,
+                                "output_fps": out,
                                 "gen_ms": float(data.get("gen_ms", data.get("gen_time_ms", 0.0))),
+                                "jitter_ms": float(data.get("jitter_ms", 0.0)),
+                                "avg_interval_ms": float(data.get("avg_interval_ms", 0.0)),
                                 "drops": int(data.get("drops", data.get("dropped", 0))),
                                 "queued": int(data.get("queued", data.get("queue_depth", 0))),
                                 "present_mode": str(data.get("present_mode", "")),
@@ -589,6 +599,8 @@ class Plugin:
             "base_fps": 0.0 if not on else 30.0,
             "output_fps": 0.0 if not on else (30.0 * mult),
             "gen_ms": 0.0,
+            "jitter_ms": 0.0,
+            "avg_interval_ms": 0.0,
             "drops": 0,
             "queued": 0,
             "present_mode": "",
@@ -598,12 +610,13 @@ class Plugin:
         }
 
     async def get_status_info(self):
-        import pathlib
         run_path = os.path.join(LOCAL_BIN_DIR, "skyframe-run")
         return {
             "user_home": USER_HOME,
             "lib64": os.path.isfile(os.path.join(LOCAL_LIB_DIR, "liblsfg-vk-layer.so")),
             "lib32": os.path.isfile(os.path.join(LOCAL_LIB_DIR, "liblsfg-vk-layer_32.so")),
+            "shim64": os.path.isfile(os.path.join(LOCAL_LIB_DIR, "libskyframe-shim.so")),
+            "shim32": os.path.isfile(os.path.join(LOCAL_LIB_DIR, "libskyframe-shim_32.so")),
             "runner": os.path.isfile(run_path),
             "sky_manifests": True,
             "enabled": self.config.get("enabled", False),

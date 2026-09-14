@@ -21,6 +21,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ g++-multilib libvulkan-dev python3 zip
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -53,25 +58,38 @@ jobs:
           tar -xJf /tmp/lsfgvk.tar.xz -C /tmp/lsfgvk-official
           find /tmp/lsfgvk-official -type f | sort
 
+      - name: Build SkyFrame shim layer (64-bit + 32-bit)
+        run: |
+          cmake -S engine/skyframe -B build-shim64 -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-shim64 --config Release -j$(nproc)
+          cmake -S engine/skyframe -B build-shim32 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-m32" -DCMAKE_C_FLAGS="-m32" -DCMAKE_SHARED_LINKER_FLAGS="-m32"
+          cmake --build build-shim32 --config Release -j$(nproc)
+          find build-shim64 build-shim32 -name "*.so" | sort
+
       - name: Prepare Decky Plugin binaries
         run: |
           mkdir -p decky-plugin/bin
 
-          # 64-bit + 32-bit layer libraries (32-bit stored as _32, picked by main.py)
+          # Official lsfg-vk 2.0.0 core (FG engine).
           cp /tmp/lsfgvk-official/lib/liblsfg-vk-layer.so decky-plugin/bin/liblsfg-vk-layer.so
           cp /tmp/lsfgvk-official/lib/liblsfg-vk-layer.x86.so decky-plugin/bin/liblsfg-vk-layer_32.so
           cp /tmp/lsfgvk-official/bin/lsfg-vk-cli decky-plugin/bin/lsfg-vk-cli
           chmod +x decky-plugin/bin/lsfg-vk-cli || true
+          # Own SkyFrame present-tap layer (live HUD stats; forward-only).
+          cp build-shim64/libskyframe-shim.so decky-plugin/bin/libskyframe-shim.so
+          cp build-shim32/libskyframe-shim.so decky-plugin/bin/libskyframe-shim_32.so
           # Isolated per-game launcher (installed to ~/.local/bin by main.py)
           chmod +x decky-plugin/skyframe-run || true
 
           echo "=== arch check (1=32bit, 2=64bit) ==="
           python3 -c "
-          for f in ['decky-plugin/bin/liblsfg-vk-layer.so','decky-plugin/bin/liblsfg-vk-layer_32.so','decky-plugin/bin/lsfg-vk-cli']:
+          for f in ['decky-plugin/bin/liblsfg-vk-layer.so','decky-plugin/bin/liblsfg-vk-layer_32.so','decky-plugin/bin/lsfg-vk-cli','decky-plugin/bin/libskyframe-shim.so','decky-plugin/bin/libskyframe-shim_32.so']:
               d = open(f,'rb').read(6)
               assert d[:4] == b'\x7fELF', f
               print(f, 'class:', d[4])
           "
+          test -f decky-plugin/bin/libskyframe-shim.so || (echo "shim 64 missing!" && exit 1)
+          test -f decky-plugin/bin/libskyframe-shim_32.so || (echo "shim 32 missing!" && exit 1)
           test -f decky-plugin/bin/liblsfg-vk-layer.so || (echo "64-bit layer missing!" && exit 1)
           test -f decky-plugin/bin/liblsfg-vk-layer_32.so || (echo "32-bit layer missing!" && exit 1)
           test -f decky-plugin/bin/lsfg-vk-cli || (echo "CLI missing!" && exit 1)
@@ -103,8 +121,8 @@ jobs:
             ### Что внутри (все готовое, собирать ничего не нужно)
             - Официальное ядро **lsfg-vk 2.0.0** (prebuilt): 64/32-bit Vulkan-слой + `lsfg-vk-cli` (`healthcheck`, `validate`, `benchmark`). Ядро PancakeTAS, используется как зависимость.
             - `skyframe-run` — изолированный лаунчер: `~/.local/bin/skyframe-run %command%`
-            - Свой слой `VK_LAYER_SKYFRAME_frame_generation` (манифесты ставит плагин)
-            - Decky UI v2: HUD `base→output`, live-toggle, Adaptive, доставка Smooth/Balanced/Low-lag (режимы доставки — в `~/.config/skyframe/skyframe.toml`, для будущего своего слоя)
+            - Свой слой `VK_LAYER_SKYFRAME_frame_generation` — present-tap (forward-only + живой замер FPS/джи́ттера для HUD)
+            - Decky UI: HUD `base→output`, live-toggle, Adaptive, доставка Smooth/Balanced/Low-lag (режимы доставки — в `~/.config/skyframe/skyframe.toml`, для будущего полного слоя)
 
             ### Требования
             Lossless Scaling в Steam → Свойства → Бета-версии → ветка **`lsfg-vk`**.

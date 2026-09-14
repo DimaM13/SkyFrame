@@ -11,14 +11,19 @@ if [ "${1:-}" = "--debug" ]; then
   shift
 fi
 
-# Isolate from competing FG layers for THIS game only (no global uninstall).
-unset ENABLE_LSFGVK
-unset ENABLE_MAKO
-export DISABLE_LSFGVK=1
+# Both SkyFrame layers are gated per-game (never global):
+#   ENABLE_SKYFRAME=1 -> our present-tap (live HUD stats, forward-only)
+#   ENABLE_LSFGVK=1   -> official 2.0.0 FG core (actual frame generation)
+# Competing FG stacks stay off for this game only (no global uninstall).
+export ENABLE_SKYFRAME=1
+export ENABLE_LSFGVK=1
+unset DISABLE_SKYFRAME
 export DISABLE_MAKO=1
 export DISABLE_LSFGVK_FRAME_GENERATION=1
-export ENABLE_SKYFRAME=1
-unset DISABLE_SKYFRAME
+# Surgical per-game guard: silence known foreign FG layers by NAME so they
+# can never double-chain with ours (our own manifests above stay enabled).
+# Covers manual official installs (.x86) and a globally-armed MAKO.
+export VK_LOADER_LAYERS_DISABLE="VK_LAYER_LSFGVK_frame_generation_x86,VK_LAYER_MAKO_render"
 
 # Keep SkyFrame config discovery stable under Steam runtime.
 if [ -z "${LSFG_CONFIG:-}" ] && [ -f "$HOME/.config/lsfg-vk/conf.toml" ]; then
@@ -36,13 +41,13 @@ if [ "$DEBUG" = "1" ]; then
   {
     echo "=== [skyframe-run] $(date -u +%FT%TZ) ==="
     echo "[skyframe-run] cmd: $*"
-    echo "[skyframe-run] env: ENABLE_SKYFRAME=${ENABLE_SKYFRAME:-<unset>} DISABLE_SKYFRAME=${DISABLE_SKYFRAME:-<unset>} LSFGVK_PROFILE=${LSFGVK_PROFILE:-<unset>} LSFG_CONFIG=${LSFG_CONFIG:-<default>}"
+    echo "[skyframe-run] env: ENABLE_SKYFRAME=${ENABLE_SKYFRAME:-<unset>} ENABLE_LSFGVK=${ENABLE_LSFGVK:-<unset>} DISABLE_SKYFRAME=${DISABLE_SKYFRAME:-<unset>} LSFGVK_PROFILE=${LSFGVK_PROFILE:-<unset>} LSFG_CONFIG=${LSFG_CONFIG:-<default>}"
     echo "[skyframe-run] manifests:"
     ls -la "$HOME/.local/share/vulkan/implicit_layer.d/" 2>&1
     echo "[skyframe-run] conf head:"
     head -12 "${LSFG_CONFIG:-$HOME/.config/lsfg-vk/conf.toml}" 2>&1
     echo "[skyframe-run] libs:"
-    ls -la "$HOME/.local/lib/liblsfg-vk-layer.so" "$HOME/.local/lib/liblsfg-vk-layer_32.so" "$HOME/.local/bin/lsfg-vk-cli" 2>&1
+    ls -la "$HOME/.local/lib/liblsfg-vk-layer.so" "$HOME/.local/lib/liblsfg-vk-layer_32.so" "$HOME/.local/lib/libskyframe-shim.so" "$HOME/.local/lib/libskyframe-shim_32.so" "$HOME/.local/bin/lsfg-vk-cli" 2>&1
   } >> "$LOG" 2>&1
   # NOTE: append (>>) — truncate (>) стирал бы диагностику выше.
   exec "$@" >> "$LOG" 2>&1

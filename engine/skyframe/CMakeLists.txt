@@ -1,25 +1,26 @@
-# SkyFrame layer (own identity, phase-1 alias over vetted lsfg-vk 2.0 core)
-#
-# Phase 1 (this release): no C++ fork. VK_LAYER_SKYFRAME_frame_generation
-# manifests point at liblsfg-vk-layer.so; activation via ENABLE_SKYFRAME=1
-# through skyframe-run. See decky-plugin/main.py sync_vulkan_layer().
-#
-# Phase 2 (planned fork, GPL lineage only):
-#   base = lsfg-vk v2 GPL tree at upstream commit 8b0da266 (same as MAKO lineage),
-#   NOT the CC BY-NC-ND 4.0 final 2.0.0 source (derivatives forbidden).
-#   1. copy engine/lsfg/lsfg-vk-layer -> engine/skyframe/layer-src
-#   2. rename namespace lsfgvk::layer -> skyframe::layer, log prefix, layer name
-#      VK_LAYER_LSFGVK_frame_generation -> VK_LAYER_SKYFRAME_frame_generation
-#   3. split swapchain.cpp -> create/resources/profile/present/status (MAKO layout)
-#   4. add frame_generation_enabled live-flag + adaptive scheduler + stats shm
-#      writing /tmp/skyframe_stats.json {base_fps, output_fps, gen_ms}
-#   5. build libskyframe.so (+_32.so), swap library_path in manifests.
 cmake_minimum_required(VERSION 3.16)
 
-# Alias manifest template for documentation / manual installs.
-# Real manifests are generated at runtime by decky-plugin/main.py so that
-# library paths always match ~/.local/lib on the Deck.
-configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/VkLayer_SKYFRAME_frame_generation.json.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/VkLayer_SKYFRAME_frame_generation.json"
-    @ONLY)
+# Standalone-capable: CI builds this dir directly
+#   cmake -S engine/skyframe -B build-shim -DCMAKE_BUILD_TYPE=Release
+# and it also works via add_subdirectory() from the repo root.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(SkyFrameShim LANGUAGES CXX)
+    set(CMAKE_CXX_STANDARD 20)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
+find_package(Vulkan QUIET)
+
+add_library(skyframe-shim SHARED layer/skyframe_shim.cpp)
+
+target_include_directories(skyframe-shim PRIVATE ${Vulkan_INCLUDE_DIRS})
+target_compile_options(skyframe-shim PRIVATE -Wall -Wextra -Wno-unknown-warning-option)
+set_target_properties(skyframe-shim PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+    OUTPUT_NAME "skyframe-shim")
+
+# Phase-1 alias manifests (point at lsfg-vk 2.0 core) are generated at
+# runtime by decky-plugin/main.py. Phase-2 (forked libskyframe.so with
+# live-toggle/adaptive/scheduler) will extend this target, see PACING.md.
