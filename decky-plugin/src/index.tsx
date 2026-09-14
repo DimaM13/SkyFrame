@@ -214,15 +214,15 @@ function Content() {
         <PanelSectionRow>
           <ToggleField
             label="SkyFrame включен"
-            description={globalMode ? "Глобальный режим: слой во всех играх" : "Per-game: запускай игру через skyframe-run"}
+            description={globalMode ? "Глобальный режим: слой во всех играх (применение — с рестарта игры)" : "Per-game: запускай игру через skyframe-run (вкл/выкл — до запуска игры)"}
             checked={enabled}
             onChange={(v) => { setEnabled(v); setEnabledCall(v).catch(console.error); refreshStatus(); }}
           />
         </PanelSectionRow>
         <PanelSectionRow>
           <ToggleField
-            label="Live-toggle генерации"
-            description="Пауза/продолжение синтеза без рестарта игры (hot-reload conf.toml)"
+            label="Live-toggle генерации ⚠️"
+            description="НЕ трогать в запущенной игре — офиц. ядро 2.0.0 крашится на пересоздании контекста. Меняй до запуска. Настоящий live будет в своем слое."
             checked={fgOn}
             onChange={(v) => { setFgOn(v); setFgOnCall(v).catch(console.error); }}
           />
@@ -250,8 +250,8 @@ function Content() {
         {/* FIXED vs ADAPTIVE */}
         <PanelSectionRow>
           <ToggleField
-            label="Adaptive FG (как у MAKO)"
-            description={`Добивка до ${targetFps} FPS, потолок ${adaptMax}x. Выкл = фикс ${multiplier}x`}
+            label="Adaptive FG (скоро)"
+            description={`Движком пока игнорируется (настройка едет в skyframe.toml для будущего слоя). Сейчас работает только фикс ${multiplier}x`}
             checked={adaptive}
             onChange={(v) => { setAdaptive(v); setAdaptiveCall(v).catch(console.error); }}
           />
