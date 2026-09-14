@@ -87,10 +87,25 @@ def fix_perms(path: str, is_exec: bool = False):
         logging.warning(f"[SkyFrame] Failed to set perms on {path}: {e}")
 
 def find_lossless_dll(custom_path: str = "") -> dict:
-    """Locates Lossless.dll from Steam installations, MicroSD cards, or custom path"""
+    """Locates the LSFG model DLL from Steam installations, MicroSD cards, or custom path.
+    lsfg-vk 2.0 expects `lsfg-vk.dll` (beta branch); the legacy `Lossless.dll`
+    from the default branch CRASHES inside openContext. Prefer lsfg-vk.dll
+    whenever it sits next to Lossless.dll."""
+    def prefer_vk_dll(path: str) -> str:
+        try:
+            sibling = os.path.join(os.path.dirname(path), "lsfg-vk.dll")
+            if os.path.isfile(sibling):
+                return sibling
+        except Exception:
+            pass
+        return path
+
     candidates = []
     if custom_path and os.path.isfile(custom_path):
-        candidates.append(custom_path)
+        if os.path.basename(custom_path).lower() == "lsfg-vk.dll":
+            candidates.append(custom_path)
+        else:
+            candidates.append(prefer_vk_dll(custom_path))
 
     steam_rel = os.path.join("steamapps", "common", "Lossless Scaling", "Lossless.dll")
 
@@ -117,12 +132,15 @@ def find_lossless_dll(custom_path: str = "") -> dict:
     for path in candidates:
         if os.path.isfile(path):
             try:
-                size_mb = round(os.path.getsize(path) / (1024 * 1024), 2)
+                chosen = prefer_vk_dll(path)
+                size_mb = round(os.path.getsize(chosen) / (1024 * 1024), 2)
+                dll_name = os.path.basename(chosen)
+                ok = dll_name.lower() == "lsfg-vk.dll"
                 return {
                     "found": True,
-                    "path": path,
+                    "path": chosen,
                     "size_mb": size_mb,
-                    "status": "Found (Ready for LSFG 2.x FP16)",
+                    "status": "Found (lsfg-vk.dll, ready)" if ok else "Found (legacy Lossless.dll — switch to lsfg-vk beta!)",
                     "branch_hint": "Please ensure you selected the 'lsfg-vk' beta branch in Steam for Lossless Scaling."
                 }
             except Exception:
