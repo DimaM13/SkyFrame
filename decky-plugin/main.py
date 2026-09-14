@@ -182,17 +182,23 @@ class Plugin:
             logging.error(f"[SkyFrame] Failed to save config: {e}")
 
     def sync_lsfg_config(self, dll_path: str):
-        """Generates ~/.config/lsfg-vk/conf.toml for LSFG engine.
-        SkyFrame v2 writes both lsfg-vk 2.0 keys and forward-compatible
-        SkyFrame keys (adaptive/live/pacing). Unknown keys are ignored by
-        the old engine but picked up by VK_LAYER_SKYFRAME once forked.
+        """Writes TWO configs:
+        1. ~/.config/lsfg-vk/conf.toml — STRICT official lsfg-vk 2.0.0 schema
+           only (unknown keys log ERROR lines there, so nothing extra).
+        2. ~/.config/skyframe/skyframe.toml — our own keys (live-toggle,
+           adaptive, delivery scheduler) for the future VK_LAYER_SKYFRAME.
+        Core binaries are the official 2.0.0 prebuilts (see CI workflow),
+        matched to the current Steam lsfg-vk.dll.
         """
         try:
             os.makedirs(LSFG_CONFIG_DIR, exist_ok=True)
             fix_perms(LSFG_CONFIG_DIR)
 
             multiplier = int(self.config.get("multiplier", 2))
+            if multiplier not in (2, 3, 4):
+                multiplier = 2
             flow_scale = float(self.config.get("flow_scale", 0.90))
+            flow_scale = max(0.25, min(1.0, flow_scale))
             perf_mode = "true" if self.config.get("performance_mode", True) else "false"
             fg_on = "true" if self.config.get("frame_generation_enabled", True) else "false"
             adaptive = "true" if self.config.get("adaptive", False) else "false"
@@ -210,14 +216,12 @@ class Plugin:
             pacing = str(self.config.get("pacing", "smooth") or "smooth")
             if pacing not in ("vsync", "smooth", "none"):
                 pacing = "smooth"
-            # lsfg-vk 2.0 pacing enum currently only knows vsync/none;
-            # map our "smooth" (Balanced) to vsync for the upstream engine.
-            # NOTE: bundled engine tree only parses pacing="none" — anything
-            # else throws and the layer goes dormant. Always write "none"
-            # until the forked libskyframe.so lands.
-            upstream_pacing = "none"
+            # Official 2.0.0 knows ONLY pacing="vsync" (see pacing-modes doc).
+            # Our Balanced/Low-lag differences live in skyframe.toml until
+            # the forked libskyframe.so lands.
+            upstream_pacing = "vsync"
             # --- SkyFrame delivery scheduler (see engine/skyframe/PACING.md) ---
-            # vsync = Smooth like 2.0.0 (deep queue, max smoothness, +lag)
+            # vsync = Smooth (deep queue, max smoothness, +lag)
             # smooth = Balanced default (queue 1 + deadline + fresh-first)
             # none = Low-lag (mailbox, drop stale, min lag, possible micro-judder)
             try:
@@ -233,10 +237,11 @@ class Plugin:
             else:  # smooth / Balanced
                 sq, sdl, sff, spm = 1, round(0.8 * interval_ms, 1), "true", "fifo"
 
+            # 1) Strict upstream config — nothing but documented 2.0.0 keys.
             toml_lines = [
-                "# Automatically managed by SkyFrame Decky Plugin (SkyFrame v2)",
-                "# SkyFrame keys (adaptive/frame_generation_enabled/skyframe_*) are",
-                "# ignored by upstream lsfg-vk 2.0 and honoured by VK_LAYER_SKYFRAME.",
+                "# Automatically managed by SkyFrame Decky Plugin",
+                "# Official lsfg-vk 2.0.0 schema only — do not add keys here",
+                "# (use ~/.config/skyframe/skyframe.toml for SkyFrame keys).",
                 "version = 2",
                 "",
                 "[global]",
@@ -250,17 +255,8 @@ class Plugin:
                 f"flow_scale = {flow_scale}",
                 f"performance_mode = {perf_mode}",
                 f'pacing = "{upstream_pacing}"',
-                "",
-                "# --- SkyFrame v2 extensions (forward-compatible) ---",
-                f"frame_generation_enabled = {fg_on}",
-                f"adaptive = {adaptive}",
-                f"target_fps = {target_fps}",
-                f"adaptive_max_multiplier = {adapt_max}",
-                f'skyframe_pacing = "{pacing}"',
-                f"skyframe_max_queued = {sq}",
-                f"skyframe_deadline_ms = {sdl}",
-                f"skyframe_fresh_first = {sff}",
-                f'skyframe_present_mode = "{spm}"',
+                "override_present_mode = true",
+                "preserve_swapchain_image_count = false",
                 ""
             ]
             toml_content = "\n".join(toml_lines)
@@ -272,6 +268,35 @@ class Plugin:
             os.replace(tmp_toml, LSFG_CONFIG_PATH)
             fix_perms(LSFG_CONFIG_PATH)
             logging.info(f"[SkyFrame] Updated LSFG conf.toml (multiplier: {multiplier}, perf: {perf_mode})")
+
+            # 2) Our own keys live in a separate file — never in upstream conf.
+            try:
+                sky_toml = os.path.join(CONFIG_DIR, "skyframe.toml")
+                sky_lines = [
+                    "# Automatically managed by SkyFrame Decky Plugin",
+                    "# Read by the future VK_LAYER_SKYFRAME fork. Upstream lsfg-vk ignores this file.",
+                    "[delivery]",
+                    f'mode = "{pacing}"',
+                    f"max_queued = {sq}",
+                    f"deadline_ms = {sdl}",
+                    f"fresh_first = {sff}",
+                    f'present_mode = "{spm}"',
+                    "",
+                    "[generation]",
+                    f"enabled = {fg_on}",
+                    f"adaptive = {adaptive}",
+                    f"target_fps = {target_fps}",
+                    f"adaptive_max_multiplier = {adapt_max}",
+                    "",
+                ]
+                tmp_sky = sky_toml + ".tmp"
+                with open(tmp_sky, "w", encoding="utf-8") as f:
+                    f.write("\n".join(sky_lines))
+                fix_perms(tmp_sky)
+                os.replace(tmp_sky, sky_toml)
+                fix_perms(sky_toml)
+            except Exception as e:
+                logging.warning(f"[SkyFrame] Failed to sync skyframe.toml: {e}")
         except Exception as e:
             logging.warning(f"[SkyFrame] Failed to sync LSFG conf.toml: {e}")
 
