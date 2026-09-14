@@ -93,14 +93,76 @@ def parse(dll_path):
         data_rva, size = struct.unpack_from("<II", data, rsrc_base + (doff & 0x7FFFFFFF))
         try:
             foff = rva_to_file(data_rva)
-            blob = data[foff:foff + min(size, 64)]
+            blob = data[foff:foff + size]
         except ValueError:
-            results.append((res_id, size, False, []))
+            results.append((res_id, size, False, [], None))
             continue
         words = struct.unpack("<%dI" % (len(blob) // 4), blob) if len(blob) >= 4 else ()
         is_spv = bool(words) and words[0] == SDBG
-        results.append((res_id, size, is_spv, list(words[:8])))
+        contract = spirv_contract(words) if is_spv else None
+        results.append((res_id, size, is_spv, list(words[:8]), contract))
     return results
+
+
+def spirv_contract(words):
+    """Count descriptor slots: (sampled, storage, uniform, samplers).
+
+    Pure structural parse of OpTypeImage/Sampler/Pointer,
+    OpVariable and OpDecorate Set/Binding. Returns None if unparseable.
+    """
+    try:
+        if len(words) < 5 or words[0] != SDBG:
+            return None
+        types = {}   # id -> (kind, storage, pointee, sampled)
+        variables = {}  # id -> (pointer_type, storage)
+        decor = {}   # id -> [set, binding]
+        n = len(words)
+        o = 5
+        while o < n:
+            wc = words[o] >> 16
+            op = words[o] & 0xFFFF
+            if wc == 0 or o + wc > n:
+                return None
+            if op == 25 and wc >= 9:  # OpTypeImage
+                types[words[o + 1]] = ("img", 0, 0, words[o + 7])
+            elif op == 26 and wc >= 2:  # OpTypeSampler
+                types[words[o + 1]] = ("sampler", 0, 0, 0)
+            elif op == 32 and wc >= 4:  # OpTypePointer
+                types[words[o + 1]] = ("ptr", words[o + 2], words[o + 3], 0)
+            elif op == 59 and wc >= 4:  # OpVariable
+                variables[words[o + 2]] = (words[o + 1], words[o + 3])
+            elif op == 71 and wc >= 4:  # OpDecorate
+                d = decor.setdefault(words[o + 1], [None, None])
+                if words[o + 2] == 34:
+                    d[0] = words[o + 3]
+                elif words[o + 2] == 33:
+                    d[1] = words[o + 3]
+            o += wc
+        sampled = storage = uniform = samplers = 0
+        for vid, (pt, sc) in variables.items():
+            if vid not in decor or decor[vid][0] is None or decor[vid][1] is None:
+                continue
+            t = types.get(pt)
+            if not t or t[0] != "ptr":
+                continue
+            if sc == 2:  # Uniform
+                uniform += 1
+                continue
+            if sc != 0:  # UniformConstant
+                continue
+            p = types.get(t[2])
+            if not p:
+                continue
+            if p[0] == "sampler":
+                samplers += 1
+            elif p[0] == "img":
+                if p[3] == 1:
+                    sampled += 1
+                elif p[3] == 2:
+                    storage += 1
+        return (sampled, storage, uniform, samplers)
+    except Exception:
+        return None
 
 
 def main():
@@ -113,10 +175,14 @@ def main():
         print(f"ERROR: {e}")
         return 1
     print(f"RCDATA entries: {len(results)}")
-    print(f"{'id':>6} {'size':>10}  spirv  head-words")
-    for rid, size, is_spv, words in sorted(results):
+    print(f"{'id':>6} {'size':>10}  spirv  sampled storage uniform samplers  head-words")
+    for rid, size, is_spv, words, contract in sorted(results):
         head = " ".join(f"{w:08x}" for w in words)
-        print(f"{rid:>6} {size:>10}  {'YES' if is_spv else 'no ':<5} {head}")
+        if contract is None:
+            c = "  -       -       -       -"
+        else:
+            c = f"{contract[0]:>7} {contract[1]:>7} {contract[2]:>7} {contract[3]:>7}"
+        print(f"{rid:>6} {size:>10}  {'YES' if is_spv else 'no ':<5} {c}  {head}")
     return 0
 
 
